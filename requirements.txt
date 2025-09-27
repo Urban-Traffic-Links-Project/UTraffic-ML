@@ -1,2 +1,11 @@
 torch
 pandas
+numpy
+requests
+osmx
+geopandas
+matplotlib
+seaborn
+scikit-learn
+pytest
+dotenv
