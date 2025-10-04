@@ -5,19 +5,21 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score, average_precision_score
+from scipy.stats import spearmanr
+from collections import defaultdict
 
 
 # ---------------------------
 # Data
 # ---------------------------
-def default_paths(base = Path.cwd() / "Urban-Traffic-Links" / "data" / "raw" / "kaggle"):
+def default_paths(base = Path("C:/AI/Specialized_Project2_github/Urban-Traffic-Links/data/raw/kaggle")):
     base = Path(base)
     return dict(
-        train=base.joinpath('train.csv'),
-        nodes=base.joinpath('nodes.csv'),
-        segments=base.joinpath('segments.csv'),
-        streets=base.joinpath('streets.csv'),
-        segment_status=base.joinpath('segment_status.csv'),
+        train=base / 'train.csv',
+        nodes=base / 'nodes.csv',
+        segments=base / 'segments.csv',
+        streets=base / 'streets.csv',
+        segment_status=base / 'segment_status.csv',
     )
 
 def load_data(paths):
@@ -27,38 +29,6 @@ def load_data(paths):
     streets = pd.read_csv(paths['streets'])
     segment_status = pd.read_csv(paths['segment_status'])
     return train, nodes, segments, streets, segment_status
-
-# ---------------------------
-# Handle Graph
-# ---------------------------
-#Build matrix for route
-def build_segment_graph(train):
-    sub = train.drop_duplicates(subset=["segment_id"])[["segment_id", "s_node_id", "e_node_id"]].copy()
-
-    # Map id -> index
-    seg_ids = sub['segment_id'].astype(int).tolist()
-    id2idx = {sid: i for i,sid in enumerate(seg_ids)}
-
-    #Take length of segment
-    n = len(seg_ids)
-
-    from collections import defaultdict
-    virtual_link = defaultdict(list)
-    for _,s in sub.iterrows():
-        idx = id2idx[int(s['segment_id'])]
-        virtual_link[int(s['s_node_id'])].append(idx)
-        virtual_link[int(s['e_node_id'])].append(idx)
-    A = np.zeros((n, n), dtype=np.float32)
-    for seg_list in virtual_link.values():
-        for i in range(len(seg_list)):
-            for j in range(i+1, len(seg_list)):
-                a,b = seg_list[i], seg_list[j]
-                A[a,b] = 1.0
-                A[b,a] = 1.0
-    # Add into main diagonal
-    np.fill_diagonal(A, 1.0)
-    return A, seg_ids, id2idx
-
 
 # ---------------------------
 # Features & targets
@@ -143,79 +113,123 @@ def negative_sampling(n, num_samples, forbidden,seed=0):
         forbidden.add(k)
         neg.append([u,v])
     return np.array(neg, dtype=np.int64)
+# ---------------------------
+# LOS utilities + temporal split
+# ---------------------------
+LOS_TO_ORD = {"A": 6, "B": 5, "C": 4, "D": 3, "E": 2, "F": 1}
+def make_timestamp(df):
+    if "date" not in df.columns:
+        raise ValueError("Missing date column")
+    d = pd.to_datetime(df["date"], errors="coerce")
+    if "period" in df.columns and df["period"].notna().any():
+        # chuyển 'period_h_m' -> 'h:m'
+        per = df["period"].fillna("").astype(str).str.replace("period_","",regex=False)
+        # pad giờ/phút (9_5 -> 09:05)
+        per = per.str.replace("_",":",regex=False)
+        per = pd.to_datetime(per, format="%H:%M", errors="coerce").dt.time
+        df["ts"] = pd.to_datetime(d.dt.date.astype(str)+ " " + pd.Series(per).astype(str),errors="coerce")
+    else:
+        df["ts"] = d
+    return df
 
-# def roc_auc(y_true, y_score):
-#     y_true = np.asarray(y_true).astype(int)
-#     #yscore -> output from softmax
-#     y_score = np.asarray(y_score).astype(float)
-#     pos = y_score[y_true == 1]
-#     neg = y_score[y_true == 0]
-#     if len(pos) == 0 or len(neg) == 0:
-#         return float('nan')
-#     #Get rank
-#     all_scores = np.concatenate([pos, neg])
-#     ranks = all_scores.argsort().argsort() + 1
-#     r_pos = ranks[:len(pos)]
-#
-#     u = r_pos.sum() - len(pos) * (len(pos) + 1) / 2
-#     auc = u / (len(pos) * len(neg))
-#     return float(auc)
+def temporal_split_intervals(ts_series, train_ratio=0.7, mature_frac=0.8):
+    """
+        Chia timeline thành:
+          Train:  [t0, tc]  với maturing [t0, tb], probing (train) (tb, tc]
+          Test:   (tc, td]  với maturing (tc, td_m], probing (test) (td_m, td]
+    """
+    t_sorted = ts_series.dropna().sort_values()
+    if len(t_sorted) < 6:
+        raise ValueError("Không đủ mốc thời gian để temporal split.")
+    t0 = t_sorted.iloc[0]
+    td = t_sorted.iloc[-1]
+    tc = t_sorted.quantile(train_ratio)
+    tb = pd.to_datetime(t0 + mature_frac * (tc - t0))
+    td_m = pd.to_datetime(tc + mature_frac * (td - tc))
+    return t0, tb, tc, td_m, td
+
+def build_spearman_adj_from_window(df, seg_ids, t_start, t_end, threshold=0.7, topk=None):
+    """
+        Tạo adjacency theo Spearman(LOS) trong cửa sổ [t_start, t_end].
+        - df cần có cột: ts, segment_id, LOS (A..F)
+        - seg_ids: list segment theo thứ tự cố định
+        """
+    sub = df[(df["ts"] >= t_start) & (df["ts"] <= t_end)][["ts", "segment_id", "LOS"]].copy()
+    if sub.empty:
+        raise ValueError("Empty dataframe")
+    sub["los_ord"] = sub["LOS"].map(LOS_TO_ORD).astype("float32")
+    piv = sub.pivot_table(index="ts", columns="segment_id", values="los_ord", aggfunc="mean")
+    piv = piv.reindex(columns=seg_ids)
+    piv = piv.sort_index().interpolate(limit_direction="both").fillna(piv.mean())
+    rho, _ = spearmanr(piv.values, axis = 0)
+    rho = np.nan_to_num(rho, nan=0.0)
+    n = len(seg_ids)
+    A = np.zeros((n,n), dtype=np.float32)
+    if topk:
+        idx = np.argsort(-rho, axis=1)[:, 1:topk + 1]  # bỏ self
+        rows = np.arange(n)[:, None] #CHuyển thành cột
+        A[rows, idx] = rho[rows, idx]
+        A = np.maximum(A, A.T)  # đối xứng bằng max
+    else:
+        A = (rho >= float(threshold)).astype(np.float32)
+        np.fill_diagonal(A, 1.0)
+    u, v = np.where(np.triu(A, k=1) > 0)
+    edges = np.stack([u, v], axis=1)
+    return A, edges
+
+def formed_edges(A_maturing, A_probing):
+    U1,V1 = np.where(np.triu(A_maturing, k=1) > 0)
+    U2,V2 = np.where(np.triu(A_probing, k=1) > 0)
+    had = set(zip(U1.tolist(), V1.tolist()))
+    formed = [(u, v) for u, v in zip(U2.tolist(), V2.tolist()) if (u, v) not in had]
+    return np.array(formed, dtype=np.int64)
 
 
-# def roc_auc(y_true, y_score):
-#     y_true  = np.asarray(y_true).astype(int)
-#     y_score = np.asarray(y_score).astype(float)
-#
-#     pos = y_score[y_true == 1]
-#     neg = y_score[y_true == 0]
-#     if len(pos) == 0 or len(neg) == 0:
-#         return float("nan")
-#
-#     all_scores = np.concatenate([pos, neg])              # [pos..., neg...]
-#     order = np.argsort(all_scores)                       # chỉ số tăng dần theo score
-#     ranks = np.empty_like(order, dtype=float)
-#     ranks[order] = np.arange(1, len(all_scores) + 1)     # rank 1..N
-#
-#     # (tuỳ chọn) xử lý tie bằng average rank
-#     # tìm các nhóm tie
-#     s_sorted = all_scores[order]
-#     i = 0
-#     while i < len(s_sorted):
-#         j = i + 1
-#         while j < len(s_sorted) and s_sorted[j] == s_sorted[i]:
-#             j += 1
-#         if j - i > 1:
-#             avg = (i + 1 + j) / 2.0
-#             ranks[order[i:j]] = avg
-#         i = j
-#
-#     r_pos = ranks[:len(pos)]                             # vì ta ghép pos trước
-#     U = r_pos.sum() - len(pos) * (len(pos) + 1) / 2.0
-#     auc = U / (len(pos) * len(neg))
-#     return float(auc)
+def build_topology_adj(segments_df, seg_ids):
+    """
+    A_topo: 2 segment có cạnh nếu CHIA SẺ cùng s_node_id hoặc e_node_id.
+    """
+    seg_df = segments_df.copy()
+    # chuẩn hoá tên cột: có thể là '_id' hoặc 'segment_id'
+    if "segment_id" not in seg_df.columns and "_id" in seg_df.columns:
+        seg_df = seg_df.rename(columns={"_id": "segment_id"})
+    needed = {"segment_id","s_node_id","e_node_id"}
+    missing = needed - set(seg_df.columns)
+    if missing:
+        raise ValueError(f"Thiếu cột cho topo: {missing}")
 
-# def average_precision_numpy(y_true, y_score):
-#     y_true = np.asarray(y_true).astype(int)
-#     y_score= np.asarray(y_score).astype(float)
-#
-#     #Reorder y_true follow y_score
-#     order = np.argsort(-y_score)
-#     y_true = y_true[order]
-#
-#     #Đếm TP, FP
-#     tp = np.cumsum(y_true)
-#     fp = np.cumsum(1 - y_true)
-#
-#     #Calculate
-#     precision = tp / np.maximum(tp + fp, 1)
-#     recall = tp / np.maximum(tp[-1], 1)
-#     # integrate precision over recall steps
-#     ap = 0.0
-#     prev_r = 0.0
-#     for p, r in zip(precision, recall):
-#         ap += p * (r - prev_r)
-#         prev_r = r
-#     return float(ap)
+    seg_df = seg_df[seg_df["segment_id"].isin(seg_ids)].copy()
+    id2idx = {sid: i for i, sid in enumerate(seg_ids)}
+
+    node_to_segs = defaultdict(list)
+    for _, r in seg_df.iterrows():
+        sid = int(r["segment_id"])
+        if sid not in id2idx:
+            continue
+        i = id2idx[sid]
+        node_to_segs[int(r["s_node_id"])].append(i)
+        node_to_segs[int(r["e_node_id"])].append(i)
+
+    n = len(seg_ids)
+    A = np.zeros((n, n), dtype=np.float32)
+    for seg_list in node_to_segs.values():
+        for a in range(len(seg_list)):
+            for b in range(a+1, len(seg_list)):
+                i, j = seg_list[a], seg_list[b]
+                A[i, j] = 1.0
+                A[j, i] = 1.0
+    np.fill_diagonal(A, 1.0)
+    return A, seg_ids, id2idx
+
+def combine_adj(A_topo, A_corr, alpha=0.7, thresh=0.5):
+    """
+    A_final = alpha*A_topo + (1-alpha)*A_corr  -> sau đó nhị phân hoá theo thresh.
+    Trả về A_bin (0/1, có đường chéo 1.0)
+    """
+    Af = alpha * A_topo + (1.0 - alpha) * A_corr
+    A_bin = (Af >= float(thresh)).astype(np.float32)
+    np.fill_diagonal(A_bin, 1.0)
+    return A_bin
 
 # =========================
 # GCN encoder + Dot decoder
@@ -302,109 +316,7 @@ def train_linkpred(Ahat, X, pos_tr, pos_val, pos_te, hidden=64, emb_dim=64, epoc
 
 
 
-# def train_linkpred(
-#     Ahat, X, pos_tr, pos_val, pos_te,
-#     hidden=64, emb_dim=64, epochs=400, lr=1e-3, wd=5e-4, seed=0,
-#     device=None, patience=30, eval_every=5, resample_neg_each_epoch=True
-# ):
-#     """
-#     Huấn luyện với:
-#       - Đánh giá validation định kỳ (eval_every epoch)
-#       - Early stopping theo val_AUC (patience)
-#       - Chọn model có val_AUC tốt nhất để final test
-#     """
-#     if device is None:
-#         device = torch.device("cpu")
-#     torch.manual_seed(seed); np.random.seed(seed)
-#
-#     n = X.shape[0]
-#     # forbidden gồm toàn bộ cạnh dương để tránh lấy nhầm negative
-#     forb_all = set(edge_key(u, v) for u, v in np.vstack([pos_tr, pos_val, pos_te]))
-#
-#     # Negative cố định cho val/test (để đánh giá nhất quán)
-#     neg_val = negative_sampling(n, len(pos_val), set(forb_all), seed+1)
-#     neg_te  = negative_sampling(n, len(pos_te),  set(forb_all), seed+2)
-#
-#     # Negatives cho train: có thể cố định hoặc resample mỗi epoch
-#     def sample_train_negs():
-#         return negative_sampling(n, len(pos_tr), set(forb_all), seed=np.random.randint(0, 10**9))
-#
-#     neg_tr = sample_train_negs()  # khởi tạo lần đầu
-#
-#     # Tensors
-#     X_t = torch.from_numpy(X).float().to(device)
-#     A_t = torch.from_numpy(Ahat).float().to(device)
-#     pos_tr_t = torch.from_numpy(pos_tr).long().to(device)
-#
-#     # Model
-#     encoder = GCN(in_dim=X.shape[1], hidden_dim=min(hidden, X.shape[1]), out_dim=emb_dim).to(device)
-#     decoder = DotDecoder()
-#     opt = torch.optim.Adam(encoder.parameters(), lr=lr, weight_decay=wd)
-#     bce = nn.BCEWithLogitsLoss()
-#
-#     best_val_auc = -1.0
-#     best_state = None
-#     best_epoch = -1
-#     bad_rounds = 0  # đếm số lần eval liên tiếp không cải thiện
-#
-#     for epoch in range(1, epochs + 1):
-#         encoder.train()
-#         opt.zero_grad()
-#
-#         # (tuỳ chọn) resample negatives cho train mỗi epoch
-#         if resample_neg_each_epoch or epoch == 1:
-#             neg_tr = sample_train_negs()
-#         neg_tr_t = torch.from_numpy(neg_tr).long().to(device)
-#
-#         z = encoder(X_t, A_t)
-#         logits_pos = decoder(z, pos_tr_t)
-#         logits_neg = decoder(z, neg_tr_t)
-#         logits = torch.cat([logits_pos, logits_neg], dim=0)
-#         labels = torch.cat(
-#             [torch.ones_like(logits_pos), torch.zeros_like(logits_neg)], dim=0
-#         ).float()
-#
-#         loss = bce(logits, labels)
-#         loss.backward()
-#         opt.step()
-#
-#         # Đánh giá định kỳ trên validation
-#         if epoch % eval_every == 0 or epoch == epochs:
-#             val_auc, val_ap = eval_linkpred(encoder, decoder, A_t, X_t, pos_val, neg_val)
-#
-#             # Theo dõi model tốt nhất theo val_AUC
-#             if val_auc > best_val_auc:
-#                 best_val_auc = val_auc
-#                 best_state = {k: v.detach().cpu().clone() for k, v in encoder.state_dict().items()}
-#                 best_epoch = epoch
-#                 bad_rounds = 0
-#             else:
-#                 bad_rounds += 1
-#
-#             # (tuỳ chọn) in log gọn nhẹ
-#             # print(f"[Epoch {epoch:4d}] loss={loss.item():.4f} | valAUC={val_auc:.3f} valAP={val_ap:.3f} | bestAUC={best_val_auc:.3f}@{best_epoch}")
-#
-#             # Early stopping nếu không cải thiện sau 'patience' lần đánh giá
-#             if bad_rounds >= patience:
-#                 # print(f"[EarlyStop] No improvement in {patience} eval rounds. Stop at epoch {epoch}.")
-#                 break
-#
-#     # Khôi phục tham số tốt nhất theo validation
-#     if best_state is not None:
-#         encoder.load_state_dict(best_state)
-#     else:
-#         best_epoch = epochs  # phòng khi không có lần eval nào tốt hơn
-#
-#     # Đánh giá cuối: dùng model tốt nhất theo validation
-#     val_auc, val_ap = eval_linkpred(encoder, decoder, A_t, X_t, pos_val, neg_val)
-#     te_auc,  te_ap  = eval_linkpred(encoder, decoder, A_t, X_t, pos_te,  neg_te)
-#
-#     metrics = {
-#         "best_epoch": best_epoch,
-#         "val_auc": float(val_auc), "val_ap": float(val_ap),
-#         "test_auc": float(te_auc), "test_ap": float(te_ap),
-#     }
-#     return encoder, decoder, metrics
+
 
 
 def get_device():
@@ -427,75 +339,93 @@ def main():
     dev = get_device()
     print(f"[INFO] Device: {dev}")
     ap = argparse.ArgumentParser()
-    ap.add_argument("--outdir", default=str(Path.cwd() /"Urban-Traffic-Links" / "outputs"))
-    ap.add_argument("--snapshot_date", default="2020-08-02", help="yyy-mm-dd; nếu None sẽ dùng ngày sớm nhất trong train")
-    ap.add_argument("--snapshot_period", default="period_23_30", help="ví dụ: 'AM_peak' (nếu cột period tồn tại)")
+    ap.add_argument("--outdir", default=str(Path.cwd() / "Urban-Traffic-Links" / "outputs"))
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--emb_dim", type=int, default=64)
     ap.add_argument("--epochs", type=int, default=400)
     ap.add_argument("--seed", type=int, default=0)
-    # optional hparams
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--wd", type=float, default=5e-4)
-
+    ap.add_argument("--alpha", type=float, default=0.7)
+    ap.add_argument("--corr_threshold", type=float, default=0.7)
+    ap.add_argument("--final_threshold", type=float, default=0.5)
+    ap.add_argument("--corr_topk", type=int, default=0)
     args = ap.parse_args()
-
-    # Paths & outdir
-    paths = default_paths()
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
 
     # Load data
     print("[INFO] Loading data ...")
+    paths = default_paths()
     train, nodes, segments, streets, segment_status = load_data(paths)
 
-    # Ensure datetime for 'date' if cột tồn tại
-    if "date" in train.columns:
-        train["date"] = pd.to_datetime(train["date"], errors="coerce")
+    # Preprocess timestamp
+    train = make_timestamp(train)
+    train["date"] = pd.to_datetime(train["date"], errors="coerce")
+    if "LOS" not in train.columns:
+        raise ValueError("Thiếu cột LOS (A..F) để tính Spearman!")
 
-    # Resolve snapshot_date if None -> earliest date in train
-    if args.snapshot_date is None and "date" in train.columns:
-        earliest = train["date"].dropna().min()
-        if pd.isna(earliest):
-            raise ValueError("Không tìm được 'snapshot_date' vì cột 'date' trống.")
-        args.snapshot_date = earliest.date().isoformat()
+    # Temporal split
+    print("[INFO] Temporal split ...")
+    t0, tb, tc, td_m, td = temporal_split_intervals(train["ts"])
+    print(f"  Train window: [{t0} → {tc}] | Test window: ({tc} → {td}]")
 
-    # Build full graph from topology
-    print("[INFO] Building graph ...")
-    A_full, seg_ids, id2idx = build_segment_graph(train)
+    # Build topo adjacency
+    seg_ids = sorted(train["segment_id"].dropna().unique().astype(int).tolist())
+    print("[INFO] Building topology adjacency ...")
+    A_topo, seg_ids, id2idx = build_topology_adj(segments,seg_ids)
+    print(f"  A_topo shape = {A_topo.shape}")
 
-    # Split positive edges
-    pos_edges = edges_from_adj(A_full)  # full topo edges (no self-loops)
-    pos_tr, pos_val, pos_te = split_edges(
-        pos_edges, val_ratio=0.1, test_ratio=0.1, seed=args.seed
+    # Spearman adjacency
+    print("[INFO] Building Spearman adjacency ...")
+    A_corr, _ = build_spearman_adj_from_window(
+        train, seg_ids, t_start=t0, t_end=tc,
+        threshold=args.corr_threshold,
+        topk=args.corr_topk if args.corr_topk > 0 else None
     )
+    # --------------------------
+    # In ma trận Spearman + các cặp tương quan không kề
+    # --------------------------
+    print("[INFO] Checking Spearman correlation usefulness ...")
 
-    # Build train adjacency only with train edges (avoid leakage)
-    A_train = np.zeros_like(A_full, dtype=np.float32)
-    for u, v in pos_tr:
-        A_train[u, v] = 1.0
-        A_train[v, u] = 1.0
-    np.fill_diagonal(A_train, 1.0)
-    Ahat = normalize_adj(A_train)
+    # In ma trận Spearman (nếu nhỏ)
+    if A_corr.shape[0] <= 20:
+        print("\n[Spearman correlation matrix (A_corr)]:")
+        np.set_printoptions(precision=2, suppress=True)
+        print(A_corr)
+    else:
+        print(f"A_corr too large to print ({A_corr.shape}) -> skip full print")
 
-    # Features snapshot
-    print("[INFO] Preparing node features (snapshot) ...")
-    X, meta = prepare_feature_labels(
-        train, seg_ids,
-        snapshot_date=args.snapshot_date,
-        snapshot_period=args.snapshot_period,
-        task="classification"
-    )
-    print(f"[INFO] Snapshot -> date={meta['snapshot_date']} "
-          f"period={meta['snapshot_period']} | X shape={X.shape}")
+    # Tìm các cặp có tương quan cao nhưng không kề trong topology
+    diff_mask = (A_corr >= args.corr_threshold) & (A_topo == 0)
+    u, v = np.where(np.triu(diff_mask, k=1))  # lấy tam giác trên (tránh trùng)
 
-    # Train link prediction
-    print("[INFO] Training link prediction (GCN encoder + dot decoder) ...")
+    if len(u) == 0:
+        print("[INFO] No correlated but non-adjacent pairs found.")
+    else:
+        print(f"\n[INFO] Found {len(u)} correlated-but-non-adjacent pairs (potential hidden correlations):")
+        for i in range(min(20, len(u))):  # chỉ in 20 cặp đầu
+            print(f"  Segment {seg_ids[u[i]]} ↔ Segment {seg_ids[v[i]]} | corr={A_corr[u[i], v[i]]:.3f}")
+
+    # Combine adjacency
+    A_final = combine_adj(A_topo, A_corr, alpha=args.alpha, thresh=args.final_threshold)
+    Ahat = normalize_adj(A_final)
+
+    # Split edges
+    pos_edges = edges_from_adj(A_final)
+    pos_tr, pos_val, pos_te = split_edges(pos_edges, val_ratio=0.1, test_ratio=0.1, seed=args.seed)
+    print(f"[INFO] Edges: train={len(pos_tr)}, val={len(pos_val)}, test={len(pos_te)}")
+
+    # Prepare features
+    X, meta = prepare_feature_labels(train, seg_ids, snapshot_date=tc)
+    print(f"[INFO] X shape = {X.shape}")
+
+    # Train + eval
+    print("[INFO] Training GCN ...")
     _, _, metrics = train_linkpred(
         Ahat, X, pos_tr, pos_val, pos_te,
-        hidden=args.hidden, emb_dim=args.emb_dim, epochs=args.epochs,
-        lr=args.lr, wd=args.wd, seed=args.seed
+        hidden=args.hidden, emb_dim=args.emb_dim,
+        epochs=args.epochs, lr=args.lr, wd=args.wd, seed=args.seed
     )
+
     print(f"[RESULT] LinkPred  val_AUC={metrics['val_auc']:.3f}  "
           f"val_AP={metrics['val_ap']:.3f}  "
           f"test_AUC={metrics['test_auc']:.3f}  "
