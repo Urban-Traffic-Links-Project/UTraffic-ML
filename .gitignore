@@ -204,6 +204,7 @@ cython_debug/
 # Marimo
 marimo/_static/
 marimo/_lsp/
+<<<<<<< HEAD
 __marimo__/
 
 # Ignore raw and processed data
@@ -212,3 +213,6 @@ data/processed/
 src/data_processing/data/raw/
 *.json
 *.csv
+=======
+__marimo__/
+>>>>>>> 4e99cfca607266ec4b42201e31e44950e52d5ece
