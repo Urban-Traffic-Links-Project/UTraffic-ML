@@ -3,6 +3,14 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+data/raw/
+data/processed/
+src/data_processing/cache/
+
+# Giữ lại cấu trúc thư mục trống
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
 # C extensions
 *.so
 
@@ -138,9 +146,9 @@ celerybeat.pid
 .env
 .envrc
 .venv
-env/
+.env/
 venv/
-ENV/
+.env/
 env.bak/
 venv.bak/
 
