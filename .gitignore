@@ -3,13 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-data/raw/
-data/processed/
-src/data_processing/cache/
-
-# Giữ lại cấu trúc thư mục trống
+# --- Ignore toàn bộ dữ liệu ---
+data/**
+!data/.gitkeep
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+
+
 
 # C extensions
 *.so
