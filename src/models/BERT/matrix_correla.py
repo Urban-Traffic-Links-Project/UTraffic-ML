@@ -620,16 +620,24 @@ def build_zone(output_dir, seed_seg_id, R_max=2000, tau_max=10,
 
     evals, evecs = np.linalg.eigh(L)
     order = np.argsort(evals)
-    if d_spa < N_zone:
-        order = order[:d_spa]
-    lap_eigvec = evecs[:, order].astype("float32")  # (N_zone, d_spa)
+
+    # số eigenvector thực sự dùng
+    num_vecs = min(d_spa, N_zone)
+    order = order[:num_vecs]
+
+    # evecs_selected: (N_zone, num_vecs)
+    evecs_selected = evecs[:, order].astype("float32")
+
+    # luôn trả (N_zone, d_spa), nếu thiếu thì pad 0
+    lap_eigvec = np.zeros((N_zone, d_spa), dtype="float32")
+    lap_eigvec[:, :num_vecs] = evecs_selected
 
     return {
         "seed_segment_id": seed_seg_id,
-        "zone_indices": final_indices,                 # index vào traffic_tensor
+        "zone_indices": final_indices,
         "zone_segment_ids": segment_ids[final_indices],
-        "adjacency": A,                                # (N_zone, N_zone)
-        "lap_eigvec": lap_eigvec,                      # (N_zone, d_spa)
+        "adjacency": A,
+        "lap_eigvec": lap_eigvec,  # (N_zone, d_spa) đảm bảo cố định
     }
 
 #%%
