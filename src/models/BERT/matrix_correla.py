@@ -14,9 +14,15 @@ def load_traffic_tensor(output_dir: Union[str, Path]) -> Dict[str, Any]:
 
     values = data["values"].astype("float32")
     segment_ids = data["segment_ids"]
+    time_of_day = data["time_of_day"]
+    day_of_week = data["day_of_week"]
+    is_congested = data["is_congested"]
     return {
         "values": values,
         "segment_ids": segment_ids,
+        "time_of_day": time_of_day,
+        "day_of_week": day_of_week,
+        "is_congested": is_congested,
     }
 # ============================================================
 # 1) Pearson time-lag cross-correlation cho một cặp (i, j)
