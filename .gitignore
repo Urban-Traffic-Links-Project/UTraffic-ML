@@ -3,6 +3,14 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# --- Ignore toàn bộ dữ liệu ---
+data/**
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+
+
 # C extensions
 *.so
 
@@ -138,9 +146,9 @@ celerybeat.pid
 .env
 .envrc
 .venv
-env/
+.env/
 venv/
-ENV/
+.env/
 env.bak/
 venv.bak/
 
@@ -205,9 +213,4 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-
-# Ignore raw and processed data
-data/raw/
-data/processed/
-*.json
-*.csv
+job_7839872_results.json
