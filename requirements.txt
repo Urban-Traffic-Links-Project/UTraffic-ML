@@ -10,3 +10,4 @@ scikit-learn
 pytest
 dotenv
 torch_directml
+python-dotenv
