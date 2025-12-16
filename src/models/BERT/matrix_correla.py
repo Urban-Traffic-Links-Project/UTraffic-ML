@@ -5,7 +5,8 @@ import pandas as pd
 from pathlib import Path
 from typing import Dict, Any, Union, Tuple
 from math import radians, sin, cos, asin, sqrt
-
+import time
+import torch
 #%%
 
 def load_traffic_tensor(output_dir: Union[str, Path]) -> Dict[str, Any]:
@@ -67,7 +68,7 @@ def cross_corr_time_lag_pair(
 # 2) Link weight W^{pos}_{i,j} như paper
 # ============================================================
 
-def link_weight_pos(x: np.ndarray,y: np.ndarray,tau_max: int) -> Tuple[float, int, float]:
+def link_weight_pos(x: np.ndarray, y: np.ndarray, tau_max: int) -> Tuple[float, int, float]:
     taus, corrs = cross_corr_time_lag_pair(x, y, tau_max)
     max_corr = float(np.max(corrs))
     tau_peak = int(taus[np.argmax(corrs)])
@@ -77,6 +78,7 @@ def link_weight_pos(x: np.ndarray,y: np.ndarray,tau_max: int) -> Tuple[float, in
         std_corr = 1e-6
     Wpos = (max_corr - mean_corr) / std_corr
     return float(Wpos), tau_peak, max_corr
+
 
 def compute_anchor_correlations(
     output_dir: Union[str, Path],
@@ -431,18 +433,6 @@ def spatial_radius_filter(candidate_seg_ids, seg2center, seed_seg_id, R_max):
             out.append(sid)
     return out
 
-def spatial_radius_filter(candidate_seg_ids, seg2center, seed_seg_id, R_max):
-    lat0, lon0 = seg2center[seed_seg_id]
-    out = []
-    for sid in candidate_seg_ids:
-        if sid not in seg2center:
-            continue
-        lat, lon = seg2center[sid]
-        d = haversine_distance(lat0, lon0, lat, lon)
-        if d <= R_max:
-            out.append(sid)
-    return out
-
 def compute_zone_correlations(values, segment_ids, seed_idx, candidate_indices, tau_max):
     W = {}
     Tau = {}
@@ -482,73 +472,69 @@ def filter_links(seed_idx, candidate_indices, seg2center, segment_ids, W, Tau,
 
     return keep
 
-def build_zone(output_dir, seed_seg_id, R_max=2000, tau_max=10,
-               Wmin=0.5, Dmin=0, Dmax=1500, tau_cut=10, top_k=60, d_spa=16,
-               sigma=500.0):
+def build_zone(
+    output_dir,
+    seed_seg_id,
+    R_max=2000,
+    tau_max=10,
+    Wmin=0.5,
+    Dmin=0,
+    Dmax=1500,
+    tau_cut=10,
+    top_k=60,
+    d_spa=16,
+    sigma=500.0,
+):
     output_dir = Path(output_dir)
 
     # --------- load data + topo ----------
-    graph, segid2idx = load_topology(output_dir)          # graph: seg_id -> list neighbors
-    seg2center = load_segment_centers(output_dir)         # seg_id -> (lat,lon)
+    graph, segid2idx = load_topology(output_dir)
+    seg2center = load_segment_centers(output_dir)
     data = load_traffic_tensor(output_dir)
 
-    values = data["values"]          # (T, N)
-    segment_ids = data["segment_ids"]# (N,)
+    values = data["values"]            # (T, N)
+    segment_ids = data["segment_ids"]  # (N,)
 
     seed_seg_id = int(seed_seg_id)
     seed_idx = segid2idx[seed_seg_id]
 
-    # 1) 2-hop zone quanh seed (theo topology)
-    zone_segids = get_two_hop_zone(seed_seg_id, graph)    # set(seg_id)
-
-    # 2) Spatial radius filter quanh seed
+    # --------- 1) 2-hop + radius zone ----------
+    zone_segids = get_two_hop_zone(seed_seg_id, graph)
     zone_segids = spatial_radius_filter(zone_segids, seg2center, seed_seg_id, R_max)
-    zone_segids = set(zone_segids)  # đảm bảo là set
+    zone_segids = set(zone_segids)
 
-    # 3) Convert segment_id -> global idx trong tensor
-    zone_indices = [segid2idx[sid] for sid in zone_segids if sid in segid2idx]
-
-    # 4) Tìm *tuyến liên quan* cho từng segment trong zone
-    #
-    #   Với mỗi seg_i trong zone_segids:
-    #       - Lấy 2-hop topology quanh seg_i
-    #       - (optional) radius filter quanh seg_i nếu muốn
-    #       - Chỉ trong tập candidates này mới tính cross-correlation với seg_i
-    #
-    correlated_segids = set()            # các seg_id liên quan tìm được
-    link_weights = {}                    # (i_idx, j_idx) -> Wpos, dùng sau để sort / top_k
+    # --------- 2) correlation expansion ----------
+    correlated_segids = set()
+    link_weights = {}
 
     for sid_i in zone_segids:
         if sid_i not in segid2idx:
             continue
         idx_i = segid2idx[sid_i]
-        x_i = values[:, idx_i]           # (T,)
+        x_i = values[:, idx_i]
 
-        # 4.1) 2-hop topology quanh sid_i
-        local_neis = get_two_hop_zone(sid_i, graph)   # set(seg_id)
-        if sid_i in local_neis:
-            local_neis.remove(sid_i)
-
-        # 4.2) giới hạn nhỏ hơn R_max
+        local_neis = get_two_hop_zone(sid_i, graph)
+        local_neis.discard(sid_i)
         local_neis = spatial_radius_filter(local_neis, seg2center, sid_i, R_max)
 
-        # 4.3) Lặp qua các candidate trong 2-hop của sid_i
         for sid_j in local_neis:
             if sid_j not in segid2idx:
                 continue
-            idx_j = segid2idx[sid_j]
 
-            # khoảng cách địa lý giữa i và j
             if (sid_i not in seg2center) or (sid_j not in seg2center):
                 continue
+
             lat_i, lon_i = seg2center[sid_i]
             lat_j, lon_j = seg2center[sid_j]
             d_ij = haversine_distance(lat_i, lon_i, lat_j, lon_j)
-            if d_ij < Dmin or d_ij > Dmax:
+            if not (Dmin <= d_ij <= Dmax):
                 continue
 
-            # cross-correlation (lead–lag)
-            Wpos, tau_peak, _ = link_weight_pos(x_i, values[:, idx_j], tau_max=tau_max)
+            idx_j = segid2idx[sid_j]
+            Wpos, tau_peak, _ = link_weight_pos(
+                x_i, values[:, idx_j], tau_max=tau_max
+            )
+
             if abs(tau_peak) > tau_cut:
                 continue
             if Wpos < Wmin:
@@ -557,15 +543,13 @@ def build_zone(output_dir, seed_seg_id, R_max=2000, tau_max=10,
             correlated_segids.add(sid_j)
             link_weights[(idx_i, idx_j)] = float(Wpos)
 
-    # 5) Zone cuối cùng = zone ban đầu ∪ các tuyến liên quan
+    # --------- 3) final zone (base + correlated) ----------
     final_segids = set(zone_segids) | correlated_segids
 
-    # 6) Nếu quá nhiều node => giới hạn top_k nhưng luôn giữ toàn bộ zone ban đầu
     if top_k is not None and len(final_segids) > top_k:
         base_segids = set(zone_segids)
         extra_segids = list(final_segids - base_segids)
 
-        # score mỗi node = max Wpos của các link liên quan tới node đó
         node_score = {sid: 0.0 for sid in extra_segids}
         for (gi, gj), w in link_weights.items():
             sid_gi = int(segment_ids[gi])
@@ -575,19 +559,22 @@ def build_zone(output_dir, seed_seg_id, R_max=2000, tau_max=10,
             if sid_gj in node_score:
                 node_score[sid_gj] = max(node_score[sid_gj], w)
 
-        extra_sorted = sorted(extra_segids, key=lambda s: node_score.get(s, 0.0), reverse=True)
-        remain_slots = max(0, top_k - len(base_segids))
-        extra_kept = extra_sorted[:remain_slots]
-        final_segids = base_segids | set(extra_kept)
+        extra_sorted = sorted(
+            extra_segids, key=lambda s: node_score.get(s, 0.0), reverse=True
+        )
+        remain = max(0, top_k - len(base_segids))
+        final_segids = base_segids | set(extra_sorted[:remain])
 
-    # 7) Convert final seg_id -> global idx
+    # --------- 4) convert seg_id -> global idx ----------
     final_segids = list(final_segids)
-    # có thể ưu tiên seed đứng đầu cho dễ debug
-    final_segids_sorted = [seed_seg_id] + [s for s in final_segids if s != seed_seg_id]
-    final_indices = np.array([segid2idx[s] for s in final_segids_sorted], dtype=np.int64)
+    final_segids_sorted = [seed_seg_id] + [
+        s for s in final_segids if s != seed_seg_id
+    ]
+    final_indices = np.array(
+        [segid2idx[s] for s in final_segids_sorted], dtype=np.int64
+    )
 
-    # 8) Build adjacency + Laplacian CHỈ TỪ EDGES NỘI BỘ TRONG ZONE
-    #    → Spatial PE thể hiện quan hệ không gian giữa tất cả tuyến trong vùng
+    # --------- 5) build adjacency from internal edges ----------
     edges = pd.read_csv(output_dir / "edges.csv")
 
     zone_set = set(final_segids_sorted)
@@ -599,9 +586,9 @@ def build_zone(output_dir, seed_seg_id, R_max=2000, tau_max=10,
     for _, row in edges.iterrows():
         su = int(row["segment_u"])
         sv = int(row["segment_v"])
-        # nếu 2 segment này đều nằm trong zone_final thì thêm cạnh
         if (su not in zone_set) or (sv not in zone_set):
             continue
+
         iu = global2local[segid2idx[su]]
         iv = global2local[segid2idx[sv]]
 
@@ -609,33 +596,42 @@ def build_zone(output_dir, seed_seg_id, R_max=2000, tau_max=10,
             lat_u, lon_u = seg2center[su]
             lat_v, lon_v = seg2center[sv]
             d_uv = haversine_distance(lat_u, lon_u, lat_v, lon_v)
-            w = float(np.exp(-d_uv / sigma))   # weight theo distance
+            w = float(np.exp(-d_uv / sigma))
         else:
             w = 1.0
 
         A[iu, iv] += w
         A[iv, iu] += w
 
-    # Không thêm self-loop
     np.fill_diagonal(A, 0.0)
 
-    # 9) Laplacian eigenvectors
+    # --------- 6) Laplacian + eigen (torch, stable) ----------
     d_vec = A.sum(axis=1)
     D = np.diag(d_vec)
     L = D - A
 
-    evals, evecs = np.linalg.eigh(L)
+    L = 0.5 * (L + L.T)
+    L = L.astype(np.float64, copy=False)
+    L = L + 1e-5 * np.eye(N_zone, dtype=np.float64)
+
+    Lt = torch.from_numpy(L)
+    evals, evecs = torch.linalg.eigh(Lt)
+    evals = evals.numpy()
+    evecs = evecs.numpy()
+
     order = np.argsort(evals)
-    if d_spa < N_zone:
-        order = order[:d_spa]
-    lap_eigvec = evecs[:, order].astype("float32")  # (N_zone, d_spa)
+    num_vecs = min(d_spa, N_zone)
+    order = order[:num_vecs]
+
+    lap_eigvec = np.zeros((N_zone, d_spa), dtype="float32")
+    lap_eigvec[:, :num_vecs] = evecs[:, order].astype("float32")
 
     return {
         "seed_segment_id": seed_seg_id,
-        "zone_indices": final_indices,                 # index vào traffic_tensor
+        "zone_indices": final_indices,
         "zone_segment_ids": segment_ids[final_indices],
-        "adjacency": A,                                # (N_zone, N_zone)
-        "lap_eigvec": lap_eigvec,                      # (N_zone, d_spa)
+        "adjacency": A,
+        "lap_eigvec": lap_eigvec,
     }
 
 #%%
