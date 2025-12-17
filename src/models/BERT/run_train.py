@@ -7,7 +7,7 @@ from .model_sttransformer import STEncoderOnly, ModelParams
 from .train import train_model, TrainParams
 from pathlib import Path
 
-from matrix_correla import DBSCANParams, ZoneParams, CorrParams
+from .matrix_correla import DBSCANParams, ZoneParams, CorrParams
 import torch
 import os
 
