@@ -8,6 +8,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from .model_sttransformer import STEncoderOnly, ModelParams
+import time
+import logging
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -71,33 +74,73 @@ def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.O
     n_batches = 0
     met_sum = {"acc": 0.0, "prec": 0.0, "rec": 0.0, "f1": 0.0}
 
-    for batch in loader:
-        x = batch["x"].to(device)                 # (B,L,N,d)
-        tod = batch["tod"].to(device)
-        dow = batch["dow"].to(device)
-        lap = batch["lap"].to(device)
-        y = batch["y"].to(device)
-        node_mask = batch["node_mask"].to(device)
-        final_mask = batch["final_mask"].to(device)
+    t_epoch0 = time.time()
+    t_prev = time.time()
 
-        # IMPORTANT: eval also passes node_mask into model
+    for it, batch in enumerate(loader):
+        # ---- (1) đo thời gian "load batch" (từ lần trước tới lúc batch xuất hiện)
+        load_s = time.time() - t_prev
+
+        if it == 0:
+            log.info(f"[{'train' if train else 'val'}] First batch arrived | load_time={load_s:.2f}s")
+            # in nhanh shape để chắc chắn data đúng
+            log.info(
+                f"Shapes: x={tuple(batch['x'].shape)} tod={tuple(batch['tod'].shape)} "
+                f"dow={tuple(batch['dow'].shape)} lap={tuple(batch['lap'].shape)} "
+                f"y={tuple(batch['y'].shape)} node_mask={tuple(batch['node_mask'].shape)} "
+                f"final_mask={tuple(batch['final_mask'].shape)}"
+            )
+
+        t0 = time.time()
+
+        # ---- (2) copy to device (đo riêng)
+        x = batch["x"].to(device, non_blocking=True)                 # (B,L,N,d)
+        tod = batch["tod"].to(device, non_blocking=True)
+        dow = batch["dow"].to(device, non_blocking=True)
+        lap = batch["lap"].to(device, non_blocking=True)
+        y = batch["y"].to(device, non_blocking=True)
+        node_mask = batch["node_mask"].to(device, non_blocking=True)
+        final_mask = batch["final_mask"].to(device, non_blocking=True)
+
+        t1 = time.time()
+        todev_s = t1 - t0
+
+        # ---- (3) forward
         logits = model(x=x, tod=tod, dow=dow, lap=lap, node_mask=node_mask)
-
         loss = masked_bce_loss(logits, y, final_mask)
+        t2 = time.time()
+        fwd_s = t2 - t1
 
+        # ---- (4) backward/step
+        bwd_s = 0.0
         if train:
             optim.zero_grad(set_to_none=True)
             loss.backward()
             if tp.grad_clip is not None and tp.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), tp.grad_clip)
             optim.step()
+            t3 = time.time()
+            bwd_s = t3 - t2
+        else:
+            t3 = time.time()
+
+        # ---- (5) metrics
+        m = masked_metrics(logits, y, final_mask, thresh=tp.thresh)
+        for k in met_sum:
+            met_sum[k] += m[k]
 
         total_loss += float(loss.item())
         n_batches += 1
 
-        m = masked_metrics(logits, y, final_mask, thresh=tp.thresh)
-        for k in met_sum:
-            met_sum[k] += m[k]
+        # ---- (6) log định kỳ
+        if it % 10 == 0:
+            log.info(
+                f"[{'train' if train else 'val'}] it={it:04d} "
+                f"load={load_s:.2f}s todev={todev_s:.2f}s fwd={fwd_s:.2f}s bwd={bwd_s:.2f}s "
+                f"loss={loss.item():.4f} mask_sum={final_mask.sum().item()}"
+            )
+
+        t_prev = time.time()
 
     if n_batches == 0:
         return {"loss": 0.0, **met_sum}
@@ -105,13 +148,18 @@ def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.O
     out = {"loss": total_loss / n_batches}
     for k in met_sum:
         out[k] = met_sum[k] / n_batches
+
+    log.info(f"[{'train' if train else 'val'}] epoch_done in {time.time() - t_epoch0:.1f}s")
     return out
 
 
 def train_model(model: STEncoderOnly, train_loader: DataLoader, val_loader: DataLoader, tp: TrainParams):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
+    log.info("Entered train_model()")
+
     device = tp.device
     model.to(device)
-
+    log.info(f"Model moved to {device}")
     optim = torch.optim.AdamW(model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
 
     best_f1 = -1.0
