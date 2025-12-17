@@ -375,22 +375,24 @@ class ZoneBuilder:
 
     def sample_seed_cluster(self, t: int) -> Dict[str, Any]:
         """
-        Returns meta describing chosen seed:
-          - seed_type: 'congested' or 'non_congested'
-          - seed_cluster_indices: list of global indices in seed cluster/region
-          - seed_center_latlon: (2,)
-          - clusters stats
+        Fast seed sampling:
+          - 60%: pick a DBSCAN cluster from congested segments (y==1)
+          - 40%: pick a random non-congested segment (y==0) as a "singleton seed cluster"
+        Avoids DBSCAN on non-congested set (usually huge), which causes O(M^2) distance matrix blow-up.
         """
-        p = self.zone.seed_congested_ratio
+        p = float(self.zone.seed_congested_ratio)
         choose_cong = (self.rng.random() < p)
 
+        # --- only DBSCAN congested ---
         labels_c, clusters_c = self._dbscan_clusters_at_t(t, congested=True)
-        labels_n, clusters_n = self._dbscan_clusters_at_t(t, congested=False)
+
+        y = self.traffic.is_congested[t].astype(np.int8)
+        noncong = np.where(y == 0)[0]
+        cong = np.where(y == 1)[0]
 
         def pick_from_clusters(clusters: Dict[int, List[int]]) -> Optional[List[int]]:
             if not clusters:
                 return None
-            # pick cluster proportional to size (or uniform)
             keys = list(clusters.keys())
             sizes = np.array([len(clusters[k]) for k in keys], dtype=np.float32)
             probs = sizes / (sizes.sum() + 1e-6)
@@ -398,19 +400,29 @@ class ZoneBuilder:
             return clusters[k]
 
         seed_indices: Optional[List[int]] = None
-        seed_type = "congested" if choose_cong else "non_congested"
+        seed_type: str = "congested" if choose_cong else "non_congested"
 
         if choose_cong:
+            # try congested DBSCAN cluster
             seed_indices = pick_from_clusters(clusters_c)
             if seed_indices is None:
-                # fallback to non-congested if no congested segments at this t
-                seed_indices = pick_from_clusters(clusters_n)
-                seed_type = "non_congested"
+                # fallback: pick any congested segment as singleton
+                if cong.size > 0:
+                    seed_indices = [int(self.rng.choice(cong))]
+                    seed_type = "congested_singleton"
         else:
-            seed_indices = pick_from_clusters(clusters_n)
-            if seed_indices is None:
+            # non-congested: pick random segment as singleton (NO DBSCAN)
+            if noncong.size > 0:
+                seed_indices = [int(self.rng.choice(noncong))]
+                seed_type = "non_congested_singleton"
+            else:
+                # fallback to congested cluster/singleton
                 seed_indices = pick_from_clusters(clusters_c)
-                seed_type = "congested"
+                if seed_indices is not None:
+                    seed_type = "congested"
+                elif cong.size > 0:
+                    seed_indices = [int(self.rng.choice(cong))]
+                    seed_type = "congested_singleton"
 
         if seed_indices is None or len(seed_indices) == 0:
             # last-resort fallback: random segment
@@ -426,10 +438,11 @@ class ZoneBuilder:
             "seed_type": seed_type,
             "seed_cluster_indices": [int(x) for x in seed_indices],
             "seed_center_latlon": seed_center,
+            # stats (optional)
             "num_congested_clusters": int(len(clusters_c)),
-            "num_noncongested_clusters": int(len(clusters_n)),
             "congested_cluster_sizes": [len(v) for v in clusters_c.values()],
-            "noncongested_cluster_sizes": [len(v) for v in clusters_n.values()],
+            "num_noncongested_clusters": -1,  # not computed anymore
+            "noncongested_cluster_sizes": [],
         }
 
     # ------------------------
