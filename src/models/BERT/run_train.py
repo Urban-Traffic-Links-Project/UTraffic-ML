@@ -1,10 +1,10 @@
 # run_train.py
 from torch.utils.data import DataLoader
 
-from dataset_zones import TrafficZoneDataset, DatasetParams
-from collate import pad_collate_zones
-from model_sttransformer import STEncoderOnly, ModelParams
-from train import train_model, TrainParams
+from .dataset_zones import TrafficZoneDataset, DatasetParams
+from .collate import pad_collate_zones
+from .model_sttransformer import STEncoderOnly, ModelParams
+from .train import train_model, TrainParams
 from pathlib import Path
 
 from matrix_correla import DBSCANParams, ZoneParams, CorrParams
