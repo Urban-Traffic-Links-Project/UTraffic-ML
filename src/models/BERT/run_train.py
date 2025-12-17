@@ -60,10 +60,10 @@ def main():
     zone = ZoneParams(
         seed_congested_ratio=0.6,
         hops=1,              # 2 -> 1
-        R_max_m=1000.0,      # 1500 -> 1000
+        R_max_m=1500.0,      # 1500 -> 1000
         D_min_m=0.0,
         D_max_m=3000.0,
-        top_k=32,            # 64 -> 32
+        top_k=15,            # 64 -> 32
         corr=CorrParams(tau_max=3, tau_cut=3, W_min=0.2, eps=1e-6),
         d_spa=16,
         laplacian_mode="edges",
@@ -96,29 +96,29 @@ def main():
     # 3) DataLoader (tối ưu)
     # -------------------------
     # Kaggle thường 2–8 cores: thử 4 trước
-    num_workers = 4
+    num_workers = 0
     log.info("Init dataloaders...")
 
     train_loader = DataLoader(
         train_set,
-        batch_size=8,
+        batch_size=1,
         shuffle=True,
         num_workers=num_workers,
         collate_fn=pad_collate_zones,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=(num_workers > 0),
+        persistent_workers=False,
         prefetch_factor=2 if num_workers > 0 else None,
         drop_last=True,  # ổn định batch / tăng tốc nhẹ
     )
 
     val_loader = DataLoader(
         val_set,
-        batch_size=8,
+        batch_size=1,
         shuffle=False,
         num_workers=num_workers,
         collate_fn=pad_collate_zones,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=(num_workers > 0),
+        persistent_workers=False,
         prefetch_factor=2 if num_workers > 0 else None,
     )
 
