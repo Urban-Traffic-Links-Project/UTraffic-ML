@@ -11,14 +11,7 @@ from .matrix_correla import DBSCANParams, ZoneParams, CorrParams
 import torch
 import os
 
-# ===== CPU tuning (AMD / non-CUDA) =====
-torch.set_num_threads(8)        # số core CPU bạn muốn dùng
-torch.set_num_interop_threads(2)
 
-os.environ["OMP_NUM_THREADS"] = "8"
-os.environ["MKL_NUM_THREADS"] = "8"
-
-print("Torch threads:", torch.get_num_threads())
 
 def main():
     THIS_FILE = os.getcwd()
