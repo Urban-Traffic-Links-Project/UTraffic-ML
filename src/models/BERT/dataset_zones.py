@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from matrix_correla import (
+from .matrix_correla import (
     load_traffic_tensor,
     load_graph_topology,
     ZoneBuilder, DBSCANParams, ZoneParams, CorrParams

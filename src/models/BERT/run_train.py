@@ -21,18 +21,18 @@ os.environ["MKL_NUM_THREADS"] = "8"
 print("Torch threads:", torch.get_num_threads())
 
 def main():
-    THIS_FILE = Path(__file__).resolve()
-    PROJECT_ROOT = THIS_FILE.parents[3]
+    THIS_FILE = os.getcwd()
+    CWD = THIS_FILE
 
-    DATA_DIR = PROJECT_ROOT / "data" / "processed" / "tomtom_stats"
+    DATA_DIR = os.path.join(CWD, "data", "processed", "tomtom_stats")
 
-    traffic_npz = DATA_DIR / "traffic_tensor.npz"
-    segments_csv = DATA_DIR / "segments.csv"
-    nodes_csv = DATA_DIR / "nodes.csv"
-    edges_csv = DATA_DIR / "edges.csv"
-    segment_index_csv = DATA_DIR / "segment_index.csv"
+    traffic_npz = os.path.join(DATA_DIR, "traffic_tensor.npz")
+    segments_csv = os.path.join(DATA_DIR, "segments.csv")
+    nodes_csv = os.path.join(DATA_DIR, "nodes.csv")
+    edges_csv = os.path.join(DATA_DIR, "edges.csv")
+    segment_index_csv = os.path.join(DATA_DIR, "segment_index.csv")
 
-    print("Project root:", PROJECT_ROOT)
+    print("Project root:", CWD)
     print("Data dir:", DATA_DIR)
     print("Traffic:", traffic_npz)
 

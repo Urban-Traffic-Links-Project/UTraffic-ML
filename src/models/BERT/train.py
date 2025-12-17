@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from model_sttransformer import STEncoderOnly, ModelParams
+from .model_sttransformer import STEncoderOnly, ModelParams
 
 
 @dataclass
