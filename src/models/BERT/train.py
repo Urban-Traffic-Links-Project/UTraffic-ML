@@ -64,9 +64,57 @@ def masked_metrics(logits: torch.Tensor, y: torch.Tensor, final_mask: torch.Tens
     f1 = (2 * prec * rec) / max(1e-9, (prec + rec))
     return {"acc": acc, "prec": prec, "rec": rec, "f1": f1}
 
+@torch.no_grad()
+def best_f1_over_thresholds(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    final_mask: torch.Tensor,
+    thrs = None,
+):
+    """
+    Scan thresholds and return (best_thr, best_f1, best_prec, best_rec).
+    logits, y, final_mask: (B,N)
+    """
+    probs = torch.sigmoid(logits)
+    m = final_mask.bool()
+
+    if m.sum() == 0:
+        return 0.5, 0.0, 0.0, 0.0
+
+    probs_m = probs[m]
+    yt = (y[m] >= 0.5).to(torch.int64)
+
+    if thrs is None:
+        thrs = torch.linspace(0.05, 0.95, 19, device=probs_m.device)
+
+    best_thr = 0.5
+    best_f1 = -1.0
+    best_prec = 0.0
+    best_rec = 0.0
+
+    for thr in thrs:
+        pred = (probs_m >= thr).to(torch.int64)
+        tp = ((pred == 1) & (yt == 1)).sum().item()
+        fp = ((pred == 1) & (yt == 0)).sum().item()
+        fn = ((pred == 0) & (yt == 1)).sum().item()
+
+        prec = tp / max(1, tp + fp)
+        rec  = tp / max(1, tp + fn)
+        f1   = (2 * prec * rec) / max(1e-9, prec + rec)
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = float(thr.item())
+            best_prec = prec
+            best_rec = rec
+
+    return best_thr, float(best_f1), float(best_prec), float(best_rec)
 
 def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.Optimizer,
                   tp: TrainParams, train: bool) -> Dict[str, float]:
+    all_logits = []
+    all_y = []
+    all_mask = []
     device = tp.device
     model.train(train)
 
@@ -122,6 +170,9 @@ def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.O
             t3 = time.time()
             bwd_s = t3 - t2
         else:
+            all_logits.append(logits.detach().cpu())
+            all_y.append(y.detach().cpu())
+            all_mask.append(final_mask.detach().cpu())
             t3 = time.time()
 
         # ---- (5) metrics
@@ -150,6 +201,15 @@ def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.O
         out[k] = met_sum[k] / n_batches
 
     log.info(f"[{'train' if train else 'val'}] epoch_done in {time.time() - t_epoch0:.1f}s")
+    if not train:
+        logits_cat = torch.cat(all_logits, dim=0)
+        y_cat = torch.cat(all_y, dim=0)
+        mask_cat = torch.cat(all_mask, dim=0)
+        best_thr, best_f1, best_prec, best_rec = best_f1_over_thresholds(logits_cat, y_cat, mask_cat)
+        out["best_thr"] = best_thr
+        out["best_f1"] = best_f1
+        out["best_prec"] = best_prec
+        out["best_rec"] = best_rec
     return out
 
 
@@ -208,9 +268,12 @@ def train_model(model: STEncoderOnly, train_loader: DataLoader, val_loader: Data
         tr = run_one_epoch(model, train_loader, optim, tp, train=True)
         va = run_one_epoch(model, val_loader, optim, tp, train=False)
 
-        print(f"[Epoch {ep+1}/{tp.epochs}] "
-              f"train loss={tr['loss']:.4f} f1={tr['f1']:.3f} | "
-              f"val loss={va['loss']:.4f} f1={va['f1']:.3f}")
+        print(
+            f"[Epoch {ep + 1}/{tp.epochs}] "
+            f"train loss={tr['loss']:.4f} prec={tr['prec']:.3f} rec={tr['rec']:.3f} f1={tr['f1']:.3f} | "
+            f"val loss={va['loss']:.4f} prec={va['prec']:.3f} rec={va['rec']:.3f} f1={va['f1']:.3f} |"
+            f"best_f1={va.get('best_f1', 0.0):.3f} thr={va.get('best_thr', 0.5):.2f}"
+        )
 
         if va["f1"] > best_f1:
             best_f1 = va["f1"]
