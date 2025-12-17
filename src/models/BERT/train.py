@@ -22,6 +22,37 @@ class TrainParams:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     thresh: float = 0.5  # for metrics
 
+@torch.no_grad()
+def best_f1_over_thresholds_1d(probs_1d: torch.Tensor, y01_1d: torch.Tensor, thrs=None):
+    """
+    probs_1d: (K,) float in [0,1]
+    y01_1d:   (K,) int64 {0,1}
+    """
+    if probs_1d.numel() == 0:
+        return 0.5, 0.0, 0.0, 0.0
+
+    if thrs is None:
+        thrs = torch.linspace(0.05, 0.95, 19)
+
+    best_thr, best_f1, best_prec, best_rec = 0.5, -1.0, 0.0, 0.0
+
+    for thr in thrs:
+        pred = (probs_1d >= thr).to(torch.int64)
+        tp = ((pred == 1) & (y01_1d == 1)).sum().item()
+        fp = ((pred == 1) & (y01_1d == 0)).sum().item()
+        fn = ((pred == 0) & (y01_1d == 1)).sum().item()
+
+        prec = tp / max(1, tp + fp)
+        rec  = tp / max(1, tp + fn)
+        f1   = (2 * prec * rec) / max(1e-9, prec + rec)
+
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = float(thr.item())
+            best_prec = float(prec)
+            best_rec = float(rec)
+
+    return best_thr, float(best_f1), float(best_prec), float(best_rec)
 
 def masked_bce_loss(logits: torch.Tensor, y: torch.Tensor, final_mask: torch.Tensor) -> torch.Tensor:
     """
@@ -112,8 +143,8 @@ def best_f1_over_thresholds(
 
 def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.Optimizer,
                   tp: TrainParams, train: bool) -> Dict[str, float]:
-    all_logits = []
-    all_y = []
+    all_probs_m = []
+    all_y_m = []
     all_mask = []
     device = tp.device
     model.train(train)
@@ -170,9 +201,13 @@ def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.O
             t3 = time.time()
             bwd_s = t3 - t2
         else:
-            all_logits.append(logits.detach().cpu())
-            all_y.append(y.detach().cpu())
-            all_mask.append(final_mask.detach().cpu())
+            with torch.no_grad():
+                probs = torch.sigmoid(logits)
+                m = final_mask.bool()
+                if m.any():
+                    all_probs_m.append(probs[m].detach().cpu())  # (K,)
+                    all_y_m.append((y[m] >= 0.5).detach().cpu())  # (K,) bool
+
             t3 = time.time()
 
         # ---- (5) metrics
@@ -202,14 +237,21 @@ def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.O
 
     log.info(f"[{'train' if train else 'val'}] epoch_done in {time.time() - t_epoch0:.1f}s")
     if not train:
-        logits_cat = torch.cat(all_logits, dim=0)
-        y_cat = torch.cat(all_y, dim=0)
-        mask_cat = torch.cat(all_mask, dim=0)
-        best_thr, best_f1, best_prec, best_rec = best_f1_over_thresholds(logits_cat, y_cat, mask_cat)
-        out["best_thr"] = best_thr
-        out["best_f1"] = best_f1
-        out["best_prec"] = best_prec
-        out["best_rec"] = best_rec
+        if len(all_probs_m) == 0:
+            out["best_thr"] = 0.5
+            out["best_f1"] = 0.0
+            out["best_prec"] = 0.0
+            out["best_rec"] = 0.0
+        else:
+            probs_all = torch.cat(all_probs_m, dim=0)  # (TotalK,)
+            y_all = torch.cat(all_y_m, dim=0).to(torch.int64)  # (TotalK,)
+
+            best_thr, best_f1, best_prec, best_rec = best_f1_over_thresholds_1d(probs_all, y_all)
+            out["best_thr"] = best_thr
+            out["best_f1"] = best_f1
+            out["best_prec"] = best_prec
+            out["best_rec"] = best_rec
+
     return out
 
 
@@ -275,8 +317,9 @@ def train_model(model: STEncoderOnly, train_loader: DataLoader, val_loader: Data
             f"best_f1={va.get('best_f1', 0.0):.3f} thr={va.get('best_thr', 0.5):.2f}"
         )
 
-        if va["f1"] > best_f1:
-            best_f1 = va["f1"]
+        score = va.get("best_f1", va["f1"])
+        if score > best_f1:
+            best_f1 = score
             best_state = {k: v.cpu() for k, v in model.state_dict().items()}
 
     if best_state is not None:
