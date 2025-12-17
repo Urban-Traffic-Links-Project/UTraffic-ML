@@ -55,7 +55,7 @@ def main():
     # FAST PRESET (để debug tốc độ trước)
     # - hist_len_corr nhỏ hơn => xcorr nhanh hơn
     # - hops=1, R_max nhỏ hơn, top_k nhỏ hơn => candidates ít => giảm O(M^2)
-    ds = DatasetParams(L=11, delta=1, hist_len_corr=24)  # 48 -> 24 (nhanh hơn)
+    ds = DatasetParams(L=4, delta=1, hist_len_corr=4)  # 48 -> 24 (nhanh hơn)
 
     zone = ZoneParams(
         seed_congested_ratio=0.6,
@@ -75,11 +75,11 @@ def main():
     log.info("Init datasets...")
     train_set = TrafficZoneDataset(
         traffic_npz, segments_csv, nodes_csv, edges_csv, segment_index_csv,
-        split="train", ds=ds, dbscan=db, zone=zone, seed=13
+        split="train", ds=ds, dbscan=db, zone=zone, seed=42
     )
     val_set = TrafficZoneDataset(
         traffic_npz, segments_csv, nodes_csv, edges_csv, segment_index_csv,
-        split="val", ds=ds, dbscan=db, zone=zone, seed=13
+        split="val", ds=ds, dbscan=db, zone=zone, seed=42
     )
     log.info("[DEBUG] Single-process sanity: calling train_set[0] ...")
     t0 = time.time()
@@ -106,7 +106,7 @@ def main():
         num_workers=num_workers,
         collate_fn=pad_collate_zones,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=False,
+        persistent_workers=(num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None,
         drop_last=True,  # ổn định batch / tăng tốc nhẹ
     )
@@ -118,7 +118,7 @@ def main():
         num_workers=num_workers,
         collate_fn=pad_collate_zones,
         pin_memory=torch.cuda.is_available(),
-        persistent_workers=False,
+        persistent_workers=(num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None,
     )
 
