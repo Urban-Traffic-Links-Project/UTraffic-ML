@@ -9,6 +9,15 @@ from .matrix_correla import DBSCANParams, ZoneParams, CorrParams
 import torch
 import os
 
+import time
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
 def main():
     # -------------------------
@@ -63,7 +72,7 @@ def main():
         cache_dir="./cache_zone",
     )
     db = DBSCANParams(eps_m=250.0, min_samples=3)
-
+    log.info("Init datasets...")
     train_set = TrafficZoneDataset(
         traffic_npz, segments_csv, nodes_csv, edges_csv, segment_index_csv,
         split="train", ds=ds, dbscan=db, zone=zone, seed=13
@@ -77,7 +86,8 @@ def main():
     # 3) DataLoader (tối ưu)
     # -------------------------
     # Kaggle thường 2–8 cores: thử 4 trước
-    num_workers = 4
+    num_workers = 8
+    log.info("Init dataloaders...")
 
     train_loader = DataLoader(
         train_set,
@@ -105,6 +115,8 @@ def main():
     # -------------------------
     # 4) Model
     # -------------------------
+    log.info("Init model...")
+
     mp = ModelParams(d_in=1, d_model=128, nhead=4, num_layers=4, dropout=0.1, d_spa=zone.d_spa, L_max=64)
     model = STEncoderOnly(mp)
 
