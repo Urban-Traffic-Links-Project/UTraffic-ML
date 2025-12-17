@@ -160,6 +160,45 @@ def train_model(model: STEncoderOnly, train_loader: DataLoader, val_loader: Data
     device = tp.device
     model.to(device)
     log.info(f"Model moved to {device}")
+    import threading
+    import traceback
+
+    def _fetch_first_batch(loader, out_dict):
+        try:
+            it = iter(loader)
+            out_dict["batch"] = next(it)  # <-- chỗ hay kẹt
+        except Exception as e:
+            out_dict["exc"] = e
+            out_dict["tb"] = traceback.format_exc()
+
+    log.info("[DEBUG] Sanity: fetching FIRST train batch...")
+    shared = {}
+    th = threading.Thread(target=_fetch_first_batch, args=(train_loader, shared), daemon=True)
+    t0 = time.time()
+    th.start()
+
+    # heartbeat mỗi 10s, báo đang chờ batch
+    while th.is_alive():
+        waited = time.time() - t0
+        log.info(f"[DEBUG] Waiting for first batch... {waited:.1f}s")
+        time.sleep(10.0)
+
+    # thread kết thúc: hoặc lấy được batch, hoặc exception
+    if "exc" in shared:
+        log.error("[DEBUG] First batch FAILED with exception!")
+        log.error(str(shared["exc"]))
+        log.error(shared.get("tb", ""))
+        raise shared["exc"]
+
+    batch0 = shared["batch"]
+    log.info(f"[DEBUG] First batch OK in {time.time() - t0:.1f}s")
+    log.info(
+        f"[DEBUG] batch0 shapes: x={tuple(batch0['x'].shape)} tod={tuple(batch0['tod'].shape)} "
+        f"dow={tuple(batch0['dow'].shape)} lap={tuple(batch0['lap'].shape)} "
+        f"y={tuple(batch0['y'].shape)} node_mask={tuple(batch0['node_mask'].shape)} "
+        f"final_mask={tuple(batch0['final_mask'].shape)}"
+    )
+
     optim = torch.optim.AdamW(model.parameters(), lr=tp.lr, weight_decay=tp.weight_decay)
 
     best_f1 = -1.0

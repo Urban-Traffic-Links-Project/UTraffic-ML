@@ -81,6 +81,16 @@ def main():
         traffic_npz, segments_csv, nodes_csv, edges_csv, segment_index_csv,
         split="val", ds=ds, dbscan=db, zone=zone, seed=13
     )
+    log.info("[DEBUG] Single-process sanity: calling train_set[0] ...")
+    t0 = time.time()
+    _ = train_set[0]
+    log.info(f"[DEBUG] train_set[0] OK in {time.time() - t0:.1f}s")
+
+    log.info("[DEBUG] Single-process sanity: fetching 1 batch with num_workers=0 ...")
+    dbg_loader = DataLoader(train_set, batch_size=2, shuffle=False, num_workers=0, collate_fn=pad_collate_zones)
+    t0 = time.time()
+    _ = next(iter(dbg_loader))
+    log.info(f"[DEBUG] first batch (nw=0) OK in {time.time() - t0:.1f}s")
 
     # -------------------------
     # 3) DataLoader (tối ưu)
