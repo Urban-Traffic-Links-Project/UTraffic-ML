@@ -343,7 +343,7 @@ class ZoneBuilder:
         lat0, lon0 = seed_center_latlon
         dists = []
         for idx in pool_set:
-            lat, lon = self.topo.segment_center_latlon[idx]  # bạn đã có center cho segment global idx
+            lat, lon = self.topo.centers_latlon[idx]  # bạn đã có center cho segment global idx
             d = haversine_distance_m(lat0, lon0, lat, lon)
             dists.append((d, idx))
         dists.sort(key=lambda x: x[0])
