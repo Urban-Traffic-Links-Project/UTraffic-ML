@@ -6,7 +6,7 @@ import math
 import json
 import pickle
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass,field
 from typing import Dict, Tuple, List, Optional, Iterable, Any, Set
 
 import numpy as np
@@ -251,7 +251,7 @@ class ZoneParams:
     D_max_m: float = 3000.0
     top_k: int = 64
     # correlation params
-    corr: CorrParams = CorrParams()
+    corr: CorrParams = field(default_factory=CorrParams)
     # laplacian PE
     d_spa: int = 16
     laplacian_mode: str = "edges"  # "edges" or "kernel"
