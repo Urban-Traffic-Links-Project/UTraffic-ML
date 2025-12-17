@@ -101,7 +101,7 @@ def main():
 
     train_loader = DataLoader(
         train_set,
-        batch_size=1,
+        batch_size=8,
         shuffle=True,
         num_workers=num_workers,
         collate_fn=pad_collate_zones,
@@ -113,7 +113,7 @@ def main():
 
     val_loader = DataLoader(
         val_set,
-        batch_size=1,
+        batch_size=8,
         shuffle=False,
         num_workers=num_workers,
         collate_fn=pad_collate_zones,

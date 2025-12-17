@@ -372,63 +372,152 @@ class ZoneBuilder:
     # ------------------------
     # Seed selection 60/40
     # ------------------------
+    def _grid_downsample(self, sel: np.ndarray, cell_m: float = 150.0, max_points: int = 12000) -> np.ndarray:
+        """
+        Deterministic spatial downsample: keep at most 1 point per grid cell.
+        If still too many, keep first max_points (deterministic by original order).
+        """
+        if sel.size <= max_points:
+            return sel
+
+        latlon = self.topo.centers_latlon[sel].astype(np.float64)  # degrees
+        lat = latlon[:, 0]
+        lon = latlon[:, 1]
+
+        # Rough meters per degree
+        lat0 = float(np.mean(lat))
+        m_per_deg_lat = 111320.0
+        m_per_deg_lon = 111320.0 * float(np.cos(np.deg2rad(lat0)))
+
+        gx = np.floor((lon * m_per_deg_lon) / cell_m).astype(np.int64)
+        gy = np.floor((lat * m_per_deg_lat) / cell_m).astype(np.int64)
+
+        seen = set()
+        kept = []
+        for i in range(sel.size):
+            key = (int(gx[i]), int(gy[i]))
+            if key not in seen:
+                seen.add(key)
+                kept.append(int(sel[i]))
+                if len(kept) >= max_points:
+                    break
+
+        return np.array(kept, dtype=np.int64)
+
+    def _dbscan_all_points(self, sel: np.ndarray) -> Tuple[np.ndarray, Dict[int, List[int]]]:
+        """
+        DBSCAN on sel using haversine metric (ball_tree). No precomputed MxM.
+        Returns labels and clusters dict.
+        """
+        if sel.size == 0:
+            return np.array([], dtype=np.int32), {}
+
+        latlon_deg = self.topo.centers_latlon[sel].astype(np.float64)
+        latlon_rad = np.deg2rad(latlon_deg)
+        eps_rad = float(self.dbscan.eps_m) / EARTH_RADIUS_M
+
+        clustering = DBSCAN(
+            eps=eps_rad,
+            min_samples=int(self.dbscan.min_samples),
+            metric="haversine",
+            algorithm="ball_tree",
+        )
+        labels = clustering.fit_predict(latlon_rad).astype(np.int32)
+
+        clusters: Dict[int, List[int]] = {}
+        for idx_local, lab in enumerate(labels):
+            if lab < 0:
+                continue
+            gi = int(sel[idx_local])
+            clusters.setdefault(int(lab), []).append(gi)
+
+        return labels, clusters
+
+    def _filter_and_trim_clusters(
+            self,
+            clusters: Dict[int, List[int]],
+            max_radius_m: float = 1500.0,
+            max_cluster_points: int = 400,
+    ) -> Dict[int, List[int]]:
+        """
+        Keep only clusters whose max distance to centroid <= max_radius_m.
+        If cluster too large, trim to nearest max_cluster_points to centroid.
+        """
+        out: Dict[int, List[int]] = {}
+
+        for cid, members in clusters.items():
+            if len(members) == 0:
+                continue
+
+            arr = np.array(members, dtype=np.int64)
+            latlon = self.topo.centers_latlon[arr].astype(np.float32)
+            center = latlon.mean(axis=0)
+
+            # distances to centroid
+            d = np.zeros((arr.size,), dtype=np.float32)
+            lat0, lon0 = float(center[0]), float(center[1])
+            for i in range(arr.size):
+                d[i] = haversine_distance_m(lat0, lon0, float(latlon[i, 0]), float(latlon[i, 1]))
+
+            radius = float(d.max()) if d.size > 0 else 0.0
+            if radius > max_radius_m:
+                continue
+
+            # trim if too big: keep nearest-to-centroid points
+            if arr.size > int(max_cluster_points):
+                order = np.argsort(d)  # nearest first
+                arr = arr[order[: int(max_cluster_points)]]
+
+            out[int(cid)] = [int(x) for x in arr.tolist()]
+
+        return out
 
     def sample_seed_cluster(self, t: int) -> Dict[str, Any]:
-        """
-        Fast seed sampling:
-          - 60%: pick a DBSCAN cluster from congested segments (y==1)
-          - 40%: pick a random non-congested segment (y==0) as a "singleton seed cluster"
-        Avoids DBSCAN on non-congested set (usually huge), which causes O(M^2) distance matrix blow-up.
-        """
         p = float(self.zone.seed_congested_ratio)
-        choose_cong = (self.rng.random() < p)
-
-        # --- only DBSCAN congested ---
-        labels_c, clusters_c = self._dbscan_clusters_at_t(t, congested=True)
+        choose_cong = (self.rng.random() < p)  # giữ ratio 60/40
 
         y = self.traffic.is_congested[t].astype(np.int8)
-        noncong = np.where(y == 0)[0]
-        cong = np.where(y == 1)[0]
+        sel = np.where(y == 1)[0] if choose_cong else np.where(y == 0)[0]
 
-        def pick_from_clusters(clusters: Dict[int, List[int]]) -> Optional[List[int]]:
-            if not clusters:
-                return None
-            keys = list(clusters.keys())
-            sizes = np.array([len(clusters[k]) for k in keys], dtype=np.float32)
-            probs = sizes / (sizes.sum() + 1e-6)
-            k = int(self.rng.choice(keys, p=probs))
-            return clusters[k]
+        # 1) deterministic downsample if too large (NO random)
+        # bạn chỉnh cell_m/max_points theo máy
+        sel = self._grid_downsample(sel.astype(np.int64), cell_m=150.0, max_points=12000)
 
-        seed_indices: Optional[List[int]] = None
-        seed_type: str = "congested" if choose_cong else "non_congested"
+        # 2) DBSCAN on all remaining points (fast haversine)
+        _, clusters = self._dbscan_all_points(sel)
 
-        if choose_cong:
-            # try congested DBSCAN cluster
-            seed_indices = pick_from_clusters(clusters_c)
-            if seed_indices is None:
-                # fallback: pick any congested segment as singleton
-                if cong.size > 0:
-                    seed_indices = [int(self.rng.choice(cong))]
-                    seed_type = "congested_singleton"
-        else:
-            # non-congested: pick random segment as singleton (NO DBSCAN)
-            if noncong.size > 0:
-                seed_indices = [int(self.rng.choice(noncong))]
-                seed_type = "non_congested_singleton"
-            else:
-                # fallback to congested cluster/singleton
-                seed_indices = pick_from_clusters(clusters_c)
-                if seed_indices is not None:
-                    seed_type = "congested"
-                elif cong.size > 0:
-                    seed_indices = [int(self.rng.choice(cong))]
-                    seed_type = "congested_singleton"
+        # 3) keep clusters whose radius <= 1500m, trim huge clusters
+        clusters = self._filter_and_trim_clusters(
+            clusters,
+            max_radius_m=1500.0,
+            max_cluster_points=400,  # cluster quá to thì cắt gần tâm
+        )
 
-        if seed_indices is None or len(seed_indices) == 0:
-            # last-resort fallback: random segment
-            gi = int(self.rng.integers(0, self.traffic.values.shape[1]))
+        # 4) choose a cluster: prefer not-too-large, not-too-tiny (deterministic scoring)
+        if not clusters:
+            # fallback deterministic: pick one point (first)
+            gi = int(sel[0]) if sel.size > 0 else int(self.rng.integers(0, self.traffic.values.shape[1]))
             seed_indices = [gi]
-            seed_type = "fallback_random"
+            seed_type = "fallback_singleton"
+        else:
+            # scoring: size preference + penalty for very large clusters
+            # target size ~ 30-80 tùy bạn; mình đặt 50
+            target_size = 50.0
+            best_cid = None
+            best_score = -1e18
+
+            for cid, members in clusters.items():
+                sz = float(len(members))
+                # score cao nếu size gần target_size; phạt nếu quá to
+                score = -abs(sz - target_size)
+                if sz > 300:
+                    score -= 1000.0  # rất ngại cluster quá lớn
+                if score > best_score:
+                    best_score = score
+                    best_cid = cid
+
+            seed_indices = clusters[int(best_cid)]
+            seed_type = "congested_dbscan_R1500" if choose_cong else "noncongested_dbscan_R1500"
 
         latlon = self.topo.centers_latlon[np.array(seed_indices, dtype=np.int64)]
         seed_center = latlon.mean(axis=0).astype(np.float32)
@@ -438,11 +527,8 @@ class ZoneBuilder:
             "seed_type": seed_type,
             "seed_cluster_indices": [int(x) for x in seed_indices],
             "seed_center_latlon": seed_center,
-            # stats (optional)
-            "num_congested_clusters": int(len(clusters_c)),
-            "congested_cluster_sizes": [len(v) for v in clusters_c.values()],
-            "num_noncongested_clusters": -1,  # not computed anymore
-            "noncongested_cluster_sizes": [],
+            "num_clusters_after_filter": int(len(clusters)),
+            "seed_size": int(len(seed_indices)),
         }
 
     # ------------------------

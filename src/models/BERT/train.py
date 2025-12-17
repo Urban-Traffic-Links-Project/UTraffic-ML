@@ -133,7 +133,7 @@ def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.O
         n_batches += 1
 
         # ---- (6) log định kỳ
-        if it % 10 == 0:
+        if it % 1 == 0:
             log.info(
                 f"[{'train' if train else 'val'}] it={it:04d} "
                 f"load={load_s:.2f}s todev={todev_s:.2f}s fwd={fwd_s:.2f}s bwd={bwd_s:.2f}s "
