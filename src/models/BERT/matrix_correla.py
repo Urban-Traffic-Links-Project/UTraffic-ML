@@ -8,10 +8,16 @@ import pickle
 import hashlib
 from dataclasses import dataclass,field
 from typing import Dict, Tuple, List, Optional, Iterable, Any, Set
-
+import time
 import numpy as np
 import pandas as pd
-
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 try:
     from sklearn.cluster import DBSCAN
 except Exception as e:
@@ -764,8 +770,10 @@ class ZoneBuilder:
         T = self.traffic.values.shape[0]
         if t < 0 or t >= T:
             raise IndexError(f"t out of range: {t} (T={T})")
-
+        tA = time.time()
         meta = self.sample_seed_cluster(t)
+        log.info(f"[zone] sample_seed_cluster: {time.time() - tA:.2f}s")
+
         seed_indices = meta["seed_cluster_indices"]
         seed_center = meta["seed_center_latlon"]
 
@@ -816,12 +824,14 @@ class ZoneBuilder:
             return cached
 
         # compute candidate-vs-candidate correlations
+        tB = time.time()
         pairs, attrs = self._compute_links_candidate_pairwise(
             candidate_indices=candidates,
             t=t,
             hist_len=int(hist_len),
             corr=self.zone.corr,
         )
+        log.info(f"[zone] xcorr pairs: {time.time() - tB:.2f}s | M={len(candidates)}")
 
         # filter links
         kp, ka, kd = self._filter_links(
@@ -850,6 +860,8 @@ class ZoneBuilder:
                 target_mask_zone[pos[g]] = 1
 
         lap = None
+        tC = time.time()
+
         if return_lap:
             lap = self.build_laplacian_eigvec(
                 zone_indices=zone_indices,
@@ -857,6 +869,7 @@ class ZoneBuilder:
                 mode=str(self.zone.laplacian_mode),
                 sigma_m=float(self.zone.sigma_m),
             )
+        log.info(f"[zone] lap eigsh: {time.time() - tC:.2f}s | N={len(zone_indices)}")
 
         out = {
             "zone_indices": [int(x) for x in zone_indices],
