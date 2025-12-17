@@ -259,6 +259,8 @@ class ZoneParams:
     # caching
     enable_cache: bool = True
     cache_dir: str = "./cache_zone"
+    max_candidates: int = 256
+    max_zone_size: int = 512
 
 class ZoneBuilder:
     def __init__(
@@ -319,6 +321,48 @@ class ZoneBuilder:
                 clusters.setdefault(int(lab), []).append(gi)
 
             return labels, clusters
+
+    def _cap_by_distance(
+            self,
+            indices: List[int],
+            seed_center_latlon: Tuple[float, float],
+            keep: Optional[Iterable[int]] = None,
+            cap: int = 512,
+    ) -> List[int]:
+        """
+        Keep 'keep' first, then fill remaining slots by nearest-to-seed.
+        """
+        if cap is None or cap <= 0 or len(indices) <= cap:
+            return sorted(list(dict.fromkeys(indices)))
+
+        keep_set = set(int(x) for x in (keep or []))
+        # Always keep only those that exist in indices ∪ keep
+        pool_set = set(int(x) for x in indices) | keep_set
+
+        # compute dist to seed for pool
+        lat0, lon0 = seed_center_latlon
+        dists = []
+        for idx in pool_set:
+            lat, lon = self.topo.segment_center_latlon[idx]  # bạn đã có center cho segment global idx
+            d = haversine_distance_m(lat0, lon0, lat, lon)
+            dists.append((d, idx))
+        dists.sort(key=lambda x: x[0])
+
+        out = []
+        # 1) keep first (preserve)
+        for k in keep_set:
+            out.append(k)
+        out = list(dict.fromkeys(out))
+
+        # 2) fill by nearest
+        for _, idx in dists:
+            if len(out) >= cap:
+                break
+            if idx not in out:
+                out.append(idx)
+
+        return out
+
     # ------------------------
     # Seed selection 60/40
     # ------------------------
@@ -736,6 +780,14 @@ class ZoneBuilder:
         if not seed_set.issubset(cand_set):
             candidates = sorted(list(cand_set.union(seed_set)))
 
+        if getattr(self.zone, "max_candidates", 0) and len(candidates) > int(self.zone.max_candidates):
+            candidates = self._cap_by_distance(
+                indices=candidates,
+                seed_center_latlon=seed_center,
+                keep=seed_indices,  # keep seeds
+                cap=int(self.zone.max_candidates),
+            )
+
         # cache key (correlation heavy part)
         cache_key = {
             "t": t,
@@ -782,15 +834,20 @@ class ZoneBuilder:
         )
 
         # select targets from links
-        targets_global, target_mask_zone = self._topk_targets_from_links(
+        targets_global, _ = self._topk_targets_from_links(
             candidate_indices=candidates,
             pairs=kp,
             attrs=ka,
             top_k=int(self.zone.top_k),
         )
 
-
         zone_indices = candidates
+        # rebuild target_mask_zone theo zone_indices
+        pos = {int(g): i for i, g in enumerate(zone_indices)}
+        target_mask_zone = np.zeros((len(zone_indices),), dtype=np.int8)
+        for g in targets_global:
+            if g in pos:
+                target_mask_zone[pos[g]] = 1
 
         lap = None
         if return_lap:
