@@ -86,7 +86,7 @@ def main():
     # 3) DataLoader (tối ưu)
     # -------------------------
     # Kaggle thường 2–8 cores: thử 4 trước
-    num_workers = 8
+    num_workers = 4
     log.info("Init dataloaders...")
 
     train_loader = DataLoader(
