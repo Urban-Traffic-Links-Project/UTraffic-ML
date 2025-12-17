@@ -1,637 +1,837 @@
-#%%
+
+from __future__ import annotations
+
+import os
+import math
+import json
+import pickle
+import hashlib
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional, Iterable, Any, Set
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from typing import Dict, Any, Union, Tuple
-from math import radians, sin, cos, asin, sqrt
-import time
-import torch
-#%%
 
-def load_traffic_tensor(output_dir: Union[str, Path]) -> Dict[str, Any]:
-    tensor_path = output_dir / "traffic_tensor.npz"
-    data = np.load(tensor_path)
+try:
+    from sklearn.cluster import DBSCAN
+except Exception as e:
+    DBSCAN = None
 
-    values = data["values"].astype("float32")
-    segment_ids = data["segment_ids"]
-    time_of_day = data["time_of_day"]
-    day_of_week = data["day_of_week"]
-    is_congested = data["is_congested"]
-    return {
-        "values": values,
-        "segment_ids": segment_ids,
-        "time_of_day": time_of_day,
-        "day_of_week": day_of_week,
-        "is_congested": is_congested,
-    }
-# ============================================================
-# 1) Pearson time-lag cross-correlation cho một cặp (i, j)
-# ============================================================
-def cross_corr_time_lag_pair(
-    x: np.ndarray,y:np.ndarray,tau_max:int
-) -> Tuple[np.ndarray,np.ndarray]:
-    assert x.ndim == 1 and y.ndim == 1
-    assert len(x) == len(y)
-    L = len(x)
-    taus = np.arange(-tau_max, tau_max + 1, dtype=int)
-    corrs = np.zeros_like(taus,dtype=np.float32)
+try:
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+except Exception:
+    sp = None
 
-    def _pearson(a: np.ndarray, b: np.ndarray) -> float:
-        if a.size < 2:
-            return 0.0
-        a_mean = a.mean()
-        b_mean = b.mean()
-        a_centered = a - a_mean
-        b_centered = b - b_mean
+EARTH_RADIUS_M = 6371000.0
 
-        num = np.sum(a_centered * b_centered)
-        den = np.sqrt(np.sum(a_centered**2) * np.sum(b_centered**2))
-        if den <= 1e-12:
-            return 0.0
-        return float(num / den)
-    for k, tau in enumerate(taus):
-        if tau == 0:
-            a = x
-            b = y
-        elif tau > 0:
-            a = x[: L - tau]
-            b = y[tau:]
-        else:
-            lag = -tau
-            a = y[: L - lag]
-            b = x[lag:]
-        corrs[k] = _pearson(a, b)
-    return taus, corrs
+def haversine_distance_m(lat1, lon1, lat2, lon2) -> float:
+    """Great-circle distance in meters."""
+    lat1, lon1, lat2, lon2 = map(np.deg2rad, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    c = 2.0 * np.arcsin(np.sqrt(a))
+    return float(EARTH_RADIUS_M * c)
+
+def pairwise_haversine_m(latlon: np.ndarray) -> np.ndarray:
+    """
+    latlon: (M,2) [lat,lon]
+    returns: (M,M) distance matrix meters
+    """
+    lat = np.deg2rad(latlon[:, 0].astype(np.float64))
+    lon = np.deg2rad(latlon[:, 1].astype(np.float64))
+    dlat = lat[:, None] - lat[None, :]
+    dlon = lon[:, None] - lon[None, :]
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat)[:, None] * np.cos(lat)[None, :] * np.sin(dlon / 2) ** 2
+    c = 2 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+    return (EARTH_RADIUS_M * c).astype(np.float32)
+
+def stable_hash(obj: Any) -> str:
+    """Hash for caching keys (stable across runs)."""
+    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    return hashlib.md5(data).hexdigest()
 
 # ============================================================
-# 2) Link weight W^{pos}_{i,j} như paper
+# Data IO
 # ============================================================
 
-def link_weight_pos(x: np.ndarray, y: np.ndarray, tau_max: int) -> Tuple[float, int, float]:
-    taus, corrs = cross_corr_time_lag_pair(x, y, tau_max)
-    max_corr = float(np.max(corrs))
-    tau_peak = int(taus[np.argmax(corrs)])
-    mean_corr = float(np.mean(corrs))
-    std_corr = float(np.std(corrs))
-    if std_corr < 1e-6:
-        std_corr = 1e-6
-    Wpos = (max_corr - mean_corr) / std_corr
-    return float(Wpos), tau_peak, max_corr
+@dataclass
+class TrafficTensor:
+    values: np.ndarray          # (T,N) float32 z-speed
+    is_congested: np.ndarray    # (T,N) int8 0/1
+    segment_ids: np.ndarray     # (N,) int64
+    time_of_day: np.ndarray     # (T,) float32 [0,1]
+    day_of_week: np.ndarray     # (T,) int64 0..6
+    dates: Optional[np.ndarray] = None        # (T,) str 'YYYY-MM-DD'
+    time_set_id: Optional[np.ndarray] = None  # (T,) int32
 
+def load_traffic_tensor(npz_path: str) -> TrafficTensor:
+    z = np.load(npz_path, allow_pickle=True)
+    tt = TrafficTensor(
+        values=z["values"].astype(np.float32),
+        is_congested=z["is_congested"].astype(np.int8),
+        segment_ids=z["segment_ids"].astype(np.int64),
+        time_of_day=z["time_of_day"].astype(np.float32) if "time_of_day" in z else None,
+        day_of_week=z["day_of_week"].astype(np.int64) if "day_of_week" in z else None,
+        dates=z["dates"].astype(str) if "dates" in z else None,
+        time_set_id=z["time_set_id"].astype(np.int32) if "time_set_id" in z else None,
+    )
+    return tt
 
-def compute_anchor_correlations(
-    output_dir: Union[str, Path],
-    anchor_segment_id: Union[int, str],
-    tau_max: int = 3,
-) -> Dict[str, Any]:
+@dataclass
+class GraphTopology:
+    # global index mapping
+    segid_to_idx: Dict[int, int]
+    idx_to_segid: np.ndarray  # (N,)
+    # segment centers lat/lon in global index order
+    centers_latlon: np.ndarray  # (N,2) float32
+    # adjacency list by global index
+    neighbors: List[List[int]]
+
+def load_graph_topology(
+    segments_csv_path: str,
+    nodes_csv_path: str,
+    edges_csv_path: str,
+    segment_index_csv_path: str,
+) -> GraphTopology:
     """
-    Tính link weight W^{pos}_{anchor, j} giữa 1 anchor và toàn bộ segments.
+    Expect:
+      segments.csv: segment_id, node_u, node_v, ...
+      nodes.csv: node_id, lat, lon, ...
+      edges.csv: segment_u, segment_v   (segment IDs, undirected)
+      segment_index.csv: idx, segment_id  (mapping)
     """
-    data = load_traffic_tensor(output_dir)
-    values = data["values"]            # (T, N)
-    segment_ids = data["segment_ids"]  # (N,)
+    seg_df = pd.read_csv(segments_csv_path)
+    node_df = pd.read_csv(nodes_csv_path)
+    edge_df = pd.read_csv(edges_csv_path)
+    map_df = pd.read_csv(segment_index_csv_path)
 
-    # tìm index anchor trong segment_ids
-    mask = (segment_ids == anchor_segment_id)
-    idx_arr = np.where(mask)[0]
-    if len(idx_arr) == 0:
-        raise ValueError(f"Anchor segment_id {anchor_segment_id} not found in segment_ids.")
-    anchor_idx = int(idx_arr[0])
+    # mapping
+    idx_to_segid = map_df.sort_values("idx")["segment_id"].astype(np.int64).values
+    segid_to_idx = {int(s): int(i) for i, s in enumerate(idx_to_segid)}
 
-    x = values[:, anchor_idx]  # (T,)
+    # node coords
+    node_df = node_df.copy()
+    node_df["node_id"] = node_df["node_id"].astype(int)
+    node_lat = dict(zip(node_df["node_id"].values, node_df["lat"].values))
+    node_lon = dict(zip(node_df["node_id"].values, node_df["lon"].values))
 
-    T, N = values.shape
-    weights = np.zeros(N, dtype=np.float32)
-    tau_peaks = np.zeros(N, dtype=np.int32)
-    max_corrs = np.zeros(N, dtype=np.float32)
+    # segment centers
+    seg_df = seg_df.copy()
+    seg_df["segment_id"] = seg_df["segment_id"].astype(np.int64)
+    seg_df["node_u"] = seg_df["node_u"].astype(int)
+    seg_df["node_v"] = seg_df["node_v"].astype(int)
 
-    for j in range(N):
-        if j == anchor_idx:
-            # self-link
-            weights[j] = 0.0
-            tau_peaks[j] = 0
-            max_corrs[j] = 1.0
+    centers = np.zeros((len(idx_to_segid), 2), dtype=np.float32)
+    missing = 0
+    for seg_id, u, v in zip(seg_df["segment_id"].values, seg_df["node_u"].values, seg_df["node_v"].values):
+        if int(seg_id) not in segid_to_idx:
             continue
-
-        y = values[:, j]  # (T,)
-        Wpos, tau_peak, max_corr = link_weight_pos(x, y, tau_max=tau_max)
-
-        weights[j] = Wpos
-        tau_peaks[j] = tau_peak
-        max_corrs[j] = max_corr
-
-    return {
-        "anchor_segment_id": anchor_segment_id,
-        "segment_ids": segment_ids,
-        "anchor_index": anchor_idx,
-        "weights": weights,
-        "tau_peaks": tau_peaks,
-        "max_corrs": max_corrs,
-    }
-
-# ============================================================
-# 3) Haversine distance (m) giữa 2 điểm (lat, lon)
-# ============================================================
-def haversine_distance(lat1, lon1, lat2, lon2) -> float:
-    """
-    lat, lon tính bằng độ. Kết quả trả về mét.
-    """
-    R = 6371000.0  # bán kính Trái Đất (m)
-
-    phi1 = radians(lat1)
-    phi2 = radians(lat2)
-    dphi = radians(lat2 - lat1)
-    dlambda = radians(lon2 - lon1)
-
-    a = sin(dphi / 2.0) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2.0) ** 2
-    c = 2 * asin(sqrt(a))
-    return float(R * c)
-
-
-def load_node_positions(output_dir: Union[str, Path]) -> Dict[int, Tuple[float, float]]:
-    """
-    Đọc nodes.csv → map node_id -> (lat, lon)
-    Giả sử file nằm trong: output_dir / "tomtom_stats" / "nodes.csv"
-    """
-    nodes_path = output_dir  / "nodes.csv"
-    df_nodes = pd.read_csv(nodes_path)
-
-    node2pos: Dict[int, Tuple[float, float]] = {}
-    for _, row in df_nodes.iterrows():
-        node_id = int(row["node_id"])
-        lat = float(row["lat"])
-        lon = float(row["lon"])
-        node2pos[node_id] = (lat, lon)
-    return node2pos
-
-
-def load_segment_centers(output_dir: Union[str, Path]) -> Dict[int, Tuple[float, float]]:
-    """
-    Đọc segments.csv + nodes.csv để tính center (lat, lon)
-    của mỗi segment_id.
-
-    center = midpoint(node_u, node_v) theo lat/lon.
-    """
-    seg_path = output_dir  / "segments.csv"
-
-    df_segments = pd.read_csv(seg_path)
-    node2pos = load_node_positions(output_dir)
-
-    seg2center: Dict[int, Tuple[float, float]] = {}
-    for _, row in df_segments.iterrows():
-        seg_id = int(row["segment_id"])
-        u = int(row["node_u"])
-        v = int(row["node_v"])
-
-        if (u not in node2pos) or (v not in node2pos):
-            # thiếu thông tin node → bỏ qua (sẽ set NaN sau)
+        ui = int(u); vi = int(v)
+        if ui not in node_lat or vi not in node_lat:
+            missing += 1
             continue
-
-        lat_u, lon_u = node2pos[u]
-        lat_v, lon_v = node2pos[v]
-        lat_c = (lat_u + lat_v) / 2.0
-        lon_c = (lon_u + lon_v) / 2.0
-        seg2center[seg_id] = (lat_c, lon_c)
-
-    return seg2center
-
-def compute_dist_to_anchor_from_centers(
-    output_dir: Union[str, Path],
-    segment_ids_tensor: np.ndarray,
-    anchor_index: int,
-) -> np.ndarray:
-    """
-    Từ segment_ids trong traffic_tensor (segment_ids_tensor),
-    dùng segments.csv + nodes.csv để tính center (lat, lon),
-    sau đó tính khoảng cách Haversine từ anchor đến mọi segment.
-
-    return:
-        dist_to_anchor: (N,) mét. Seg nào thiếu center sẽ có dist = +inf.
-    """
-    seg2center = load_segment_centers(output_dir)
-
-    N = len(segment_ids_tensor)
-    lat_all = np.full(N, np.nan, dtype="float32")
-    lon_all = np.full(N, np.nan, dtype="float32")
-
-    # map theo đúng thứ tự segment_ids_tensor
-    for i, sid in enumerate(segment_ids_tensor):
-        sid_int = int(sid)
-        if sid_int in seg2center:
-            lat_all[i] = seg2center[sid_int][0]
-            lon_all[i] = seg2center[sid_int][1]
-        else:
-            # thiếu center → giữ NaN
-            pass
-
-    lat_anchor = float(lat_all[anchor_index])
-    lon_anchor = float(lon_all[anchor_index])
-
-    dist_to_anchor = np.full(N, np.inf, dtype="float32")
-
-    for j in range(N):
-        if j == anchor_index:
-            dist_to_anchor[j] = 0.0
-            continue
-        if np.isnan(lat_all[j]) or np.isnan(lon_all[j]):
-            # không có center → coi như rất xa
-            dist_to_anchor[j] = np.inf
-            continue
-
-        d = haversine_distance(
-            lat_anchor, lon_anchor,
-            float(lat_all[j]), float(lon_all[j])
-        )
-        dist_to_anchor[j] = d
-
-    return dist_to_anchor  # (N,) mét
-
-def build_influenced_subgraph(
-    output_dir: Union[str, Path],
-    corr_info: Dict[str, Any],
-    tau_cut: int = 40,
-    Wmin: float = None,
-    Dmax: float = None,
-    top_k: int = 30,
-) -> Dict[str, Any]:
-    """
-    Lọc các tuyến có khả năng bị anchor (segment tâm vùng) ảnh hưởng, dùng:
-      - |tau_peak| <= tau_cut
-      - Wpos >= Wmin  (nếu Wmin=None thì lấy theo percentile)
-      - dist_to_anchor <= Dmax (mét; nếu Dmax=None thì lấy theo percentile)
-
-    Sau đó sort theo Wpos giảm dần và lấy top_k neighbor.
-    """
-    output_dir = Path(output_dir)
-
-    anchor_segment_id = corr_info["anchor_segment_id"]
-    segment_ids = corr_info["segment_ids"]
-    anchor_idx = int(corr_info["anchor_index"])
-    weights = corr_info["weights"]
-    tau_peaks = corr_info["tau_peaks"]
-    max_corrs = corr_info["max_corrs"]
-
-    # 1) khoảng cách (Haversine) tới anchor, theo thứ tự segment_ids
-    dist_to_anchor = compute_dist_to_anchor_from_centers(
-        output_dir, segment_ids, anchor_idx
-    )  # (N,) mét
-
-    # 2) lọc theo |tau_peak|
-    mask = np.abs(tau_peaks) <= tau_cut
-
-    W_candidates   = weights[mask]
-    tau_candidates = tau_peaks[mask]
-    corr_candidates = max_corrs[mask]
-    dist_candidates = dist_to_anchor[mask]
-    idx_candidates  = np.arange(len(segment_ids))[mask]
-
-    if W_candidates.size == 0:
-        raise RuntimeError("Không có candidate nào sau khi lọc theo tau_cut.")
-
-    # 3) nếu chưa set Wmin/Dmax thì lấy theo percentile
-    if Wmin is None:
-        Wmin = float(np.percentile(W_candidates, 70))   # top 30% mạnh nhất
-    if Dmax is None:
-        Dmax = float(np.percentile(dist_candidates[np.isfinite(dist_candidates)], 70))
-
-    mask2 = (W_candidates >= Wmin) & (dist_candidates <= Dmax)
-
-    W_sel   = W_candidates[mask2]
-    tau_sel = tau_candidates[mask2]
-    corr_sel = corr_candidates[mask2]
-    dist_sel = dist_candidates[mask2]
-    idx_sel  = idx_candidates[mask2]
-
-    # --- bỏ anchor trên TẤT CẢ các mảng ---
-    mask_not_anchor = (idx_sel != anchor_idx)
-    W_sel   = W_sel[mask_not_anchor]
-    tau_sel = tau_sel[mask_not_anchor]
-    corr_sel = corr_sel[mask_not_anchor]
-    dist_sel = dist_sel[mask_not_anchor]
-    idx_sel  = idx_sel[mask_not_anchor]
-
-    if idx_sel.size == 0:
-        raise RuntimeError("Không còn neighbor nào sau khi áp Wmin/Dmax, hãy giảm ngưỡng.")
-
-    # 4) sort theo Wpos giảm dần
-    order = np.argsort(-W_sel)
-    W_sel   = W_sel[order]
-    tau_sel = tau_sel[order]
-    corr_sel = corr_sel[order]
-    dist_sel = dist_sel[order]
-    idx_sel  = idx_sel[order]
-
-    # 5) lấy top_k
-    if top_k is not None and idx_sel.size > top_k:
-        W_sel   = W_sel[:top_k]
-        tau_sel = tau_sel[:top_k]
-        corr_sel = corr_sel[:top_k]
-        dist_sel = dist_sel[:top_k]
-        idx_sel  = idx_sel[:top_k]
-
-    neighbor_indices = idx_sel
-    neighbor_segment_ids = segment_ids[neighbor_indices]
-    selected_indices = np.concatenate([[anchor_idx], neighbor_indices])
-
-    return {
-        "anchor_segment_id": anchor_segment_id,
-        "anchor_index": anchor_idx,
-        "segment_ids": segment_ids,
-        "selected_indices": selected_indices,
-        "neighbor_segment_ids": neighbor_segment_ids,
-        "neighbor_indices": neighbor_indices,
-        "Wpos": W_sel,
-        "tau_peaks": tau_sel,
-        "max_corrs": corr_sel,
-        "dist_to_anchor": dist_sel,      # mét
-        "Wmin_used": Wmin,
-        "Dmax_used": Dmax,
-    }
-
-
-def build_laplacian_from_distance(
-    subgraph_info: Dict[str, Any],
-    d_spa: int = 16,
-    sigma: float = 500.0,
-) -> Dict[str, Any]:
-    """
-    Xây adjacency + Laplacian eigenvectors cho subgraph
-    dùng khoảng cách Haversine tới anchor (mét):
-
-      - node 0: anchor
-      - node 1..k: neighbors
-      - A[0,i] = A[i,0] = exp(-dist_i / sigma)
-
-    sigma: tham số scale (m). Ví dụ:
-      - 500 → edge weight ~0.37 tại 500m
-      - 1000 → edge weight ~0.37 tại 1km
-    """
-    dist_to_anchor = subgraph_info["dist_to_anchor"]  # (k,) mét
-    k = dist_to_anchor.shape[0]
-    n_nodes = k + 1
-
-    A = np.zeros((n_nodes, n_nodes), dtype="float32")
-    for i in range(1, n_nodes):
-        d = float(dist_to_anchor[i - 1])  # mét
-        w = float(np.exp(-d / sigma))
-        A[0, i] = w
-        A[i, 0] = w
-
-    d_vec = A.sum(axis=1)
-    D = np.diag(d_vec)
-    L = D - A
-
-    evals, evecs = np.linalg.eigh(L)
-    idx = np.argsort(evals)
-    if d_spa < n_nodes:
-        idx = idx[:d_spa]
-    lap_eigvec = evecs[:, idx].astype("float32")  # (n_nodes, d_spa)
-
-    out = dict(subgraph_info)
-    out.update({
-        "adjacency": A,
-        "lap_eigvec": lap_eigvec,
-    })
-    return out
-
-def load_topology(output_dir: Union[str, Path]):
-    edges = pd.read_csv(output_dir / "edges.csv")   # (segment_u, segment_v)
-    idx_map = pd.read_csv(output_dir / "segment_index.csv")  # (idx, segment_id)
-
-    segid2idx = {int(r.segment_id): int(r.idx) for _, r in idx_map.iterrows()}
-
-    # Build adjacency list (undirected)
-    graph = {}
-    for _, row in edges.iterrows():
-        u = int(row["segment_u"])
-        v = int(row["segment_v"])
-        graph.setdefault(u, []).append(v)
-        graph.setdefault(v, []).append(u)
-    return graph, segid2idx
-
-def get_two_hop_zone(seed_seg_id: int, graph: Dict[int, list]):
-    hop1 = set(graph.get(seed_seg_id, []))
-    hop2 = set()
-
-    for n1 in hop1:
-        for n2 in graph.get(n1, []):
-            if n2 != seed_seg_id and n2 not in hop1:
-                hop2.add(n2)
-
-    return {seed_seg_id} | hop1 | hop2
-
-def spatial_radius_filter(candidate_seg_ids, seg2center, seed_seg_id, R_max):
-    lat0, lon0 = seg2center[seed_seg_id]
-    out = []
-    for sid in candidate_seg_ids:
-        if sid not in seg2center:
-            continue
-        lat, lon = seg2center[sid]
-        d = haversine_distance(lat0, lon0, lat, lon)
-        if d <= R_max:
-            out.append(sid)
-    return out
-
-def compute_zone_correlations(values, segment_ids, seed_idx, candidate_indices, tau_max):
-    W = {}
-    Tau = {}
-    MaxCorr = {}
-
-    x = values[:, seed_idx]
-
-    for j in candidate_indices:
-        if j == seed_idx:
-            continue
-        y = values[:, j]
-        w, tau, mc = link_weight_pos(x, y, tau_max)
-        W[j] = w
-        Tau[j] = tau
-        MaxCorr[j] = mc
-    return W, Tau, MaxCorr
-
-def filter_links(seed_idx, candidate_indices, seg2center, segment_ids, W, Tau,
-                 Wmin, Dmin, Dmax, tau_cut):
-    keep = []
-    lat0, lon0 = seg2center[int(segment_ids[seed_idx])]
-
-    for j in candidate_indices:
-        sid = int(segment_ids[j])
-        if sid not in seg2center:
-            continue
-        lat, lon = seg2center[sid]
-        d = haversine_distance(lat0, lon0, lat, lon)
-
-        if abs(Tau[j]) > tau_cut:
-            continue
-        if W[j] < Wmin:
-            continue
-        if not (Dmin <= d <= Dmax):
-            continue
-        keep.append(j)
-
-    return keep
-
-def build_zone(
-    output_dir,
-    seed_seg_id,
-    R_max=2000,
-    tau_max=10,
-    Wmin=0.5,
-    Dmin=0,
-    Dmax=1500,
-    tau_cut=10,
-    top_k=60,
-    d_spa=16,
-    sigma=500.0,
-):
-    output_dir = Path(output_dir)
-
-    # --------- load data + topo ----------
-    graph, segid2idx = load_topology(output_dir)
-    seg2center = load_segment_centers(output_dir)
-    data = load_traffic_tensor(output_dir)
-
-    values = data["values"]            # (T, N)
-    segment_ids = data["segment_ids"]  # (N,)
-
-    seed_seg_id = int(seed_seg_id)
-    seed_idx = segid2idx[seed_seg_id]
-
-    # --------- 1) 2-hop + radius zone ----------
-    zone_segids = get_two_hop_zone(seed_seg_id, graph)
-    zone_segids = spatial_radius_filter(zone_segids, seg2center, seed_seg_id, R_max)
-    zone_segids = set(zone_segids)
-
-    # --------- 2) correlation expansion ----------
-    correlated_segids = set()
-    link_weights = {}
-
-    for sid_i in zone_segids:
-        if sid_i not in segid2idx:
-            continue
-        idx_i = segid2idx[sid_i]
-        x_i = values[:, idx_i]
-
-        local_neis = get_two_hop_zone(sid_i, graph)
-        local_neis.discard(sid_i)
-        local_neis = spatial_radius_filter(local_neis, seg2center, sid_i, R_max)
-
-        for sid_j in local_neis:
-            if sid_j not in segid2idx:
-                continue
-
-            if (sid_i not in seg2center) or (sid_j not in seg2center):
-                continue
-
-            lat_i, lon_i = seg2center[sid_i]
-            lat_j, lon_j = seg2center[sid_j]
-            d_ij = haversine_distance(lat_i, lon_i, lat_j, lon_j)
-            if not (Dmin <= d_ij <= Dmax):
-                continue
-
-            idx_j = segid2idx[sid_j]
-            Wpos, tau_peak, _ = link_weight_pos(
-                x_i, values[:, idx_j], tau_max=tau_max
-            )
-
-            if abs(tau_peak) > tau_cut:
-                continue
-            if Wpos < Wmin:
-                continue
-
-            correlated_segids.add(sid_j)
-            link_weights[(idx_i, idx_j)] = float(Wpos)
-
-    # --------- 3) final zone (base + correlated) ----------
-    final_segids = set(zone_segids) | correlated_segids
-
-    if top_k is not None and len(final_segids) > top_k:
-        base_segids = set(zone_segids)
-        extra_segids = list(final_segids - base_segids)
-
-        node_score = {sid: 0.0 for sid in extra_segids}
-        for (gi, gj), w in link_weights.items():
-            sid_gi = int(segment_ids[gi])
-            sid_gj = int(segment_ids[gj])
-            if sid_gi in node_score:
-                node_score[sid_gi] = max(node_score[sid_gi], w)
-            if sid_gj in node_score:
-                node_score[sid_gj] = max(node_score[sid_gj], w)
-
-        extra_sorted = sorted(
-            extra_segids, key=lambda s: node_score.get(s, 0.0), reverse=True
-        )
-        remain = max(0, top_k - len(base_segids))
-        final_segids = base_segids | set(extra_sorted[:remain])
-
-    # --------- 4) convert seg_id -> global idx ----------
-    final_segids = list(final_segids)
-    final_segids_sorted = [seed_seg_id] + [
-        s for s in final_segids if s != seed_seg_id
-    ]
-    final_indices = np.array(
-        [segid2idx[s] for s in final_segids_sorted], dtype=np.int64
+        latc = 0.5 * (float(node_lat[ui]) + float(node_lat[vi]))
+        lonc = 0.5 * (float(node_lon[ui]) + float(node_lon[vi]))
+        centers[segid_to_idx[int(seg_id)], 0] = latc
+        centers[segid_to_idx[int(seg_id)], 1] = lonc
+    print("Số missing:", missing)
+    # adjacency list (global idx)
+    N = len(idx_to_segid)
+    neighbors: List[List[int]] = [[] for _ in range(N)]
+    # edges.csv may store segment ids or indices; assume segment_id
+    for su, sv in zip(edge_df.iloc[:, 0].values, edge_df.iloc[:, 1].values):
+        su = int(su); sv = int(sv)
+        if su in segid_to_idx and sv in segid_to_idx:
+            iu = segid_to_idx[su]; iv = segid_to_idx[sv]
+            if iv not in neighbors[iu]:
+                neighbors[iu].append(iv)
+            if iu not in neighbors[iv]:
+                neighbors[iv].append(iu)
+
+    return GraphTopology(
+        segid_to_idx=segid_to_idx,
+        idx_to_segid=idx_to_segid,
+        centers_latlon=centers,
+        neighbors=neighbors,
     )
 
-    # --------- 5) build adjacency from internal edges ----------
-    edges = pd.read_csv(output_dir / "edges.csv")
+# ============================================================
+# Correlation (lead-lag) utilities
+# ============================================================
 
-    zone_set = set(final_segids_sorted)
-    N_zone = len(final_segids_sorted)
-    global2local = {g_idx: i for i, g_idx in enumerate(final_indices)}
+@dataclass
+class CorrParams:
+    tau_max: int = 3          # max lag (+/-) in steps
+    tau_cut: int = 3          # filter by |tau_pos| <= tau_cut
+    W_min: float = 0.2        # threshold for Wpos
+    # optional normalization
+    eps: float = 1e-6
 
-    A = np.zeros((N_zone, N_zone), dtype="float32")
+def _xcorr_peak_wpos_tau_paper(x: np.ndarray, y: np.ndarray, tau_max: int, eps: float = 1e-6) -> Tuple[float, int]:
+    """
+    Paper-style:
+      - Compute X_{i,j}(tau) Pearson correlation for tau in [-tau_max, +tau_max]
+      - tau_pos = argmax X(tau)
+      - Wpos = (max(X) - mean(X)) / std(X)
+      - Return (Wpos_clipped, tau_pos)
+    Notes:
+      - If std(X) is tiny -> protect with eps
+      - Optionally clip Wpos at >=0 (paper focuses on positive links)
+    """
+    x = x.astype(np.float32)
+    y = y.astype(np.float32)
+    T = x.shape[0]
+    if T < 4:
+        print("time series < 4", x)
+        return 0.0, 0
 
-    for _, row in edges.iterrows():
-        su = int(row["segment_u"])
-        sv = int(row["segment_v"])
-        if (su not in zone_set) or (sv not in zone_set):
+    Xtaus = []
+    taus = list(range(-tau_max, tau_max + 1))
+
+    for tau in taus:
+        if tau < 0:
+            # X_{i,j}(tau) = X_{j,i}(-tau)
+            # Equivalent compute corr between x[-tau:] and y[:T+tau]
+            xa = x[-tau:]
+            ya = y[: T + tau]
+        elif tau > 0:
+            xa = x[: T - tau]
+            ya = y[tau:]
+        else:
+            xa = x
+            ya = y
+
+        if xa.size < 4:
+            Xtaus.append(0.0)
             continue
 
-        iu = global2local[segid2idx[su]]
-        iv = global2local[segid2idx[sv]]
+        # Pearson corr for this overlap window
+        xa0 = xa - xa.mean()
+        ya0 = ya - ya.mean()
+        denom = (np.sqrt((xa0 * xa0).sum()) * np.sqrt((ya0 * ya0).sum())) + eps
+        corr = float((xa0 * ya0).sum() / denom)
+        Xtaus.append(corr)
 
-        if (su in seg2center) and (sv in seg2center):
-            lat_u, lon_u = seg2center[su]
-            lat_v, lon_v = seg2center[sv]
-            d_uv = haversine_distance(lat_u, lon_u, lat_v, lon_v)
-            w = float(np.exp(-d_uv / sigma))
+    Xarr = np.array(Xtaus, dtype=np.float32)
+    k = int(np.argmax(Xarr))
+    maxX = float(Xarr[k])
+    meanX = float(Xarr.mean())
+    stdX = float(Xarr.std()) + eps
+
+    Wpos = (maxX - meanX) / stdX
+    tau_pos = int(taus[k])
+
+    # Paper later filters "strong positive" links, bạn có thể clip âm về 0
+    if Wpos < 0:
+        Wpos = 0.0
+
+    return float(Wpos), tau_pos
+
+# ============================================================
+# Zone building
+# ============================================================
+
+@dataclass
+class DBSCANParams:
+    eps_m: float = 250.0      # DBSCAN eps in meters
+    min_samples: int = 3
+
+@dataclass
+class ZoneParams:
+    # seed sampling
+    seed_congested_ratio: float = 0.6  # 60% congested, 40% non-congested
+    # candidate expansion
+    hops: int = 2
+    # radius filter
+    R_max_m: float = 2000.0
+    # link filters
+    D_min_m: float = 0.0
+    D_max_m: float = 3000.0
+    top_k: int = 64
+    # correlation params
+    corr: CorrParams = CorrParams()
+    # laplacian PE
+    d_spa: int = 16
+    laplacian_mode: str = "edges"  # "edges" or "kernel"
+    sigma_m: float = 500.0         # for kernel mode exp(-D/sigma)
+    # caching
+    enable_cache: bool = True
+    cache_dir: str = "./cache_zone"
+
+class ZoneBuilder:
+    def __init__(
+        self,
+        traffic: TrafficTensor,
+        topo: GraphTopology,
+        dbscan: DBSCANParams = DBSCANParams(),
+        zone: ZoneParams = ZoneParams(),
+        random_seed: int = 13,
+    ):
+        if DBSCAN is None:
+            raise ImportError("scikit-learn is required for DBSCAN. Please install scikit-learn.")
+        if sp is None or spla is None:
+            # still can build zone, but laplacian PE optional
+            pass
+
+        self.traffic = traffic
+        self.topo = topo
+        self.dbscan = dbscan
+        self.zone = zone
+        self.rng = np.random.default_rng(random_seed)
+
+        if zone.enable_cache:
+            os.makedirs(zone.cache_dir, exist_ok=True)
+
+        # ------------------------
+        # Snapshot DBSCAN clusters
+        # ------------------------
+    def _dbscan_clusters_at_t(self, t: int, congested: bool) -> Tuple[np.ndarray, Dict[int, List[int]]]:
+            """
+            Return (labels, clusters_dict) for either congested or non-congested segments at time t.
+            labels: for selected indices only (same order as selected list)
+            clusters_dict: cluster_id -> list of global indices
+              cluster_id uses DBSCAN labels (>=0)
+            """
+            y = self.traffic.is_congested[t].astype(np.int8)
+            if congested:
+                sel = np.where(y == 1)[0]
+            else:
+                sel = np.where(y == 0)[0]
+
+            if sel.size == 0:
+                return np.array([], dtype=np.int32), {}
+
+            latlon = self.topo.centers_latlon[sel]
+            # DBSCAN uses euclidean distance; here we approximate by projecting meters
+            # Better: precompute distance matrix with haversine for selected points when sel is small
+            # We'll do haversine distance matrix to be correct.
+            D = pairwise_haversine_m(latlon)
+            clustering = DBSCAN(eps=self.dbscan.eps_m, min_samples=self.dbscan.min_samples, metric="precomputed")
+            labels = clustering.fit_predict(D).astype(np.int32)
+
+            clusters: Dict[int, List[int]] = {}
+            for idx_local, lab in enumerate(labels):
+                if lab < 0:
+                    continue
+                gi = int(sel[idx_local])
+                clusters.setdefault(int(lab), []).append(gi)
+
+            return labels, clusters
+    # ------------------------
+    # Seed selection 60/40
+    # ------------------------
+
+    def sample_seed_cluster(self, t: int) -> Dict[str, Any]:
+        """
+        Returns meta describing chosen seed:
+          - seed_type: 'congested' or 'non_congested'
+          - seed_cluster_indices: list of global indices in seed cluster/region
+          - seed_center_latlon: (2,)
+          - clusters stats
+        """
+        p = self.zone.seed_congested_ratio
+        choose_cong = (self.rng.random() < p)
+
+        labels_c, clusters_c = self._dbscan_clusters_at_t(t, congested=True)
+        labels_n, clusters_n = self._dbscan_clusters_at_t(t, congested=False)
+
+        def pick_from_clusters(clusters: Dict[int, List[int]]) -> Optional[List[int]]:
+            if not clusters:
+                return None
+            # pick cluster proportional to size (or uniform)
+            keys = list(clusters.keys())
+            sizes = np.array([len(clusters[k]) for k in keys], dtype=np.float32)
+            probs = sizes / (sizes.sum() + 1e-6)
+            k = int(self.rng.choice(keys, p=probs))
+            return clusters[k]
+
+        seed_indices: Optional[List[int]] = None
+        seed_type = "congested" if choose_cong else "non_congested"
+
+        if choose_cong:
+            seed_indices = pick_from_clusters(clusters_c)
+            if seed_indices is None:
+                # fallback to non-congested if no congested segments at this t
+                seed_indices = pick_from_clusters(clusters_n)
+                seed_type = "non_congested"
         else:
-            w = 1.0
+            seed_indices = pick_from_clusters(clusters_n)
+            if seed_indices is None:
+                seed_indices = pick_from_clusters(clusters_c)
+                seed_type = "congested"
 
-        A[iu, iv] += w
-        A[iv, iu] += w
+        if seed_indices is None or len(seed_indices) == 0:
+            # last-resort fallback: random segment
+            gi = int(self.rng.integers(0, self.traffic.values.shape[1]))
+            seed_indices = [gi]
+            seed_type = "fallback_random"
 
-    np.fill_diagonal(A, 0.0)
+        latlon = self.topo.centers_latlon[np.array(seed_indices, dtype=np.int64)]
+        seed_center = latlon.mean(axis=0).astype(np.float32)
 
-    # --------- 6) Laplacian + eigen (torch, stable) ----------
-    d_vec = A.sum(axis=1)
-    D = np.diag(d_vec)
-    L = D - A
+        return {
+            "t": int(t),
+            "seed_type": seed_type,
+            "seed_cluster_indices": [int(x) for x in seed_indices],
+            "seed_center_latlon": seed_center,
+            "num_congested_clusters": int(len(clusters_c)),
+            "num_noncongested_clusters": int(len(clusters_n)),
+            "congested_cluster_sizes": [len(v) for v in clusters_c.values()],
+            "noncongested_cluster_sizes": [len(v) for v in clusters_n.values()],
+        }
 
-    L = 0.5 * (L + L.T)
-    L = L.astype(np.float64, copy=False)
-    L = L + 1e-5 * np.eye(N_zone, dtype=np.float64)
+    # ------------------------
+    # Candidate expansion
+    # ------------------------
+    def _k_hop_expand(self, seeds: Iterable[int], hops: int) -> List[int]:
+        visited: Set[int] = set(int(s) for s in seeds)
+        frontier: Set[int] = set(int(s) for s in seeds)
+        for _ in range(hops):
+            nxt: Set[int] = set()
+            for u in frontier:
+                for v in self.topo.neighbors[u]:
+                    if v not in visited:
+                        visited.add(v)
+                        nxt.add(v)
+            frontier = nxt
+            if not frontier:
+                break
+        return sorted(list(visited))
 
-    Lt = torch.from_numpy(L)
-    evals, evecs = torch.linalg.eigh(Lt)
-    evals = evals.numpy()
-    evecs = evecs.numpy()
+    def _radius_filter(self, candidates: List[int], seed_center_latlon: np.ndarray, R_max_m: float) -> List[int]:
+        c = np.array(candidates, dtype=np.int64)
+        latlon = self.topo.centers_latlon[c]
+        lat0, lon0 = float(seed_center_latlon[0]), float(seed_center_latlon[1])
 
-    order = np.argsort(evals)
-    num_vecs = min(d_spa, N_zone)
-    order = order[:num_vecs]
+        # vectorized approximate: compute haversine per point
+        # For simplicity: loop (candidates size usually moderate)
+        keep = []
+        for gi, (la, lo) in zip(c.tolist(), latlon):
+            d = haversine_distance_m(lat0, lon0, float(la), float(lo))
+            if d <= R_max_m:
+                keep.append(int(gi))
+        return keep
 
-    lap_eigvec = np.zeros((N_zone, d_spa), dtype="float32")
-    lap_eigvec[:, :num_vecs] = evecs[:, order].astype("float32")
+    # ------------------------
+    # Candidate-vs-candidate correlation + link filtering
+    # ------------------------
+    def _compute_links_candidate_pairwise(
+            self,
+            candidate_indices: List[int],
+            t: int,
+            hist_len: int,
+            corr: CorrParams,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute paper-style Wpos and tau_pos for all pairs (i<j) in candidates
+        using history window ending at t.
 
-    return {
-        "seed_segment_id": seed_seg_id,
-        "zone_indices": final_indices,
-        "zone_segment_ids": segment_ids[final_indices],
-        "adjacency": A,
-        "lap_eigvec": lap_eigvec,
-    }
+        Return:
+          pairs: (E,2) global indices
+          attrs: (E,2) columns [Wpos, tau_pos]
+        """
 
-#%%
+        # -------------------------------------------------
+        # 1. Prepare candidate data
+        # -------------------------------------------------
+        c = np.array(candidate_indices, dtype=np.int64)
+        M = c.size
+        if M < 2:
+            return (
+                np.zeros((0, 2), dtype=np.int64),
+                np.zeros((0, 2), dtype=np.float32),
+            )
+
+        t0 = t - hist_len + 1
+        if t0 < 0:
+            return (
+                np.zeros((0, 2), dtype=np.int64),
+                np.zeros((0, 2), dtype=np.float32),
+            )
+
+        # history window (L, N)
+        X = self.traffic.values[t0: t + 1, :]
+        Xc = X[:, c]  # (L, M)
+        L = Xc.shape[0]
+
+        # guard: history too short for correlation
+        if L < max(4, corr.tau_max + 3):
+            return (
+                np.zeros((0, 2), dtype=np.int64),
+                np.zeros((0, 2), dtype=np.float32),
+            )
+
+        # -------------------------------------------------
+        # 2. Pairwise correlation
+        # -------------------------------------------------
+        E_pairs: List[Tuple[int, int]] = []
+        E_attr: List[Tuple[float, int]] = []
+
+        for a in range(M):
+            xa = Xc[:, a]
+            for b in range(a + 1, M):
+                xb = Xc[:, b]
+
+                wpos, tau_pos = _xcorr_peak_wpos_tau_paper(
+                    xa, xb,
+                    tau_max=corr.tau_max,
+                    eps=corr.eps,
+                )
+
+                # chỉ giữ link có tín hiệu dương
+                if wpos <= 0.0:
+                    continue
+
+                E_pairs.append((int(c[a]), int(c[b])))
+                E_attr.append((float(wpos), int(tau_pos)))
+
+        if not E_pairs:
+            return (
+                np.zeros((0, 2), dtype=np.int64),
+                np.zeros((0, 2), dtype=np.float32),
+            )
+
+        pairs = np.array(E_pairs, dtype=np.int64)
+        attrs = np.array(E_attr, dtype=np.float32)  # [Wpos, tau_pos]
+
+        return pairs, attrs
+
+    def _filter_links(
+            self,
+            pairs: np.ndarray,
+            attrs: np.ndarray,
+            D_min_m: float,
+            D_max_m: float,
+            W_min: float,
+            tau_cut: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Filter by Wpos, distance range, |tau| <= tau_cut.
+        Return:
+          kept_pairs (E',2), kept_attrs (E',2), kept_dist (E',)
+        """
+        if pairs.shape[0] == 0:
+            return pairs, attrs, np.zeros((0,), dtype=np.float32)
+
+        gi = pairs[:, 0]
+        gj = pairs[:, 1]
+        latlon_i = self.topo.centers_latlon[gi]
+        latlon_j = self.topo.centers_latlon[gj]
+
+        # compute distances per edge (loop ok)
+        dist = np.zeros((pairs.shape[0],), dtype=np.float32)
+        for k in range(pairs.shape[0]):
+            dist[k] = haversine_distance_m(
+                float(latlon_i[k, 0]), float(latlon_i[k, 1]),
+                float(latlon_j[k, 0]), float(latlon_j[k, 1]),
+            )
+
+        Wpos = attrs[:, 0]
+        tau = attrs[:, 1]
+        m = (
+                (Wpos >= float(W_min)) &
+                (dist >= float(D_min_m)) &
+                (dist <= float(D_max_m)) &
+                (np.abs(tau) <= float(tau_cut))
+        )
+
+        kp = pairs[m]
+        ka = attrs[m]
+        kd = dist[m]
+        return kp, ka, kd
+
+    def _topk_targets_from_links(
+            self,
+            candidate_indices: List[int],
+            pairs: np.ndarray,
+            attrs: np.ndarray,
+            top_k: int,
+    ) -> Tuple[List[int], np.ndarray]:
+        """
+        Define targets as all nodes that appear in kept links; if too many -> top_k by max incident Wpos.
+        Return:
+          targets_global_indices (list),
+          target_mask_zone (len M_zone,)
+        """
+        c = np.array(candidate_indices, dtype=np.int64)
+        M = c.size
+        if pairs.shape[0] == 0:
+            return [], np.zeros((M,), dtype=np.int8)
+
+        # incident max weight for each node
+        score = np.zeros((M,), dtype=np.float32)
+        pos_in_zone = {int(g): i for i, g in enumerate(c.tolist())}
+
+        Wpos = attrs[:, 0]
+        for (u, v), w in zip(pairs.tolist(), Wpos.tolist()):
+            if u in pos_in_zone:
+                score[pos_in_zone[u]] = max(score[pos_in_zone[u]], float(w))
+            if v in pos_in_zone:
+                score[pos_in_zone[v]] = max(score[pos_in_zone[v]], float(w))
+
+        # nodes that appear in at least one link
+        appear = score > 0
+        idxs = np.where(appear)[0]
+        if idxs.size == 0:
+            return [], np.zeros((M,), dtype=np.int8)
+
+        # if too many -> top_k
+        if idxs.size > int(top_k):
+            order = np.argsort(score[idxs])[::-1]
+            idxs = idxs[order[: int(top_k)]]
+
+        target_mask = np.zeros((M,), dtype=np.int8)
+        target_mask[idxs] = 1
+        targets = c[idxs].astype(np.int64).tolist()
+        return targets, target_mask
+
+    # ------------------------
+    # Laplacian PE (optional)
+    # ------------------------
+    def build_laplacian_eigvec(
+            self,
+            zone_indices: List[int],
+            d_spa: int,
+            mode: str = "edges",
+            sigma_m: float = 500.0,
+    ) -> np.ndarray:
+        """
+        Return lap_eigvec: (N_zone, d_spa) float32
+        mode:
+          - "edges": adjacency from restricted topology edges; weight=1
+          - "kernel": fully-connected A_ij = exp(-D/sigma)
+        """
+        N = len(zone_indices)
+        if N == 0:
+            return np.zeros((0, d_spa), dtype=np.float32)
+
+        if sp is None or spla is None:
+            # scipy not available: return zeros
+            return np.zeros((N, d_spa), dtype=np.float32)
+
+        z = np.array(zone_indices, dtype=np.int64)
+        zpos = {int(g): i for i, g in enumerate(z.tolist())}
+
+        if mode == "edges":
+            rows = []
+            cols = []
+            data = []
+            for g in z.tolist():
+                i = zpos[int(g)]
+                for nb in self.topo.neighbors[int(g)]:
+                    if nb in zpos:
+                        j = zpos[int(nb)]
+                        rows.append(i);
+                        cols.append(j);
+                        data.append(1.0)
+            if not rows:
+                # isolated nodes => identity laplacian => eigvec ambiguous; return zeros
+                return np.zeros((N, d_spa), dtype=np.float32)
+
+            A = sp.coo_matrix((data, (rows, cols)), shape=(N, N), dtype=np.float32).tocsr()
+            # symmetrize
+            A = 0.5 * (A + A.T)
+
+        elif mode == "kernel":
+            latlon = self.topo.centers_latlon[z]
+            D = pairwise_haversine_m(latlon)  # (N,N)
+            A_dense = np.exp(-D / max(1e-6, float(sigma_m))).astype(np.float32)
+            np.fill_diagonal(A_dense, 0.0)
+            A = sp.csr_matrix(A_dense)
+        else:
+            raise ValueError(f"Unknown laplacian mode: {mode}")
+
+        deg = np.array(A.sum(axis=1)).reshape(-1).astype(np.float32)
+        L = sp.diags(deg) - A
+
+        # Compute smallest eigenvectors
+        k = min(int(d_spa), max(1, N - 1))
+        try:
+            # sigma=0 targets smallest magnitude eigenvalues for symmetric L
+            vals, vecs = spla.eigsh(L, k=k, which="SM")
+            vecs = vecs.astype(np.float32)
+        except Exception:
+            # fallback
+            return np.zeros((N, d_spa), dtype=np.float32)
+
+        # If need fixed d_spa, pad
+        if vecs.shape[1] < int(d_spa):
+            pad = np.zeros((N, int(d_spa) - vecs.shape[1]), dtype=np.float32)
+            vecs = np.concatenate([vecs, pad], axis=1)
+
+        return vecs[:, : int(d_spa)].astype(np.float32)
+
+    # ------------------------
+    # Cache helpers
+    # ------------------------
+    def _cache_path(self, key: Dict[str, Any]) -> str:
+        h = stable_hash(key)
+        return os.path.join(self.zone.cache_dir, f"zone_{h}.pkl")
+
+    def _try_load_cache(self, key: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self.zone.enable_cache:
+            return None
+        path = self._cache_path(key)
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    return pickle.load(f)
+            except Exception:
+                return None
+        return None
+
+    def _save_cache(self, key: Dict[str, Any], obj: Dict[str, Any]) -> None:
+        if not self.zone.enable_cache:
+            return
+        path = self._cache_path(key)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+
+    # ------------------------
+    # Main entry: build zone
+    # ------------------------
+    def build_zone(
+            self,
+            t: int,
+            hist_len: int = 48,
+            return_lap: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Build a zone at time t.
+
+        Inputs:
+          t: time index
+          hist_len: how many past steps used to compute correlation (ending at t)
+          return_lap: compute Laplacian PE or not
+
+        Outputs dict:
+          - zone_indices: (N_zone,) global indices list
+          - target_mask_zone: (N_zone,) int8
+          - targets_global: list global indices
+          - links: dict with kept pairs/attrs/dist
+          - lap_eigvec: (N_zone,d_spa) float32 if return_lap else None
+          - meta: seed + stats
+        """
+        t = int(t)
+        T = self.traffic.values.shape[0]
+        if t < 0 or t >= T:
+            raise IndexError(f"t out of range: {t} (T={T})")
+
+        meta = self.sample_seed_cluster(t)
+        seed_indices = meta["seed_cluster_indices"]
+        seed_center = meta["seed_center_latlon"]
+
+        # candidate from k-hop
+        candidates = self._k_hop_expand(seed_indices, hops=int(self.zone.hops))
+        # radius filter
+        candidates = self._radius_filter(candidates, seed_center, float(self.zone.R_max_m))
+
+        # ensure seed included
+        seed_set = set(int(x) for x in seed_indices)
+        cand_set = set(int(x) for x in candidates)
+        if not seed_set.issubset(cand_set):
+            candidates = sorted(list(cand_set.union(seed_set)))
+
+        # cache key (correlation heavy part)
+        cache_key = {
+            "t": t,
+            "hist_len": int(hist_len),
+            "seed_type": meta["seed_type"],
+            "seed_cluster": tuple(sorted(seed_indices)),
+            "candidates": tuple(candidates),
+            "tau_max": int(self.zone.corr.tau_max),
+            "tau_cut": int(self.zone.corr.tau_cut),
+            "W_min": float(self.zone.corr.W_min),
+            "D_min_m": float(self.zone.D_min_m),
+            "D_max_m": float(self.zone.D_max_m),
+            "top_k": int(self.zone.top_k),
+        }
+
+        cached = self._try_load_cache(cache_key)
+        if cached is not None:
+            # optionally recompute lap if requested
+            if return_lap and cached.get("lap_eigvec") is None:
+                cached["lap_eigvec"] = self.build_laplacian_eigvec(
+                    cached["zone_indices"],
+                    d_spa=int(self.zone.d_spa),
+                    mode=str(self.zone.laplacian_mode),
+                    sigma_m=float(self.zone.sigma_m),
+                )
+            return cached
+
+        # compute candidate-vs-candidate correlations
+        pairs, attrs = self._compute_links_candidate_pairwise(
+            candidate_indices=candidates,
+            t=t,
+            hist_len=int(hist_len),
+            corr=self.zone.corr,
+        )
+
+        # filter links
+        kp, ka, kd = self._filter_links(
+            pairs=pairs,
+            attrs=attrs,
+            D_min_m=float(self.zone.D_min_m),
+            D_max_m=float(self.zone.D_max_m),
+            W_min=float(self.zone.corr.W_min),
+            tau_cut=int(self.zone.corr.tau_cut),
+        )
+
+        # select targets from links
+        targets_global, target_mask_zone = self._topk_targets_from_links(
+            candidate_indices=candidates,
+            pairs=kp,
+            attrs=ka,
+            top_k=int(self.zone.top_k),
+        )
+
+
+        zone_indices = candidates
+
+        lap = None
+        if return_lap:
+            lap = self.build_laplacian_eigvec(
+                zone_indices=zone_indices,
+                d_spa=int(self.zone.d_spa),
+                mode=str(self.zone.laplacian_mode),
+                sigma_m=float(self.zone.sigma_m),
+            )
+
+        out = {
+            "zone_indices": [int(x) for x in zone_indices],
+            "target_mask_zone": target_mask_zone.astype(np.int8),
+            "targets_global": [int(x) for x in targets_global],
+            "links": {
+                "pairs": kp.astype(np.int64),  # (E,2)
+                "attrs": ka.astype(np.float32),  # (E,2) [Wpos, tau]
+                "dist_m": kd.astype(np.float32)  # (E,)
+            },
+            "lap_eigvec": lap,  # (N_zone, d_spa) or None
+            "meta": meta | {
+                "num_candidates": int(len(zone_indices)),
+                "num_links_kept": int(kp.shape[0]),
+                "num_targets": int(int(target_mask_zone.sum())),
+                "params": {
+                    "dbscan_eps_m": float(self.dbscan.eps_m),
+                    "dbscan_min_samples": int(self.dbscan.min_samples),
+                    "hops": int(self.zone.hops),
+                    "R_max_m": float(self.zone.R_max_m),
+                    "tau_max": int(self.zone.corr.tau_max),
+                    "tau_cut": int(self.zone.corr.tau_cut),
+                    "W_min": float(self.zone.corr.W_min),
+                    "D_min_m": float(self.zone.D_min_m),
+                    "D_max_m": float(self.zone.D_max_m),
+                    "top_k": int(self.zone.top_k),
+                    "lap_mode": str(self.zone.laplacian_mode),
+                    "d_spa": int(self.zone.d_spa),
+                }
+            }
+        }
+
+        self._save_cache(cache_key, out)
+        return out
+
