@@ -200,7 +200,7 @@ def plot_wpos_vs_distance(
     title: str = "",
     fixed_end_t: Optional[int] = None,
     out_png: str = None,
-    shuffle_block_minutes: int = 3,
+    shuffle_block_minutes: int = 180,
 ) -> Dict[str, Any]:
     """
     Make a Figure-3-like scatter:
@@ -216,6 +216,9 @@ def plot_wpos_vs_distance(
 
     # precompute shuffled window for each node independently
     Xshuf = np.empty_like(Xwin, dtype=np.float32)
+    print("shuffle_block_minutes =", shuffle_block_minutes)
+    print("mean abs diff (node0) =", float(np.mean(np.abs(Xshuf[:, 0] - Xwin[:, 0]))))
+
     for n in range(N):
         Xshuf[:, n] = shuffle_by_time_blocks(Xwin[:, n], tod_minutes_win, rng, block_minutes=shuffle_block_minutes)
 
