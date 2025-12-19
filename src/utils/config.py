@@ -31,7 +31,7 @@ class TomTomConfig:
 class DataConfig:
     """Data processing configuration"""
     # Paths
-    project_dir: Path = Path(os.getcwd()).parent.parent
+    project_dir: Path = Path(os.getcwd()).parent
     data_dir: Path = project_dir / "data"
     raw_dir: Path = data_dir / "raw"
     processed_dir: Path = data_dir / "processed"

@@ -6,8 +6,8 @@ from typing import Dict, List, Optional
 from urllib.parse import urlparse
 import requests
 
-from ...utils.config import config
-from ...utils.logger import LoggerMixin
+from utils.config import config
+from utils.logger import LoggerMixin
 
 class TomTomTrafficDataCollector(LoggerMixin):
     """
@@ -268,6 +268,6 @@ class TomTomTrafficDataCollector(LoggerMixin):
         """Tìm URL của file JSON/GeoJSON trong danh sách URLs"""
         for url in urls:
             filename = urlparse(url).path
-            if filename.endswith(".json") or filename.endswith(".geojson"):
+            if filename.endswith(".json"):
                 return url
         return None

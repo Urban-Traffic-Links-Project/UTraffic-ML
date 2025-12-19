@@ -5,8 +5,7 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
 from typing import Dict, List, Optional
 import joblib
 
-from ...utils.config import config
-from ...utils.logger import LoggerMixin
+from utils.logger import LoggerMixin
 
 class DataNormalizer(LoggerMixin):
     """

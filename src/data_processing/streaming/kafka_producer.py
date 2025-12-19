@@ -4,8 +4,8 @@ from typing import Dict, Any, Optional
 from kafka import KafkaProducer
 from kafka.errors import KafkaError
 
-from ...utils.config import config
-from ...utils.logger import LoggerMixin
+from utils.config import config
+from utils.logger import LoggerMixin
 
 class TrafficDataProducer(LoggerMixin):
     """
@@ -29,7 +29,6 @@ class TrafficDataProducer(LoggerMixin):
                 max_in_flight_requests_per_connection=1,  # Ensure ordering
                 compression_type='gzip'
             )
-            self.logger.info(f"✅ Connected to Kafka: {self.bootstrap_servers}")
         except Exception as e:
             self.logger.error(f"❌ Failed to connect to Kafka: {e}")
             raise
@@ -91,7 +90,6 @@ class TrafficDataProducer(LoggerMixin):
         """Đóng producer"""
         if self.producer:
             self.producer.close()
-            self.logger.info("Closed Kafka producer")
     
     def __enter__(self):
         return self

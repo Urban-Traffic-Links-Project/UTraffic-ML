@@ -2,8 +2,8 @@
 from typing import Dict, Any, List, Tuple
 import pandas as pd
 
-from ...utils.config import config
-from ...utils.logger import LoggerMixin
+from utils.config import config
+from utils.logger import LoggerMixin
 
 class DataValidator(LoggerMixin):
     """

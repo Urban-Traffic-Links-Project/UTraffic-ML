@@ -1,10 +1,9 @@
 # src/data_processing/preprocessors/feature_extractor.py
 import pandas as pd
 import numpy as np
-from typing import List
 
-from ...utils.config import config
-from ...utils.logger import LoggerMixin
+from utils.config import config
+from utils.logger import LoggerMixin
 
 class FeatureExtractor(LoggerMixin):
     """
@@ -58,6 +57,7 @@ class FeatureExtractor(LoggerMixin):
             df['speed_reduction_ratio'] = 1 - df['relative_speed']
         
         # Speed metrics
+        # Phân biệt chậm vì kẹt hay chậm vì luật
         if 'average_speed' in df.columns:
             if 'speed_limit' in df.columns:
                 df['speed_limit_ratio'] = df['average_speed'] / (df['speed_limit'] + 1e-6)
@@ -91,8 +91,8 @@ class FeatureExtractor(LoggerMixin):
         df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
         
         # Peak hours
-        df['is_morning_peak'] = ((df['hour'] >= 7) & (df['hour'] < 9)).astype(int)
-        df['is_evening_peak'] = ((df['hour'] >= 17) & (df['hour'] < 19)).astype(int)
+        df['is_morning_peak'] = ((df['hour'] >= 6) & (df['hour'] < 9)).astype(int)
+        df['is_evening_peak'] = ((df['hour'] >= 16) & (df['hour'] < 19)).astype(int)
         df['is_peak'] = (df['is_morning_peak'] | df['is_evening_peak']).astype(int)
         
         return df
@@ -141,6 +141,7 @@ class FeatureExtractor(LoggerMixin):
         # Moving averages
         for window in [3, 6, 12]:  # 15min, 30min, 1h at 5-min resolution
             if 'average_speed' in df.columns:
+                # Moving Average
                 df[f'speed_ma_{window}'] = df.groupby('segment_id')['average_speed'].transform(
                     lambda x: x.rolling(window, min_periods=1).mean()
                 )

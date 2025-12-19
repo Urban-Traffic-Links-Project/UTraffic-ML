@@ -4,8 +4,8 @@ from typing import Callable, Optional, List
 from kafka import KafkaConsumer
 from kafka.errors import KafkaError
 
-from ...utils.config import config
-from ...utils.logger import LoggerMixin
+from utils.config import config
+from utils.logger import LoggerMixin
 
 class TrafficDataConsumer(LoggerMixin):
     """
@@ -70,8 +70,6 @@ class TrafficDataConsumer(LoggerMixin):
                     )
                     
                     if success:
-                        # Manual commit nếu xử lý thành công
-                        self.consumer.commit()
                         processed_count += 1
                         
                         if processed_count % 100 == 0:

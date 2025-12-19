@@ -3,8 +3,8 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 
-from ...utils.config import config
-from ...utils.logger import LoggerMixin
+from utils.config import config
+from utils.logger import LoggerMixin
 
 class DataCleaner(LoggerMixin):
     """
@@ -94,7 +94,7 @@ class DataCleaner(LoggerMixin):
                         )
                     
                     # Fill remaining with global median
-                    df[col].fillna(df[col].median(), inplace=True)
+                    df[col].fillna(df[col].median())
         
         # Travel time columns
         time_cols = [col for col in df.columns if 'travel_time' in col.lower()]
@@ -106,7 +106,7 @@ class DataCleaner(LoggerMixin):
                     df[col] = df.groupby('segment_id')[col].transform(
                         lambda x: x.fillna(x.median())
                     )
-                df[col].fillna(df[col].median(), inplace=True)
+                df[col].fillna(df[col].median())
         
         # Sample size: fill with 0 or median
         if 'sample_size' in df.columns:

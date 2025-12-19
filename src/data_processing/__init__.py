@@ -1,11 +1,8 @@
+# src/data_processing/__init__.py
 """
-Data Processing Module for Urban Traffic Analysis
-Implements Kappa Architecture for stream processing
+Data processing modules for traffic data pipeline
 """
 
-__version__ = "1.0.0"
-__author__ = "Urban Traffic Analysis Team"
+from .pipeline import TrafficDataPipeline
 
-# from .collectors.tomtom_collector import TomTomTrafficDataCollector
-
-# __all__ = 
+__all__ = ['TrafficDataPipeline']
