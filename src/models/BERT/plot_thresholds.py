@@ -85,15 +85,26 @@ def xcorr_wpos_tau_paper(x: np.ndarray, y: np.ndarray, tau_max: int, eps: float 
 # Hourly shuffle (paper-style null)
 # ============================================================
 
-def hourly_shuffle_by_hourbin(x: np.ndarray, tod_minutes: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+def shuffle_by_time_blocks(
+    x: np.ndarray,
+    tod_minutes: np.ndarray,
+    rng: np.random.Generator,
+    block_minutes: int = 180,   # 3 giờ
+) -> np.ndarray:
     """
-    Shuffle values within each hour-of-day bin (0..23) independently.
-    Keeps diurnal distribution but destroys temporal order (lead-lag).
+    Shuffle values within each time-of-day block of length `block_minutes`.
+    Example:
+      block_minutes=180 -> bins: [0:00-2:59], [3:00-5:59], ..., [21:00-23:59]
+    Keeps coarse diurnal distribution but destroys intra-block temporal order (lead-lag).
     """
+    assert block_minutes > 0 and (1440 % block_minutes == 0), "block_minutes must divide 1440"
     x = x.copy()
-    hours = (tod_minutes // 60).astype(np.int32)
-    for h in range(24):
-        idx = np.where(hours == h)[0]
+
+    block_id = (tod_minutes // block_minutes).astype(np.int32)  # 0..(1440/block_minutes-1)
+    n_blocks = 1440 // block_minutes
+
+    for b in range(n_blocks):
+        idx = np.where(block_id == b)[0]
         if idx.size <= 1:
             continue
         perm = rng.permutation(idx.size)
@@ -189,6 +200,7 @@ def plot_wpos_vs_distance(
     title: str = "",
     fixed_end_t: Optional[int] = None,
     out_png: str = None,
+    shuffle_block_minutes: int = 3,
 ) -> Dict[str, Any]:
     """
     Make a Figure-3-like scatter:
@@ -205,7 +217,7 @@ def plot_wpos_vs_distance(
     # precompute shuffled window for each node independently
     Xshuf = np.empty_like(Xwin, dtype=np.float32)
     for n in range(N):
-        Xshuf[:, n] = hourly_shuffle_by_hourbin(Xwin[:, n], tod_minutes_win, rng)
+        Xshuf[:, n] = shuffle_by_time_blocks(Xwin[:, n], tod_minutes_win, rng, block_minutes=shuffle_block_minutes)
 
     # sample random pairs (i<j), filter by distance <= max_x_km
     ii = rng.integers(0, N, size=num_pairs, dtype=np.int64)
@@ -287,6 +299,8 @@ def main():
     ap.add_argument("--Dmax_line_km", type=float, default=5)
     ap.add_argument("--fixed_end_t", type=int, default=None, help="optional fixed window end index t")
     ap.add_argument("--out_png", type=str, default=None)
+    ap.add_argument("--shuffle_block_minutes", type=int, default=180,
+                    help="shuffle block size in minutes (e.g., 60, 120, 180)")
 
     args = ap.parse_args()
 
@@ -316,6 +330,7 @@ def main():
         title="Figure-3 style: Wpos vs Dij (Original vs Hourly-shuffled)",
         fixed_end_t=args.fixed_end_t,
         out_png=args.out_png,
+        shuffle_block_minutes=args.shuffle_block_minutes
     )
 
 
