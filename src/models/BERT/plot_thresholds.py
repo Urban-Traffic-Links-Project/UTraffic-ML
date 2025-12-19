@@ -1,7 +1,6 @@
 # scripts/plot_thresholds.py
 from __future__ import annotations
 import argparse
-from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, Any, List
 
 import numpy as np
@@ -38,7 +37,7 @@ def xcorr_wpos_tau_paper(x: np.ndarray, y: np.ndarray, tau_max: int, eps: float 
     """
     x = x.astype(np.float32)
     y = y.astype(np.float32)
-    T = x.shape[0]
+    T = int(x.shape[0])
     if T < 4:
         return 0.0, 0
 
@@ -46,7 +45,7 @@ def xcorr_wpos_tau_paper(x: np.ndarray, y: np.ndarray, tau_max: int, eps: float 
     Xtaus = np.zeros((taus.size,), dtype=np.float32)
 
     for k, tau in enumerate(taus):
-        if abs(tau) >= T:
+        if abs(int(tau)) >= T:
             Xtaus[k] = 0.0
             continue
 
@@ -77,34 +76,34 @@ def xcorr_wpos_tau_paper(x: np.ndarray, y: np.ndarray, tau_max: int, eps: float 
     Wpos = (maxX - meanX) / stdX
     if Wpos < 0:
         Wpos = 0.0
+
     tau_pos = int(taus[idx])
     return float(Wpos), tau_pos
 
 
 # ============================================================
-# Hourly shuffle (paper-style null)
+# Shuffle within time-of-day bins (paper-style null)
 # ============================================================
 
-def shuffle_by_time_blocks(
-    x: np.ndarray,
-    tod_minutes: np.ndarray,
+def shuffle_by_tod_bins(
+    x: np.ndarray,                # (L,)
+    tod_minutes: np.ndarray,      # (L,) minute-of-day [0..1439]
     rng: np.random.Generator,
-    block_minutes: int = 180,   # 3 giờ
+    bin_minutes: int = 60,
 ) -> np.ndarray:
     """
-    Shuffle values within each time-of-day block of length `block_minutes`.
-    Example:
-      block_minutes=180 -> bins: [0:00-2:59], [3:00-5:59], ..., [21:00-23:59]
-    Keeps coarse diurnal distribution but destroys intra-block temporal order (lead-lag).
+    Shuffle values within each time-of-day bin (bin_minutes).
+    - bin_minutes=60  -> "hourly shuffling" (paper wording)
+    - bin_minutes=120 -> 2h bins (better for 15min/step)
+    - bin_minutes=180 -> 3h bins, etc.
     """
-    assert block_minutes > 0 and (1440 % block_minutes == 0), "block_minutes must divide 1440"
+    assert bin_minutes > 0 and (1440 % bin_minutes == 0), "bin_minutes must divide 1440"
     x = x.copy()
+    bin_id = (tod_minutes // bin_minutes).astype(np.int32)
+    n_bins = 1440 // bin_minutes
 
-    block_id = (tod_minutes // block_minutes).astype(np.int32)  # 0..(1440/block_minutes-1)
-    n_blocks = 1440 // block_minutes
-
-    for b in range(n_blocks):
-        idx = np.where(block_id == b)[0]
+    for b in range(n_bins):
+        idx = np.where(bin_id == b)[0]
         if idx.size <= 1:
             continue
         perm = rng.permutation(idx.size)
@@ -113,24 +112,22 @@ def shuffle_by_time_blocks(
 
 
 # ============================================================
-# Centers (midpoint) from segments.csv + nodes.csv
+# Segment centers (midpoint)
 # ============================================================
 
-def build_segment_centers_latlon(segments_csv: str, nodes_csv: str, segment_index_csv: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+def build_segment_centers_latlon(
+    segments_csv: str,
+    nodes_csv: str,
+    segment_index_csv: Optional[str] = None
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
       segment_ids_sorted: (N,)
       centers_latlon: (N,2) aligned with segment_ids_sorted
-    Assumes segments.csv has columns: segment_id, node_u, node_v
-            nodes.csv has: node_id, lat, lon
-    If segment_index_csv exists, we use it to define the final ordering of N.
     """
     seg = pd.read_csv(segments_csv)
-    nodes = pd.read_csv(nodes_csv)
+    nodes = pd.read_csv(nodes_csv).set_index("node_id")[["lat", "lon"]]
 
-    nodes = nodes.set_index("node_id")[["lat", "lon"]]
-
-    # midpoint (u,v)
     lat_u = nodes.loc[seg["node_u"].values, "lat"].values
     lon_u = nodes.loc[seg["node_u"].values, "lon"].values
     lat_v = nodes.loc[seg["node_v"].values, "lat"].values
@@ -146,16 +143,12 @@ def build_segment_centers_latlon(segments_csv: str, nodes_csv: str, segment_inde
     })
 
     if segment_index_csv is not None:
-        # enforce ordering idx -> segment_id
-        idxmap = pd.read_csv(segment_index_csv)
-        # expected columns: idx, segment_id
-        idxmap = idxmap.sort_values("idx")
+        idxmap = pd.read_csv(segment_index_csv).sort_values("idx")
         seg_centers = idxmap.merge(seg_centers, on="segment_id", how="left")
         segment_ids_sorted = seg_centers["segment_id"].values.astype(np.int64)
         centers_latlon = seg_centers[["lat", "lon"]].values.astype(np.float32)
         return segment_ids_sorted, centers_latlon
 
-    # fallback: sort by segment_id
     seg_centers = seg_centers.sort_values("segment_id")
     segment_ids_sorted = seg_centers["segment_id"].values.astype(np.int64)
     centers_latlon = seg_centers[["lat", "lon"]].values.astype(np.float32)
@@ -163,71 +156,170 @@ def build_segment_centers_latlon(segments_csv: str, nodes_csv: str, segment_inde
 
 
 # ============================================================
-# Main plotting
+# Build concatenated period across multiple days
 # ============================================================
 
-def sample_window(values: np.ndarray, time_of_day: np.ndarray, dates: Optional[np.ndarray],
-                  window_len: int, rng: np.random.Generator,
-                  fixed_end_t: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, int]:
+def parse_hhmm(s: str) -> int:
+    """'07:00' -> 420 (minutes)"""
+    hh, mm = s.split(":")
+    return int(hh) * 60 + int(mm)
+
+def build_day_to_indices_for_period(
+    dates: np.ndarray,        # (T,) 'YYYY-MM-DD'
+    tod_minutes: np.ndarray,  # (T,) minute-of-day 0..1439
+    start_min: int,
+    end_min: int,
+) -> Dict[str, np.ndarray]:
     """
-    Pick one random window of length window_len: [t0..t] and return X_win (L,N), tod_minutes_win (L,), t_end.
-    If fixed_end_t is provided, use it.
+    Map date -> sorted indices t within [start_min, end_min).
     """
-    T = values.shape[0]
-    if fixed_end_t is None:
-        t_end = int(rng.integers(window_len - 1, T))
+    out: Dict[str, List[int]] = {}
+    for t in range(len(dates)):
+        m = int(tod_minutes[t])
+        if start_min <= m < end_min:
+            d = str(dates[t])
+            out.setdefault(d, []).append(int(t))
+    return {d: np.array(sorted(idx), dtype=np.int64) for d, idx in out.items()}
+
+def estimate_step_minutes(tod_minutes: np.ndarray, idx: np.ndarray) -> Optional[int]:
+    """
+    Try to estimate step size (minutes) from one day's indices.
+    Return None if cannot.
+    """
+    if idx.size < 3:
+        return None
+    m = np.sort(tod_minutes[idx])
+    diffs = np.diff(m)
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        return None
+    # most common diff
+    vals, cnt = np.unique(diffs, return_counts=True)
+    return int(vals[np.argmax(cnt)])
+
+def sample_period_multi_days(
+    values: np.ndarray,           # (T,N)
+    dates: np.ndarray,            # (T,)
+    tod_minutes: np.ndarray,      # (T,)
+    rng: np.random.Generator,
+    days: int,
+    start_min: int,
+    duration_min: int,
+    fixed_end_date: Optional[str] = None,
+    require_full_coverage: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """
+    Concatenate same time-of-day period across `days` consecutive dates (in available-date order).
+    Returns:
+      Xcat: (Lcat,N)
+      tod_cat: (Lcat,) minute-of-day
+      chosen_days: list[str]
+    """
+    end_min = start_min + duration_min
+    if end_min > 1440:
+        raise ValueError("start + duration exceeds 24h; keep within the same day.")
+
+    day2idx = build_day_to_indices_for_period(dates, tod_minutes, start_min, end_min)
+    all_days = sorted(day2idx.keys())
+    if len(all_days) < days:
+        raise ValueError(f"Not enough days for requested period. Have {len(all_days)}, need {days}.")
+
+    # Determine expected steps per day (optional strict check)
+    expected_steps = None
+    if require_full_coverage:
+        # estimate from the first day that has enough points
+        for d in all_days:
+            step = estimate_step_minutes(tod_minutes, day2idx[d])
+            if step is not None and step > 0:
+                expected_steps = duration_min // step
+                break
+
+    # Filter days by full coverage if required
+    if require_full_coverage and expected_steps is not None:
+        good_days = [d for d in all_days if day2idx[d].size >= expected_steps]
+        all_days = good_days
+        if len(all_days) < days:
+            raise ValueError(
+                f"Not enough fully-covered days. Need {days}, have {len(all_days)}. "
+                f"(expected_steps/day ~ {expected_steps})"
+            )
+
+    if fixed_end_date is None:
+        end_pos = int(rng.integers(days - 1, len(all_days)))
     else:
-        t_end = int(fixed_end_t)
+        if fixed_end_date not in all_days:
+            raise ValueError(f"fixed_end_date={fixed_end_date} not present/usable for this period.")
+        end_pos = all_days.index(fixed_end_date)
 
-    t0 = t_end - window_len + 1
-    X = values[t0:t_end+1, :]
-    tod_minutes = (time_of_day[t0:t_end+1] * 1440.0).astype(np.int32)
-    return X, tod_minutes, t_end
+    start_pos = end_pos - days + 1
+    chosen_days = all_days[start_pos:end_pos + 1]
 
+    idx_cat = np.concatenate([day2idx[d] for d in chosen_days], axis=0)
+    Xcat = values[idx_cat, :].astype(np.float32)
+    tod_cat = tod_minutes[idx_cat].astype(np.int32)
+
+    return Xcat, tod_cat, chosen_days
+
+
+# ============================================================
+# Plot
+# ============================================================
 
 def plot_wpos_vs_distance(
     values: np.ndarray,               # (T,N)
-    time_of_day: np.ndarray,           # (T,) in [0,1]
-    centers_latlon: np.ndarray,        # (N,2)
+    dates: np.ndarray,                # (T,)
+    time_of_day: np.ndarray,          # (T,) in [0,1]
+    centers_latlon: np.ndarray,       # (N,2)
     tau_max: int,
-    window_len: int,
+    days: int,
+    start_hhmm: str,
+    duration_hours: float,
     num_pairs: int,
     max_x_km: float,
     seed: int = 13,
+    shuffle_bin_minutes: int = 60,
+    require_full_coverage: bool = True,
+    fixed_end_date: Optional[str] = None,
     Wmin_line: Optional[float] = None,
     Dmin_line_km: Optional[float] = None,
     Dmax_line_km: Optional[float] = None,
-    title: str = "",
-    fixed_end_t: Optional[int] = None,
-    out_png: str = None,
-    shuffle_block_minutes: int = 180,
+    out_png: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Make a Figure-3-like scatter:
-      y-axis: Wpos
-      x-axis: D_ij (km)
-      blue: original
-      green: hourly-shuffled
+    Figure-3-like scatter using multi-day same-period concatenation.
     """
     rng = np.random.default_rng(seed)
-    Xwin, tod_minutes_win, t_end = sample_window(values, time_of_day, None, window_len, rng, fixed_end_t=fixed_end_t)
+    tod_minutes_all = (time_of_day * 1440.0).astype(np.int32)
 
+    start_min = parse_hhmm(start_hhmm)
+    duration_min = int(round(duration_hours * 60))
+
+    Xwin, tod_win, chosen_days = sample_period_multi_days(
+        values=values,
+        dates=dates,
+        tod_minutes=tod_minutes_all,
+        rng=rng,
+        days=days,
+        start_min=start_min,
+        duration_min=duration_min,
+        fixed_end_date=fixed_end_date,
+        require_full_coverage=require_full_coverage,
+    )
     L, N = Xwin.shape
+    print(f"[INFO] Using period start={start_hhmm}, duration={duration_hours}h, days={days}, Lcat={L}")
+    print(f"[INFO] chosen_days={chosen_days}")
+    print(f"[INFO] shuffle_bin_minutes={shuffle_bin_minutes}")
 
-    # precompute shuffled window for each node independently
+    # shuffled per node independently
     Xshuf = np.empty_like(Xwin, dtype=np.float32)
-    print("shuffle_block_minutes =", shuffle_block_minutes)
-    print("mean abs diff (node0) =", float(np.mean(np.abs(Xshuf[:, 0] - Xwin[:, 0]))))
-
     for n in range(N):
-        Xshuf[:, n] = shuffle_by_time_blocks(Xwin[:, n], tod_minutes_win, rng, block_minutes=shuffle_block_minutes)
+        Xshuf[:, n] = shuffle_by_tod_bins(Xwin[:, n], tod_win, rng, bin_minutes=shuffle_bin_minutes)
 
-    # sample random pairs (i<j), filter by distance <= max_x_km
+    # sample pairs
     ii = rng.integers(0, N, size=num_pairs, dtype=np.int64)
     jj = rng.integers(0, N, size=num_pairs, dtype=np.int64)
     keep = (ii != jj)
-    ii = ii[keep]
-    jj = jj[keep]
+    ii, jj = ii[keep], jj[keep]
 
     D_km_list: List[float] = []
     W_orig_list: List[float] = []
@@ -251,18 +343,19 @@ def plot_wpos_vs_distance(
     W_orig = np.array(W_orig_list, dtype=np.float32)
     W_shuf = np.array(W_shuf_list, dtype=np.float32)
 
-    plt.figure(figsize=(7.8, 5.2))
+    # quick sanity: shuffle changed data?
+    if L > 0:
+        mad0 = float(np.mean(np.abs(Xshuf[:, 0] - Xwin[:, 0])))
+        print(f"[DEBUG] mean abs diff (node0) = {mad0:.6f}")
+
+    plt.figure(figsize=(8.2, 5.4))
     plt.scatter(D_km, W_orig, s=3, alpha=0.7, label="Original")
-    plt.scatter(D_km, W_shuf, s=3, alpha=0.7, label="Hourly-shuffled")
+    plt.scatter(D_km, W_shuf, s=3, alpha=0.7, label=f"Shuffled ({shuffle_bin_minutes}min bins)")
     plt.xlim(0, max_x_km)
     plt.xlabel(r"$D_{ij}$ (km)")
     plt.ylabel(r"$W^{pos}_{ij}$")
-    if title:
-        plt.title(title)
-    else:
-        plt.title(f"Wpos vs Distance (window_end={t_end}, L={window_len}, tau_max={tau_max})")
+    plt.title(f"Wpos vs Dij | {start_hhmm}+{duration_hours}h x {days} days | tau_max={tau_max}")
 
-    # Optional threshold lines
     if Wmin_line is not None:
         plt.axhline(float(Wmin_line), linestyle="--", linewidth=1, label=f"Wmin={Wmin_line:.3g}")
     if Dmin_line_km is not None:
@@ -273,13 +366,14 @@ def plot_wpos_vs_distance(
     plt.legend()
     plt.tight_layout()
 
-    if out_png is not None:
+    if out_png:
         plt.savefig(out_png, dpi=200)
+        print(f"[INFO] saved: {out_png}")
     else:
         plt.show()
 
     return {
-        "t_end": t_end,
+        "chosen_days": chosen_days,
         "D_km": D_km,
         "W_orig": W_orig,
         "W_shuf": W_shuf,
@@ -288,30 +382,42 @@ def plot_wpos_vs_distance(
 
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--traffic_npz", type=str, required=True)
     ap.add_argument("--segments_csv", type=str, required=True)
     ap.add_argument("--nodes_csv", type=str, required=True)
     ap.add_argument("--segment_index_csv", type=str, default=None)
-    ap.add_argument("--tau_max", type=int, default=3, help="lag in steps (15min/step -> tau_max=3 means ±45min)")
-    ap.add_argument("--window_len", type=int, default=48, help="history length used to compute Wpos in this plot")
-    ap.add_argument("--num_pairs", type=int, default=60000)
-    ap.add_argument("--max_x_km", type=float, default=5.0)
+
+    ap.add_argument("--tau_max", type=int, default=6, help="lag in steps (15min/step: tau_max=6 => ±90min)")
+    ap.add_argument("--days", type=int, default=5, help="number of days to concatenate")
+    ap.add_argument("--start_hhmm", type=str, default="07:00", help="period start time HH:MM")
+    ap.add_argument("--duration_hours", type=float, default=6.0, help="period length in hours (e.g., 6.0)")
+    ap.add_argument("--fixed_end_date", type=str, default=None, help="optional YYYY-MM-DD to end at that date")
+
+    ap.add_argument("--shuffle_bin_minutes", type=int, default=60,
+                    help="shuffle bin in minutes (paper=60; for 15min step try 120/180)")
+    ap.add_argument("--no_full_coverage", action="store_true",
+                    help="disable requiring full coverage per day in selected period")
+
+    ap.add_argument("--num_pairs", type=int, default=20000)
+    ap.add_argument("--max_x_km", type=float, default=15.0)
     ap.add_argument("--seed", type=int, default=13)
+
     ap.add_argument("--Wmin_line", type=float, default=None)
-    ap.add_argument("--Dmin_line_km", type=float, default=0)
-    ap.add_argument("--Dmax_line_km", type=float, default=5)
-    ap.add_argument("--fixed_end_t", type=int, default=None, help="optional fixed window end index t")
+    ap.add_argument("--Dmin_line_km", type=float, default=None)
+    ap.add_argument("--Dmax_line_km", type=float, default=None)
+
     ap.add_argument("--out_png", type=str, default=None)
-    ap.add_argument("--shuffle_block_minutes", type=int, default=180,
-                    help="shuffle block size in minutes (e.g., 60, 120, 180)")
 
     args = ap.parse_args()
 
     z = np.load(args.traffic_npz, allow_pickle=True)
-    values = z["values"].astype(np.float32)           # (T,N)
-    time_of_day = z["time_of_day"].astype(np.float32) # (T,) in [0,1]
+    values = z["values"].astype(np.float32)               # (T,N)
+    time_of_day = z["time_of_day"].astype(np.float32)     # (T,)
+    if "dates" not in z:
+        raise ValueError("traffic_tensor.npz must contain 'dates' for multi-day period concatenation.")
+    dates = z["dates"].astype(str)
 
-    # Build centers aligned to segment_index order (recommended)
     _, centers_latlon = build_segment_centers_latlon(
         segments_csv=args.segments_csv,
         nodes_csv=args.nodes_csv,
@@ -320,20 +426,23 @@ def main():
 
     plot_wpos_vs_distance(
         values=values,
+        dates=dates,
         time_of_day=time_of_day,
         centers_latlon=centers_latlon,
         tau_max=args.tau_max,
-        window_len=args.window_len,
+        days=args.days,
+        start_hhmm=args.start_hhmm,
+        duration_hours=args.duration_hours,
         num_pairs=args.num_pairs,
         max_x_km=args.max_x_km,
         seed=args.seed,
+        shuffle_bin_minutes=args.shuffle_bin_minutes,
+        require_full_coverage=(not args.no_full_coverage),
+        fixed_end_date=args.fixed_end_date,
         Wmin_line=args.Wmin_line,
         Dmin_line_km=args.Dmin_line_km,
         Dmax_line_km=args.Dmax_line_km,
-        title="Figure-3 style: Wpos vs Dij (Original vs Hourly-shuffled)",
-        fixed_end_t=args.fixed_end_t,
         out_png=args.out_png,
-        shuffle_block_minutes=args.shuffle_block_minutes
     )
 
 
