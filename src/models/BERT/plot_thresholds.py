@@ -188,6 +188,7 @@ def plot_wpos_vs_distance(
     Dmax_line_km: Optional[float] = None,
     title: str = "",
     fixed_end_t: Optional[int] = None,
+    out_png: str = None,
 ) -> Dict[str, Any]:
     """
     Make a Figure-3-like scatter:
@@ -256,7 +257,11 @@ def plot_wpos_vs_distance(
 
     plt.legend()
     plt.tight_layout()
-    plt.show()
+
+    if out_png is not None:
+        plt.savefig(out_png, dpi=200)
+    else:
+        plt.show()
 
     return {
         "t_end": t_end,
@@ -273,14 +278,16 @@ def main():
     ap.add_argument("--nodes_csv", type=str, required=True)
     ap.add_argument("--segment_index_csv", type=str, default=None)
     ap.add_argument("--tau_max", type=int, default=3, help="lag in steps (15min/step -> tau_max=3 means ±45min)")
-    ap.add_argument("--window_len", type=int, default=96, help="history length used to compute Wpos in this plot")
+    ap.add_argument("--window_len", type=int, default=48, help="history length used to compute Wpos in this plot")
     ap.add_argument("--num_pairs", type=int, default=60000)
     ap.add_argument("--max_x_km", type=float, default=5.0)
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--Wmin_line", type=float, default=None)
-    ap.add_argument("--Dmin_line_km", type=float, default=None)
-    ap.add_argument("--Dmax_line_km", type=float, default=None)
+    ap.add_argument("--Dmin_line_km", type=float, default=0)
+    ap.add_argument("--Dmax_line_km", type=float, default=5)
     ap.add_argument("--fixed_end_t", type=int, default=None, help="optional fixed window end index t")
+    ap.add_argument("--out_png", type=str, default=None)
+
     args = ap.parse_args()
 
     z = np.load(args.traffic_npz, allow_pickle=True)
@@ -308,6 +315,7 @@ def main():
         Dmax_line_km=args.Dmax_line_km,
         title="Figure-3 style: Wpos vs Dij (Original vs Hourly-shuffled)",
         fixed_end_t=args.fixed_end_t,
+        out_png=args.out_png,
     )
 
 
