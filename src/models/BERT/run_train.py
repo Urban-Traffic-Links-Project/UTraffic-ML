@@ -59,12 +59,12 @@ def main():
 
     zone = ZoneParams(
         seed_congested_ratio=0.6,
-        hops=1,              # 2 -> 1
+        hops=2,              # 2 -> 1
         R_max_m=1500.0,      # 1500 -> 1000
         D_min_m=0.0,
         D_max_m=3000.0,
         top_k=15,            # 64 -> 32
-        corr=CorrParams(tau_max=3, tau_cut=3, W_min=0.2, eps=1e-6),
+        corr=CorrParams(tau_max=3, tau_cut=3, W_min=1.0, eps=1e-6),
         d_spa=16,
         laplacian_mode="edges",
         sigma_m=500.0,
