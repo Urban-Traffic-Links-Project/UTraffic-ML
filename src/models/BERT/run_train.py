@@ -134,7 +134,7 @@ def main():
     # 5) Train
     # -------------------------
     log.info("Started training...")
-    tp = TrainParams(lr=1e-4, weight_decay=1e-4, epochs=30)
+    tp = TrainParams(lr=1e-4, weight_decay=1e-4, epochs=40)
     model = train_model(model, train_loader, val_loader, tp)
 
 
