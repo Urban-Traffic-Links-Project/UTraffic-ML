@@ -127,7 +127,7 @@ def main():
     # -------------------------
     log.info("Init model...")
 
-    mp = ModelParams(d_in=1, d_model=128, nhead=4, num_layers=4, dropout=0.1, d_spa=zone.d_spa, L_max=64)
+    mp = ModelParams(d_in=2, d_model=128, nhead=4, num_layers=4, dropout=0.1, d_spa=zone.d_spa, L_max=64)
     model = STEncoderOnly(mp)
 
     # -------------------------
