@@ -75,11 +75,11 @@ def main():
     log.info("Init datasets...")
     train_set = TrafficZoneDataset(
         traffic_npz, segments_csv, nodes_csv, edges_csv, segment_index_csv,
-        split="train", ds=ds, dbscan=db, zone=zone, seed=42
+        split="train", ds=ds, dbscan=db, zone=zone, seed=13
     )
     val_set = TrafficZoneDataset(
         traffic_npz, segments_csv, nodes_csv, edges_csv, segment_index_csv,
-        split="val", ds=ds, dbscan=db, zone=zone, seed=42
+        split="val", ds=ds, dbscan=db, zone=zone, seed=13
     )
     log.info("[DEBUG] Single-process sanity: calling train_set[0] ...")
     t0 = time.time()
