@@ -288,6 +288,7 @@ class ZoneBuilder:
         self.dbscan = dbscan
         self.zone = zone
         self.rng = np.random.default_rng(random_seed)
+        self._seed_cluster_cache = {}
 
         if zone.enable_cache:
             os.makedirs(zone.cache_dir, exist_ok=True)
@@ -437,7 +438,7 @@ class ZoneBuilder:
     def _filter_and_trim_clusters(
             self,
             clusters: Dict[int, List[int]],
-            max_radius_m: float = 1500.0,
+            max_radius_m: float = 3000.0,
             max_cluster_points: int = 400,
     ) -> Dict[int, List[int]]:
         """
@@ -477,49 +478,60 @@ class ZoneBuilder:
         p = float(self.zone.seed_congested_ratio)
         choose_cong = (self.rng.random() < p)  # giữ ratio 60/40
 
-        y = self.traffic.is_congested[t].astype(np.int8)
-        sel = np.where(y == 1)[0] if choose_cong else np.where(y == 0)[0]
+        cache_key = (int(t), bool(choose_cong))
 
-        # 1) deterministic downsample if too large (NO random)
-        # bạn chỉnh cell_m/max_points theo máy
-        sel = self._grid_downsample(sel.astype(np.int64), cell_m=150.0, max_points=12000)
+        # =====================================================
+        # BUILD CACHE (DBSCAN chỉ chạy 1 lần cho mỗi (t, state))
+        # =====================================================
+        if cache_key not in self._seed_cluster_cache:
+            y = self.traffic.is_congested[t].astype(np.int8)
+            sel = np.where(y == 1)[0] if choose_cong else np.where(y == 0)[0]
 
-        # 2) DBSCAN on all remaining points (fast haversine)
-        _, clusters = self._dbscan_all_points(sel)
+            # 1) deterministic downsample
+            sel = self._grid_downsample(
+                sel.astype(np.int64),
+                cell_m=150.0,
+                max_points=12000,
+            )
 
-        # 3) keep clusters whose radius <= 1500m, trim huge clusters
-        clusters = self._filter_and_trim_clusters(
-            clusters,
-            max_radius_m=1500.0,
-            max_cluster_points=400,  # cluster quá to thì cắt gần tâm
-        )
+            if sel.size == 0:
+                clusters = {}
+            else:
+                # 2) DBSCAN
+                _, clusters = self._dbscan_all_points(sel)
 
-        # 4) choose a cluster: prefer not-too-large, not-too-tiny (deterministic scoring)
+                # 3) filter + trim
+                clusters = self._filter_and_trim_clusters(
+                    clusters,
+                    max_radius_m=3000.0,
+                    max_cluster_points=400,
+                )
+
+            # cache: dict[cid -> list[int]]
+            self._seed_cluster_cache[cache_key] = clusters
+        else:
+            clusters = self._seed_cluster_cache[cache_key]
+
+        # =====================================================
+        # RANDOM SAMPLE 1 CLUSTER (thay cho best_cid deterministic)
+        # =====================================================
         if not clusters:
-            # fallback deterministic: pick one point (first)
-            gi = int(sel[0]) if sel.size > 0 else int(self.rng.integers(0, self.traffic.values.shape[1]))
+            # fallback giống hệt logic cũ
+            gi = int(
+                sel[0] if "sel" in locals() and len(sel) > 0
+                else self.rng.integers(0, self.traffic.values.shape[1])
+            )
             seed_indices = [gi]
             seed_type = "fallback_singleton"
         else:
-            # scoring: size preference + penalty for very large clusters
-            # target size ~ 30-80 tùy bạn; mình đặt 50
-            target_size = 50.0
-            best_cid = None
-            best_score = -1e18
-
-            for cid, members in clusters.items():
-                sz = float(len(members))
-                # score cao nếu size gần target_size; phạt nếu quá to
-                score = -abs(sz - target_size)
-                if sz > 300:
-                    score -= 1000.0  # rất ngại cluster quá lớn
-                if score > best_score:
-                    best_score = score
-                    best_cid = cid
-
-            seed_indices = clusters[int(best_cid)]
+            cluster_ids = list(clusters.keys())
+            cid = int(self.rng.choice(cluster_ids))
+            seed_indices = clusters[cid]
             seed_type = "congested_dbscan_R1500" if choose_cong else "noncongested_dbscan_R1500"
 
+        # =====================================================
+        # SEED CENTER (giữ nguyên)
+        # =====================================================
         latlon = self.topo.centers_latlon[np.array(seed_indices, dtype=np.int64)]
         seed_center = latlon.mean(axis=0).astype(np.float32)
 
@@ -691,6 +703,107 @@ class ZoneBuilder:
         ka = attrs[m]
         kd = dist[m]
         return kp, ka, kd
+
+    def prune_links_topk_per_node(self,
+            pairs: np.ndarray,  # (E,2) global idx
+            attrs: np.ndarray,  # (E,2) [Wpos, tau]
+            dist: np.ndarray,  # (E,)
+            k_per_node: int = 10,
+            mode: str = "union",  # "union" | "mutual"
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Keep for each node i: top-k_per_node incident edges by Wpos.
+        mode:
+          - "union": keep edge if selected by either endpoint (i OR j)
+          - "mutual": keep edge only if selected by both endpoints (i AND j)  (khắt khe hơn)
+        Return pruned (pairs, attrs, dist)
+        """
+        E = int(pairs.shape[0])
+        if E == 0:
+            return pairs, attrs, dist
+
+        k_per_node = int(k_per_node)
+        if k_per_node <= 0:
+            return np.zeros((0, 2), dtype=pairs.dtype), np.zeros((0, 2), dtype=attrs.dtype), np.zeros((0,),
+                                                                                                      dtype=dist.dtype)
+
+        W = attrs[:, 0].astype(np.float32)
+
+        # Build adjacency edge-list per node (node -> list of edge indices)
+        nodes = np.unique(pairs.reshape(-1))
+        inc = {int(n): [] for n in nodes}
+        for e in range(E):
+            u = int(pairs[e, 0]);
+            v = int(pairs[e, 1])
+            inc[u].append(e)
+            inc[v].append(e)
+
+        selected_by = set()  # for "union"
+        selected_by_u = set()  # edges selected from u side
+        selected_by_v = set()  # edges selected from v side
+
+        # For each node, select top-k incident edges by Wpos
+        for n, e_list in inc.items():
+            if not e_list:
+                continue
+            e_arr = np.array(e_list, dtype=np.int64)
+            w_arr = W[e_arr]
+
+            if e_arr.size > k_per_node:
+                # fast topk indices (unsorted)
+                kth = e_arr.size - k_per_node
+                top_local = np.argpartition(w_arr, kth)[kth:]
+                e_keep = e_arr[top_local]
+            else:
+                e_keep = e_arr
+
+            if mode == "union":
+                for e in e_keep.tolist():
+                    selected_by.add(int(e))
+            else:
+                # mutual: track separately by endpoint role
+                # but pairs are undirected; we still can approximate mutual by:
+                # edge is mutual if it is selected when considering u AND also when considering v.
+                # We'll mark membership in node-level sets; easiest: count selections
+                pass
+
+        if mode == "union":
+            keep_edges = np.array(sorted(selected_by), dtype=np.int64)
+            return pairs[keep_edges], attrs[keep_edges], dist[keep_edges]
+
+        # ---- mutual mode ----
+        # Count how many endpoints selected the edge
+        sel_count = np.zeros((E,), dtype=np.int8)
+        for n, e_list in inc.items():
+            if not e_list:
+                continue
+            e_arr = np.array(e_list, dtype=np.int64)
+            w_arr = W[e_arr]
+            if e_arr.size > k_per_node:
+                kth = e_arr.size - k_per_node
+                top_local = np.argpartition(w_arr, kth)[kth:]
+                e_keep = e_arr[top_local]
+            else:
+                e_keep = e_arr
+            sel_count[e_keep] += 1
+
+        keep_edges = np.where(sel_count >= 2)[0].astype(np.int64)  # selected by both endpoints
+        return pairs[keep_edges], attrs[keep_edges], dist[keep_edges]
+
+    def targets_from_edges_union(self,candidate_indices, pairs):
+        c = np.array(candidate_indices, dtype=np.int64)
+        M = c.size
+        if pairs.shape[0] == 0:
+            return [], np.zeros((M,), dtype=np.int8)
+        appear_nodes = np.unique(pairs.reshape(-1))
+        pos = {int(g): i for i, g in enumerate(c.tolist())}
+        mask = np.zeros((M,), dtype=np.int8)
+        targets = []
+        for g in appear_nodes.tolist():
+            if int(g) in pos:
+                mask[pos[int(g)]] = 1
+                targets.append(int(g))
+        return targets, mask
 
     def _topk_targets_from_links(
             self,
@@ -906,6 +1019,9 @@ class ZoneBuilder:
             "D_min_m": float(self.zone.D_min_m),
             "D_max_m": float(self.zone.D_max_m),
             "top_k": int(self.zone.top_k),
+            "prune_k_per_node": 10,
+            "prune_mode": "union",
+            "targets_mode": "union_edges",
         }
 
         cached = self._try_load_cache(cache_key)
@@ -943,14 +1059,20 @@ class ZoneBuilder:
         # kp: (E,2) global idx
         # ka: (E,2) [Wpos, tau]
 
+        kp, ka, kd = self.prune_links_topk_per_node(
+            pairs=kp,
+            attrs=ka,
+            dist=kd,
+            k_per_node=10,
+            mode="union",
+        )
+
         # --------------------------------------------------
         # 6) Targets from links
         # --------------------------------------------------
-        targets_global, _ = self._topk_targets_from_links(
+        targets_global, _ = self.targets_from_edges_union(
             candidate_indices=candidates,
             pairs=kp,
-            attrs=ka,
-            top_k=int(self.zone.top_k),
         )
 
         # --------------------------------------------------
