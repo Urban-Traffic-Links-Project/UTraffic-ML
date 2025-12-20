@@ -180,12 +180,13 @@ def run_one_epoch(model: STEncoderOnly, loader: DataLoader, optim: torch.optim.O
         y = batch["y"].to(device, non_blocking=True)
         node_mask = batch["node_mask"].to(device, non_blocking=True)
         final_mask = batch["final_mask"].to(device, non_blocking=True)
+        attn_bias = batch["attn_bias"].to(device, non_blocking=True)
 
         t1 = time.time()
         todev_s = t1 - t0
 
         # ---- (3) forward
-        logits = model(x=x, tod=tod, dow=dow, lap=lap, node_mask=node_mask)
+        logits = model(x=x, tod=tod, dow=dow, lap=lap, node_mask=node_mask,attn_bias=attn_bias)
         loss = masked_bce_loss(logits, y, final_mask)
         t2 = time.time()
         fwd_s = t2 - t1

@@ -852,50 +852,47 @@ class ZoneBuilder:
         """
         Build a zone at time t.
 
-        Inputs:
-          t: time index
-          hist_len: how many past steps used to compute correlation (ending at t)
-          return_lap: compute Laplacian PE or not
-
-        Outputs dict:
-          - zone_indices: (N_zone,) global indices list
+        Outputs:
+          - zone_indices: (N_zone,) global indices
           - target_mask_zone: (N_zone,) int8
-          - targets_global: list global indices
-          - links: dict with kept pairs/attrs/dist
-          - lap_eigvec: (N_zone,d_spa) float32 if return_lap else None
-          - meta: seed + stats
+          - targets_global: list[int]
+          - links: kept links info
+          - wpos_mat: (N_zone, N_zone) float32   <-- NEW
+          - lap_eigvec: (N_zone, d_spa) or None
+          - meta
         """
         t = int(t)
         T = self.traffic.values.shape[0]
         if t < 0 or t >= T:
             raise IndexError(f"t out of range: {t} (T={T})")
-        tA = time.time()
-        meta = self.sample_seed_cluster(t)
-        log.info(f"[zone] sample_seed_cluster: {time.time() - tA:.2f}s")
 
+        # --------------------------------------------------
+        # 1) Sample seed cluster
+        # --------------------------------------------------
+        meta = self.sample_seed_cluster(t)
         seed_indices = meta["seed_cluster_indices"]
         seed_center = meta["seed_center_latlon"]
 
-        # candidate from k-hop
+        # --------------------------------------------------
+        # 2) Candidate expansion + radius filter
+        # --------------------------------------------------
         candidates = self._k_hop_expand(seed_indices, hops=int(self.zone.hops))
-        # radius filter
         candidates = self._radius_filter(candidates, seed_center, float(self.zone.R_max_m))
 
         # ensure seed included
-        seed_set = set(int(x) for x in seed_indices)
-        cand_set = set(int(x) for x in candidates)
-        if not seed_set.issubset(cand_set):
-            candidates = sorted(list(cand_set.union(seed_set)))
+        candidates = sorted(set(int(x) for x in candidates).union(int(x) for x in seed_indices))
 
         if getattr(self.zone, "max_candidates", 0) and len(candidates) > int(self.zone.max_candidates):
             candidates = self._cap_by_distance(
                 indices=candidates,
                 seed_center_latlon=seed_center,
-                keep=seed_indices,  # keep seeds
+                keep=seed_indices,
                 cap=int(self.zone.max_candidates),
             )
 
-        # cache key (correlation heavy part)
+        # --------------------------------------------------
+        # 3) Cache (heavy part)
+        # --------------------------------------------------
         cache_key = {
             "t": t,
             "hist_len": int(hist_len),
@@ -912,7 +909,6 @@ class ZoneBuilder:
 
         cached = self._try_load_cache(cache_key)
         if cached is not None:
-            # optionally recompute lap if requested
             if return_lap and cached.get("lap_eigvec") is None:
                 cached["lap_eigvec"] = self.build_laplacian_eigvec(
                     cached["zone_indices"],
@@ -922,17 +918,19 @@ class ZoneBuilder:
                 )
             return cached
 
-        # compute candidate-vs-candidate correlations
-        tB = time.time()
+        # --------------------------------------------------
+        # 4) Correlation on candidate pairs
+        # --------------------------------------------------
         pairs, attrs = self._compute_links_candidate_pairwise(
             candidate_indices=candidates,
             t=t,
             hist_len=int(hist_len),
             corr=self.zone.corr,
         )
-        log.info(f"[zone] xcorr pairs: {time.time() - tB:.2f}s | M={len(candidates)}")
 
-        # filter links
+        # --------------------------------------------------
+        # 5) Filter links
+        # --------------------------------------------------
         kp, ka, kd = self._filter_links(
             pairs=pairs,
             attrs=attrs,
@@ -941,8 +939,12 @@ class ZoneBuilder:
             W_min=float(self.zone.corr.W_min),
             tau_cut=int(self.zone.corr.tau_cut),
         )
+        # kp: (E,2) global idx
+        # ka: (E,2) [Wpos, tau]
 
-        # select targets from links
+        # --------------------------------------------------
+        # 6) Targets from links
+        # --------------------------------------------------
         targets_global, _ = self._topk_targets_from_links(
             candidate_indices=candidates,
             pairs=kp,
@@ -950,17 +952,40 @@ class ZoneBuilder:
             top_k=int(self.zone.top_k),
         )
 
+        # --------------------------------------------------
+        # 7) Zone indices + target mask
+        # --------------------------------------------------
         zone_indices = candidates
-        # rebuild target_mask_zone theo zone_indices
         pos = {int(g): i for i, g in enumerate(zone_indices)}
+
         target_mask_zone = np.zeros((len(zone_indices),), dtype=np.int8)
         for g in targets_global:
             if g in pos:
                 target_mask_zone[pos[g]] = 1
 
-        lap = None
-        tC = time.time()
+        # --------------------------------------------------
+        # 8) NEW: build wpos_mat (Nz x Nz)
+        # --------------------------------------------------
+        Nz = len(zone_indices)
+        g2l = {int(g): i for i, g in enumerate(zone_indices)}
 
+        wpos_mat = np.zeros((Nz, Nz), dtype=np.float32)
+
+        for (gi, gj), (wpos, _) in zip(kp, ka):
+            gi = int(gi)
+            gj = int(gj)
+            if gi in g2l and gj in g2l:
+                a = g2l[gi]
+                b = g2l[gj]
+                w = float(wpos)
+                if w > wpos_mat[a, b]:
+                    wpos_mat[a, b] = w
+                    wpos_mat[b, a] = w  # vô hướng
+
+        # --------------------------------------------------
+        # 9) Laplacian PE
+        # --------------------------------------------------
+        lap = None
         if return_lap:
             lap = self.build_laplacian_eigvec(
                 zone_indices=zone_indices,
@@ -968,39 +993,29 @@ class ZoneBuilder:
                 mode=str(self.zone.laplacian_mode),
                 sigma_m=float(self.zone.sigma_m),
             )
-        log.info(f"[zone] lap eigsh: {time.time() - tC:.2f}s | N={len(zone_indices)}")
 
+        # --------------------------------------------------
+        # 10) Output
+        # --------------------------------------------------
         out = {
             "zone_indices": [int(x) for x in zone_indices],
-            "target_mask_zone": target_mask_zone.astype(np.int8),
+            "target_mask_zone": target_mask_zone,
             "targets_global": [int(x) for x in targets_global],
             "links": {
-                "pairs": kp.astype(np.int64),  # (E,2)
-                "attrs": ka.astype(np.float32),  # (E,2) [Wpos, tau]
-                "dist_m": kd.astype(np.float32)  # (E,)
+                "pairs": kp.astype(np.int64),
+                "attrs": ka.astype(np.float32),  # [Wpos, tau]
+                "dist_m": kd.astype(np.float32),
             },
-            "lap_eigvec": lap,  # (N_zone, d_spa) or None
+            "wpos_mat": wpos_mat,  # 👈 NEW
+            "lap_eigvec": lap,
             "meta": meta | {
                 "num_candidates": int(len(zone_indices)),
                 "num_links_kept": int(kp.shape[0]),
-                "num_targets": int(int(target_mask_zone.sum())),
-                "params": {
-                    "dbscan_eps_m": float(self.dbscan.eps_m),
-                    "dbscan_min_samples": int(self.dbscan.min_samples),
-                    "hops": int(self.zone.hops),
-                    "R_max_m": float(self.zone.R_max_m),
-                    "tau_max": int(self.zone.corr.tau_max),
-                    "tau_cut": int(self.zone.corr.tau_cut),
-                    "W_min": float(self.zone.corr.W_min),
-                    "D_min_m": float(self.zone.D_min_m),
-                    "D_max_m": float(self.zone.D_max_m),
-                    "top_k": int(self.zone.top_k),
-                    "lap_mode": str(self.zone.laplacian_mode),
-                    "d_spa": int(self.zone.d_spa),
-                }
-            }
+                "num_targets": int(target_mask_zone.sum()),
+            },
         }
 
         self._save_cache(cache_key, out)
         return out
+
 

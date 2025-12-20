@@ -166,7 +166,7 @@ class TrafficZoneDataset(Dataset):
         )
 
         # feature config
-        self.d_in = 1  # only zspeed for now
+        self.d_in = 2  # only zspeed,congested for now
 
     def __len__(self):
         return int(self.valid_t.shape[0])
@@ -188,8 +188,14 @@ class TrafficZoneDataset(Dataset):
 
         # Build window [t-L+1 .. t]
         t0 = t - L + 1
-        x = self.traffic.values[t0:t+1, :][:, zone_indices]  # (L, N_zone)
-        x = x[..., None].astype(np.float32)                  # (L, N_zone, 1)
+        # speed channel
+        x_speed = self.traffic.values[t0:t + 1, :][:, zone_indices].astype(np.float32)  # (L,Nz)
+
+        # congestion channel (0/1) trong cùng window
+        x_cong = self.traffic.is_congested[t0:t + 1, :][:, zone_indices].astype(np.float32)  # (L,Nz)
+
+        # stack -> (L,Nz,2)
+        x = np.stack([x_speed, x_cong], axis=-1).astype(np.float32)
 
         tod = self.traffic.time_of_day[t0:t+1].astype(np.float32)    # (L,)
         dow = self.traffic.day_of_week[t0:t+1].astype(np.int64)      # (L,)
@@ -198,7 +204,11 @@ class TrafficZoneDataset(Dataset):
         y = self.traffic.is_congested[t + delta, :][zone_indices].astype(np.float32)  # (N_zone,)
 
         node_mask = np.ones((zone_indices.shape[0],), dtype=np.int8)
-
+        if "wpos_mat" in z and z["wpos_mat"] is not None:
+            attn_bias = z["wpos_mat"].astype(np.float32)
+        else:
+            Nz = zone_indices.shape[0]
+            attn_bias = np.zeros((Nz, Nz), dtype=np.float32)
         return {
             "x": torch.from_numpy(x),                  # (L,Nz,1)
             "tod": torch.from_numpy(tod),              # (L,)
@@ -208,4 +218,6 @@ class TrafficZoneDataset(Dataset):
             "node_mask": torch.from_numpy(node_mask),  # (Nz,)
             "target_mask": torch.from_numpy(target_mask),  # (Nz,)
             "meta": z["meta"],                         # dict (debug)
+            "attn_bias": torch.from_numpy(attn_bias),  # (Nz,Nz)
+
         }
