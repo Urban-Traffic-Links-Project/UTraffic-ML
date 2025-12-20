@@ -59,7 +59,7 @@ def main():
 
     zone = ZoneParams(
         seed_congested_ratio=0.6,
-        hops=2,              # 2 -> 1
+        hops=1,              # 2 -> 1
         R_max_m=1500.0,      # 1500 -> 1000
         D_min_m=0.0,
         D_max_m=3000.0,
@@ -134,7 +134,7 @@ def main():
     # 5) Train
     # -------------------------
     log.info("Started training...")
-    tp = TrainParams(lr=1e-4, weight_decay=1e-4, epochs=10)
+    tp = TrainParams(lr=1e-4, weight_decay=1e-4, epochs=15)
     model = train_model(model, train_loader, val_loader, tp)
 
 
