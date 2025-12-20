@@ -64,8 +64,8 @@ class DataValidator(LoggerMixin):
         
         # Validate distance
         distance = segment.get('distance')
-        if distance is not None and (distance <= 0 or distance > 100):
-            errors.append(f"Invalid distance: {distance} km")
+        if distance is not None and (distance <= 0 or distance > 10000):
+            errors.append(f"Invalid distance: {distance} m")
         
         # Validate shape
         shape = segment.get('shape', [])

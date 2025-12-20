@@ -15,6 +15,9 @@ class DataNormalizer(LoggerMixin):
     def __init__(self):
         self.scalers: Dict[str, object] = {}
         self.feature_ranges: Dict[str, Dict] = {}
+        # Separate scaler for distance and speed_limit (always MinMaxScaler)
+        self.minmax_scaler: Optional[MinMaxScaler] = None
+        self.minmax_cols: List[str] = ['distance', 'speed_limit']
     
     def fit_transform(
         self, 
@@ -42,7 +45,34 @@ class DataNormalizer(LoggerMixin):
         
         # Exclude certain columns
         if exclude_cols is None:
-            exclude_cols = ['segment_id', 'timestamp', 'hour', 'day_of_week']
+            exclude_cols = [
+                # ID columns
+                'segment_id', 'new_segment_id',
+                # Categorical columns (should be encoded, not normalized)
+                'time_set', 'date_range', 'frc', 'hour', 'day_of_week',
+                'time_set_encoded', 'frc_encoded', 'frc_level',
+                'distance_category', 'congestion_level',
+                # Note: distance and speed_limit will be normalized separately with MinMaxScaler
+                # Text columns
+                'street_name', 'timestamp',
+                # Spatial columns (should be processed separately)
+                'latitude', 'longitude', 'distance_from_center', 
+                'grid_lat', 'grid_lon', 'grid_cell',
+                'lat_sin', 'lat_cos', 'lon_sin', 'lon_cos',
+                # Cyclic encoded features (already normalized)
+                'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
+                'time_set_sin', 'time_set_cos',
+                # Binary/boolean features
+                'is_weekend', 'is_morning_peak', 'is_evening_peak', 'is_peak',
+                # One-hot encoded columns (if any)
+            ]
+            # Also exclude any one-hot encoded columns
+            onehot_cols = [col for col in df_norm.columns 
+                          if any(cat_col in col for cat_col in ['time_set_', 'frc_', 'date_range_'])]
+            exclude_cols.extend(onehot_cols)
+        
+        # Exclude distance and speed_limit from main normalization (they use MinMaxScaler separately)
+        exclude_cols.extend(self.minmax_cols)
         
         cols_to_normalize = [col for col in numeric_cols if col not in exclude_cols]
         
@@ -75,6 +105,17 @@ class DataNormalizer(LoggerMixin):
         
         self.logger.info(f"Normalized {len(cols_to_normalize)} columns")
         
+        # Normalize distance and speed_limit with MinMaxScaler separately
+        minmax_cols_to_normalize = [col for col in self.minmax_cols 
+                                     if col in df_norm.columns and col in numeric_cols]
+        
+        if minmax_cols_to_normalize:
+            self.minmax_scaler = MinMaxScaler()
+            df_norm[minmax_cols_to_normalize] = self.minmax_scaler.fit_transform(
+                df_norm[minmax_cols_to_normalize]
+            )
+            self.logger.info(f"Normalized {minmax_cols_to_normalize} with MinMaxScaler")
+        
         return df_norm
     
     def transform(
@@ -105,6 +146,15 @@ class DataNormalizer(LoggerMixin):
         if cols_to_transform:
             df_norm[cols_to_transform] = scaler.transform(df_norm[cols_to_transform])
         
+        # Transform distance and speed_limit with MinMaxScaler if fitted
+        if self.minmax_scaler is not None:
+            minmax_cols_to_transform = [col for col in self.minmax_cols 
+                                        if col in df_norm.columns]
+            if minmax_cols_to_transform:
+                df_norm[minmax_cols_to_transform] = self.minmax_scaler.transform(
+                    df_norm[minmax_cols_to_transform]
+                )
+        
         return df_norm
     
     def inverse_transform(
@@ -127,13 +177,24 @@ class DataNormalizer(LoggerMixin):
         if cols_to_transform:
             df_orig[cols_to_transform] = scaler.inverse_transform(df_orig[cols_to_transform])
         
+        # Inverse transform distance and speed_limit with MinMaxScaler if fitted
+        if self.minmax_scaler is not None:
+            minmax_cols_to_transform = [col for col in self.minmax_cols 
+                                        if col in df_orig.columns]
+            if minmax_cols_to_transform:
+                df_orig[minmax_cols_to_transform] = self.minmax_scaler.inverse_transform(
+                    df_orig[minmax_cols_to_transform]
+                )
+        
         return df_orig
     
     def save_scalers(self, path: str):
         """Lưu scalers ra file"""
         save_data = {
             'scalers': self.scalers,
-            'feature_ranges': self.feature_ranges
+            'feature_ranges': self.feature_ranges,
+            'minmax_scaler': self.minmax_scaler,
+            'minmax_cols': self.minmax_cols
         }
         joblib.dump(save_data, path)
         self.logger.info(f"Saved scalers to {path}")
@@ -143,6 +204,9 @@ class DataNormalizer(LoggerMixin):
         save_data = joblib.load(path)
         self.scalers = save_data['scalers']
         self.feature_ranges = save_data['feature_ranges']
+        # Handle backward compatibility
+        self.minmax_scaler = save_data.get('minmax_scaler', None)
+        self.minmax_cols = save_data.get('minmax_cols', ['distance', 'speed_limit'])
         self.logger.info(f"Loaded scalers from {path}")
     
     def normalize_by_segment(

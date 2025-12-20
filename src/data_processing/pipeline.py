@@ -10,6 +10,8 @@ from .streaming.kafka_consumer import RawDataConsumer, ValidatedDataConsumer
 from .preprocessors.data_validator import DataValidator
 from .preprocessors.data_cleaner import DataCleaner
 from .preprocessors.feature_extractor import FeatureExtractor
+from .preprocessors.categorical_encoder import CategoricalFeatureEncoder
+from .preprocessors.spatial_processor import SpatialFeatureProcessor
 from .preprocessors.data_normalizer import DataNormalizer
 from .storage.parquet_writer import ParquetWriter, ParquetReader
 
@@ -29,6 +31,8 @@ class TrafficDataPipeline:
         self.validator = DataValidator()
         self.cleaner = DataCleaner()
         self.feature_extractor = FeatureExtractor()
+        self.categorical_encoder = CategoricalFeatureEncoder(encoding_strategy='ordinal')
+        self.spatial_processor = SpatialFeatureProcessor(normalize=True, create_features=True)
         self.normalizer = DataNormalizer()
         self.parquet_writer = ParquetWriter()
         self.parquet_reader = ParquetReader()
@@ -290,13 +294,19 @@ class TrafficDataPipeline:
         # Convert to DataFrame
         df = pd.DataFrame(records)
         
-        # Clean data
+        # 1. Clean data
         df = self.cleaner.clean(df)
         
-        # Extract features
+        # 2. Extract features (numerical features)
         df = self.feature_extractor.extract_all_features(df)
         
-        # Normalize
+        # 3. Encode categorical features (BEFORE normalization)
+        df = self.categorical_encoder.fit_transform(df)
+        
+        # 4. Process spatial features (BEFORE normalization)
+        df = self.spatial_processor.fit_transform(df)
+        
+        # 5. Normalize numerical features (excludes categorical and spatial)
         df = self.normalizer.fit_transform(df, method='standard')
         
         # Save to Parquet

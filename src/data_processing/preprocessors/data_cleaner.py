@@ -30,6 +30,15 @@ class DataCleaner(LoggerMixin):
         
         df_clean = df.copy()
         
+        # 0. Convert distance from meters to kilometers
+        if 'distance' in df_clean.columns:
+            # Check if distance is likely in meters (values > 1 typically)
+            if df_clean['distance'].notna().any():
+                max_distance = df_clean['distance'].max()
+                if max_distance > 10:  # Likely in meters if max > 10
+                    df_clean['distance'] = df_clean['distance'] / 1000.0
+                    self.logger.info("Converted distance from meters to kilometers")
+        
         # 1. Remove duplicates
         df_clean = self._remove_duplicates(df_clean)
         
