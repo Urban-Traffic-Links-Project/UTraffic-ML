@@ -328,6 +328,7 @@ class ZoneBuilder:
 
             return labels, clusters
 
+    # khống chế số node trong zone
     def _cap_by_distance(
             self,
             indices: List[int],
