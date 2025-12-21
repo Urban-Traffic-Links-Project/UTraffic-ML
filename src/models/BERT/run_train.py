@@ -81,6 +81,10 @@ def main():
         traffic_npz, segments_csv, nodes_csv, edges_csv, segment_index_csv,
         split="val", ds=ds, dbscan=db, zone=zone, seed=13
     )
+    test_set = TrafficZoneDataset(
+        traffic_npz, segments_csv, nodes_csv, edges_csv, segment_index_csv,
+        split="test", ds=ds, dbscan=db, zone=zone, seed=13
+    )
 
     # -------------------------
     # 3) DataLoader (tối ưu)
@@ -111,6 +115,15 @@ def main():
         persistent_workers=(num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None,
     )
+    test_loader = DataLoader(
+        test_set,
+        batch_size=8,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=pad_collate_zones,
+        persistent_workers=False,
+    )
 
     # -------------------------
     # 4) Model
@@ -124,8 +137,9 @@ def main():
     # 5) Train
     # -------------------------
     log.info("Started training...")
-    tp = TrainParams(lr=1e-4, weight_decay=1e-4, epochs=80)
-    model = train_model(model, train_loader, val_loader, tp)
+    tp = TrainParams(lr=1e-4, weight_decay=1e-4, epochs=150, thresh=0.3, out_dir="./outputs")
+    summary = train_model(model, train_loader, val_loader, test_loader, tp)
+    print(summary)
 
 
 if __name__ == "__main__":
