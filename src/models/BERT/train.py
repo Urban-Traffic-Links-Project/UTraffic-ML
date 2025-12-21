@@ -362,6 +362,7 @@ class TrainParams:
 # -------------------------
 # Loss
 # -------------------------
+# loss trung bình trên mỗi node được học
 def masked_bce_loss(logits: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     """
     BCEWithLogitsLoss on masked entries only.
@@ -660,8 +661,9 @@ def _run_epoch(
             if params.grad_clip is not None and params.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), params.grad_clip)
             optim.step()
-
+        # Node target
         batch_eval_nodes = int(final_mask.sum().item())
+        # Node tồn tại trong zone
         batch_valid_nodes = int(node_mask.sum().item())
 
         # each batch prints: loss + counts
