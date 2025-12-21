@@ -55,7 +55,7 @@ def main():
     # FAST PRESET (để debug tốc độ trước)
     # - hist_len_corr nhỏ hơn => xcorr nhanh hơn
     # - hops=1, R_max nhỏ hơn, top_k nhỏ hơn => candidates ít => giảm O(M^2)
-    ds = DatasetParams(L=4, delta=1, hist_len_corr=48)  # 48 -> 24 (nhanh hơn)
+    ds = DatasetParams(L=4, delta=2, hist_len_corr=48)  # 48 -> 24 (nhanh hơn)
 
     zone = ZoneParams(
         seed_congested_ratio=0.6,
@@ -137,7 +137,7 @@ def main():
     # 5) Train
     # -------------------------
     log.info("Started training...")
-    tp = TrainParams(lr=1e-4, weight_decay=1e-4, epochs=150, thresh=0.3, out_dir="./outputs")
+    tp = TrainParams(lr=1e-4, weight_decay=1e-4, epochs=150, thresh=0.3, out_dir="./outputs2")
     summary = train_model(model, train_loader, val_loader, test_loader, tp)
     print(summary)
 
