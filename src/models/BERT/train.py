@@ -354,7 +354,7 @@ class TrainParams:
     grad_clip: float = 1.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     thresh: float = 0.3              # fixed threshold
-    out_dir: str = "./outputs"
+    out_dir: str = "./outputs2"
     save_name: str = "best_model.pt"
     best_metric: str = "f1"          # select best by valid f1 (recommended for imbalance)
 
