@@ -59,7 +59,7 @@ def main():
 
     zone = ZoneParams(
         seed_congested_ratio=0.6,
-        hops=1,              # 2 -> 1
+        hops=2,              # 2 -> 1
         R_max_m=1500.0,      # 1500 -> 1000
         D_min_m=0.0,
         D_max_m=3000.0,
