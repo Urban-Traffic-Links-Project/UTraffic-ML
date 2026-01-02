@@ -188,14 +188,21 @@ class TrafficZoneDataset(Dataset):
 
         # Build window [t-L+1 .. t]
         t0 = t - L + 1
-        # speed channel
+        # # speed channel
+        # x_speed = self.traffic.values[t0:t + 1, :][:, zone_indices].astype(np.float32)  # (L,Nz)
+        #
+        # # congestion channel (0/1) trong cùng window
+        # x_cong = self.traffic.is_congested[t0:t + 1, :][:, zone_indices].astype(np.float32)  # (L,Nz)
+        #        x = np.stack([x_speed, x_cong], axis=-1).astype(np.float32)
+
+        #Thay đoạn trên bằng
+        # speed channel only
         x_speed = self.traffic.values[t0:t + 1, :][:, zone_indices].astype(np.float32)  # (L,Nz)
 
-        # congestion channel (0/1) trong cùng window
-        x_cong = self.traffic.is_congested[t0:t + 1, :][:, zone_indices].astype(np.float32)  # (L,Nz)
+        # make (L,Nz,1)
+        x = x_speed[..., None].astype(np.float32)
 
         # stack -> (L,Nz,2)
-        x = np.stack([x_speed, x_cong], axis=-1).astype(np.float32)
 
         tod = self.traffic.time_of_day[t0:t+1].astype(np.float32)    # (L,)
         dow = self.traffic.day_of_week[t0:t+1].astype(np.int64)      # (L,)
