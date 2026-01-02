@@ -1063,7 +1063,7 @@ class ZoneBuilder:
             pairs=kp,
             attrs=ka,
             dist=kd,
-            k_per_node=5,
+            k_per_node=10,
             mode="union",
         )
 
