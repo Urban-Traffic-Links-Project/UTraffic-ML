@@ -55,7 +55,7 @@ def main():
     # FAST PRESET (để debug tốc độ trước)
     # - hist_len_corr nhỏ hơn => xcorr nhanh hơn
     # - hops=1, R_max nhỏ hơn, top_k nhỏ hơn => candidates ít => giảm O(M^2)
-    ds = DatasetParams(L=4, delta=1, hist_len_corr=48)  # 48 -> 24 (nhanh hơn)
+    ds = DatasetParams(L=4, delta=2, hist_len_corr=48)  # 48 -> 24 (nhanh hơn)
 
     zone = ZoneParams(
         seed_congested_ratio=0.6,
