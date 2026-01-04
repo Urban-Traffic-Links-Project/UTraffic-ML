@@ -1075,9 +1075,9 @@ class ZoneBuilder:
             pairs=kp,
         )
 
-        # EXCLUDE seed cluster nodes from prediction targets
-        seed_set = set(int(x) for x in seed_indices)  # seed_indices lấy từ meta
-        targets_global = [g for g in targets_global if int(g) not in seed_set]
+        # # EXCLUDE seed cluster nodes from prediction targets
+        # seed_set = set(int(x) for x in seed_indices)  # seed_indices lấy từ meta
+        # targets_global = [g for g in targets_global if int(g) not in seed_set]
 
         # --------------------------------------------------
         # 7) Zone indices + target mask
