@@ -213,11 +213,17 @@ class ParquetReader(LoggerMixin):
             format="parquet"
         )
         
+        try:
+            fragments = list(dataset.get_fragments())
+            num_fragments = len(fragments)
+        except Exception:
+            num_fragments = None
+
         info = {
-            'path': str(table_path),
-            'schema': str(dataset.schema),
-            'num_row_groups': len(dataset.fragments),
-            'partitioning': str(dataset.partitioning) if dataset.partitioning else None
+            "path": str(table_path),
+            "schema": str(dataset.schema),
+            "num_fragments": num_fragments,
+            "partitioning": str(dataset.partitioning) if dataset.partitioning else None,
         }
         
         return info
