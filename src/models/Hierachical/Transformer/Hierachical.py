@@ -554,7 +554,7 @@ def compare_partitions(
 
         if "spectral" in run_methods:
             for k in spectral_clusters:
-                labels = run_spectral(G, n_clusters=k, seed=seed)
+                labels = run_spectral_knn(seg_lat, seg_lon, n_clusters=k, seed=seed, knn_k=10)
                 if labels is not None:
                     Q = modularity_Q_nx(G, labels)
                     res = PartitionResult("spectral", labels, Q, seed=seed, extra={"k": int(k)})
