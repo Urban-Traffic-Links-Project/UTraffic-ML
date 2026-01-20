@@ -635,7 +635,7 @@ def main():
     args = parser.parse_args()
 
     # ===== ROOT: CỐ ĐỊNH = GỐC PROJECT (parent 3) =====
-    ROOT = Path(__file__).resolve().parents[3]
+    ROOT = Path(__file__).resolve().parents[4]
 
     # ===== CỐ ĐỊNH TOÀN BỘ PIPELINE =====
     edges_csv = ROOT / "data/processed/tomtom_stats/edges.csv"
