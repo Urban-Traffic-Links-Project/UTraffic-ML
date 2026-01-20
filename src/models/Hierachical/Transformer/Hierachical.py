@@ -643,7 +643,7 @@ def main():
     segments_csv = ROOT / "data/processed/tomtom_stats/segments.csv"
     nodes_csv = ROOT / "data/processed/tomtom_stats/nodes.csv"
 
-    out_dir = ROOT / "src/models/Hierachical/Transformer/output_compaer_Hierachical"
+    out_dir = ROOT / "src/models/Hierachical/Transformer/output_compare_Hierachical"
 
     # community detection settings (CỐ ĐỊNH)
     run_methods = ["louvain", "leiden", "infomap", "spectral"]
