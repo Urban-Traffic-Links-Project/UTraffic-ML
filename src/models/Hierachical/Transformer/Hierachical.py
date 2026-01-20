@@ -33,6 +33,8 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 
+from pathlib import Path
+
 
 # =========================
 # Utils
@@ -614,71 +616,77 @@ def export_best_soft(
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--root", type=str, default=".",
-                        help="Project root (Urban-Traffic-Links). Default='.' if you run from root.")
-
-    parser.add_argument("--edges_csv", type=str, default="data/processed/tomtom_stats/edges.csv")
-    parser.add_argument("--segment_index_csv", type=str, default="data/processed/tomtom_stats/segment_index.csv")
-
-    # for distance-based Tran
-    parser.add_argument("--segments_csv", type=str, default="data/processed/tomtom_stats/segments.csv")
-    parser.add_argument("--nodes_csv", type=str, default="data/processed/tomtom_stats/nodes.csv")
-
-    # OUTPUT: đúng tên bạn yêu cầu (output_compaer_Hierachical)
-    parser.add_argument("--out_dir", type=str, default="src/models/Hierachical/Transformer/output_compaer_Hierachical")
-
-    parser.add_argument("--methods", type=str, default="louvain,leiden,infomap,spectral",
-                        help="Comma-separated: louvain,leiden,infomap,spectral,dbscan")
-
-    parser.add_argument("--seeds", type=str, default="0,1,2", help="Comma-separated seeds")
-    parser.add_argument("--gammas", type=str, default="0.5,1.0,1.5,2.0",
-                        help="Resolution sweep gamma for Louvain/Leiden")
+    # ===== CHỈ GIỮ CÁC THAM SỐ ĐƯỢC PHÉP THAY ĐỔI =====
     parser.add_argument("--spectral_k", type=str, default="10,20,30",
                         help="Spectral clustering k list")
 
-    # soft Tran controls
     parser.add_argument("--tau_km", type=float, default=-1.0,
-                        help="tau in km for exp(-d/tau). If -1 => auto median dist to own centroid.")
-    parser.add_argument("--topk", type=int, default=8,
-                        help="Keep only top-k nearest regions for each node. Use <=0 to disable.")
-    parser.add_argument("--binarize_AR", action="store_true",
-                        help="If set, A_R will be binarized (0/1). Otherwise weighted.")
+                        help="tau in km. -1 = auto (median dist)")
 
-    # dbscan optional
+    parser.add_argument("--topk", type=int, default=8,
+                        help="Top-k nearest regions for soft Tran")
+
+    parser.add_argument("--binarize_AR", action="store_true",
+                        help="Binarize region adjacency A_R")
+
     parser.add_argument("--dbscan_eps_km", type=float, default=0.5)
     parser.add_argument("--dbscan_min_samples", type=int, default=10)
 
     args = parser.parse_args()
 
-    root = args.root
-    edges_csv = os.path.join(root, args.edges_csv)
-    segment_index_csv = os.path.join(root, args.segment_index_csv)
-    segments_csv = os.path.join(root, args.segments_csv)
-    nodes_csv = os.path.join(root, args.nodes_csv)
-    out_dir = os.path.join(root, args.out_dir)
+    # ===== ROOT: CỐ ĐỊNH = GỐC PROJECT (parent 3) =====
+    ROOT = Path(__file__).resolve().parents[3]
 
-    run_methods = [m.strip().lower() for m in args.methods.split(",") if m.strip()]
-    seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
-    gammas = [float(x) for x in args.gammas.split(",") if x.strip()]
+    # ===== CỐ ĐỊNH TOÀN BỘ PIPELINE =====
+    edges_csv = ROOT / "data/processed/tomtom_stats/edges.csv"
+    segment_index_csv = ROOT / "data/processed/tomtom_stats/segment_index.csv"
+    segments_csv = ROOT / "data/processed/tomtom_stats/segments.csv"
+    nodes_csv = ROOT / "data/processed/tomtom_stats/nodes.csv"
+
+    out_dir = ROOT / "src/models/Hierachical/Transformer/output_compaer_Hierachical"
+
+    # community detection settings (CỐ ĐỊNH)
+    run_methods = ["louvain", "leiden", "infomap", "spectral"]
+    seeds = [0, 1, 2]
+    gammas = [0.5, 1.0, 1.5, 2.0]
+
     spectral_k = [int(x) for x in args.spectral_k.split(",") if x.strip()]
 
-    tau_km = None if args.tau_km is None or args.tau_km < 0 else float(args.tau_km)
+    tau_km = None if args.tau_km < 0 else float(args.tau_km)
     topk = int(args.topk)
 
     ensure_dir(out_dir)
 
+    print("ROOT =", ROOT)
+    print("edges_csv =", edges_csv)
+    print("segment_index_csv =", segment_index_csv)
+    print("segments_csv =", segments_csv)
+    print("nodes_csv =", nodes_csv)
+    print("out_dir =", out_dir)
+
+    # ===== LOAD GRAPH =====
     print("Loading graph...")
-    G, N, edges_idx = load_segment_graph(edges_csv, segment_index_csv, undirected=True)
+    G, N, edges_idx = load_segment_graph(
+        edges_csv.as_posix(),
+        segment_index_csv.as_posix(),
+        undirected=True
+    )
     print(f"Graph: N={N}, E={G.number_of_edges()}")
 
+    # ===== LOAD COORDINATES =====
     print("Loading segment lat/lon for soft Tran...")
-    seg_lat, seg_lon = load_segment_latlon(segments_csv, nodes_csv, segment_index_csv)
+    seg_lat, seg_lon = load_segment_latlon(
+        segments_csv.as_posix(),
+        nodes_csv.as_posix(),
+        segment_index_csv.as_posix()
+    )
     print(f"Coords loaded: seg_lat/seg_lon shape = {seg_lat.shape}")
 
+    # ===== COMMUNITY DETECTION =====
     print("Running community detection + modularity compare...")
     all_results, best = compare_partitions(
         G=G,
-        out_dir=out_dir,
+        out_dir=out_dir.as_posix(),
         edges_idx=edges_idx,
         seeds=seeds,
         gammas=gammas,
@@ -690,7 +698,7 @@ def main():
         dbscan_min_samples=int(args.dbscan_min_samples),
     )
 
-    # summary.csv
+    # ===== SUMMARY =====
     rows = []
     for r in all_results:
         rows.append({
@@ -701,14 +709,15 @@ def main():
             "R": int(r.labels.max()) + 1,
             "extra": json.dumps(r.extra or {}, ensure_ascii=False)
         })
+
     summary = pd.DataFrame(rows).sort_values(by="Q", ascending=False)
-    summary_path = os.path.join(out_dir, "summary.csv")
+    summary_path = out_dir / "summary.csv"
     summary.to_csv(summary_path, index=False, encoding="utf-8-sig")
     print(f"Saved: {summary_path}")
 
-    # export best + soft Tran
+    # ===== EXPORT BEST + SOFT TRAN =====
     export_best_soft(
-        out_dir=out_dir,
+        out_dir=out_dir.as_posix(),
         G=G,
         edges_idx=edges_idx,
         best=best,
@@ -720,7 +729,6 @@ def main():
     )
 
     print("DONE.")
-
 
 if __name__ == "__main__":
     main()
