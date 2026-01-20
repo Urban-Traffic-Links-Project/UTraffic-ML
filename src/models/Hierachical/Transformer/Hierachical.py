@@ -302,6 +302,44 @@ def run_spectral(G: nx.Graph, n_clusters: int, seed: int, max_dense_n: int = 500
     labels = sc.fit_predict(A).astype(np.int64)
     return reindex_labels(labels)
 
+def run_spectral_knn(
+    seg_lat: np.ndarray,
+    seg_lon: np.ndarray,
+    n_clusters: int,
+    seed: int,
+    knn_k: int = 10,
+) -> Optional[np.ndarray]:
+    """
+    Spectral clustering on kNN graph built from (lat,lon) -> sparse affinity.
+    Works for N~10k.
+    pip install scikit-learn scipy
+    """
+    try:
+        from sklearn.cluster import SpectralClustering
+        from sklearn.neighbors import kneighbors_graph
+    except Exception:
+        return None
+
+    coords = np.stack([seg_lat, seg_lon], axis=1)  # [N,2]
+
+    # kNN sparse adjacency (connectivity). Symmetrize for undirected.
+    A_knn = kneighbors_graph(
+        coords,
+        n_neighbors=knn_k,
+        mode="connectivity",
+        include_self=False
+    )
+    A_knn = 0.5 * (A_knn + A_knn.T)  # make symmetric
+
+    sc = SpectralClustering(
+        n_clusters=n_clusters,
+        affinity="precomputed",
+        assign_labels="kmeans",
+        random_state=seed
+    )
+    labels = sc.fit_predict(A_knn).astype(np.int64)
+    return reindex_labels(labels)
+
 
 def run_dbscan_coords(seg_lat: np.ndarray, seg_lon: np.ndarray, eps_km: float, min_samples: int) -> Optional[np.ndarray]:
     """
@@ -506,6 +544,7 @@ def compare_partitions(
                     save_one(res)
 
         if "infomap" in run_methods:
+
             labels = run_infomap(G, seed=seed)
             if labels is not None:
                 Q = modularity_Q_nx(G, labels)
