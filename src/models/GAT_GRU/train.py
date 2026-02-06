@@ -283,7 +283,7 @@ def main():
     # load best and test
     ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
-    test_metrics = evaluate(model, dl_te, device, mu, sigma)
+    test_metrics = evaluate(model, dl_te, device, mu, sigma, cfg, adj, rng)
     print(f"[TEST] MAE={test_metrics['MAE']:.4f} RMSE={test_metrics['RMSE']:.4f} MAPE={test_metrics['MAPE']:.2f}")
     print(f"[DONE] Best checkpoint: {best_path}")
 
