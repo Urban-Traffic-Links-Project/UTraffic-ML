@@ -119,6 +119,13 @@ def evaluate(model: GATGRU, loader: DataLoader, device: str, mu: np.ndarray, sig
 
         y_inv = inverse_z_safe(y_np, mu, sigma)
         yhat_inv = inverse_z_safe(yhat_np, mu, sigma)
+        if (not np.isfinite(y_inv).all()) or (not np.isfinite(yhat_inv).all()):
+            print("[VAL] non-finite after inverse:",
+                  "y_inv nan", np.isnan(y_inv).sum(), "inf", np.isinf(y_inv).sum(),
+                  "| yhat_inv nan", np.isnan(yhat_inv).sum(), "inf", np.isinf(yhat_inv).sum(),
+                  "| sigma min/max", float(np.min(sigma)), float(np.max(sigma)))
+            # dừng để khỏi ra nan dây chuyền
+            return {"MAE": float("nan"), "RMSE": float("nan"), "MAPE": float("nan")}
 
         maes.append(mae(yhat_inv, y_inv))
         rmses.append(rmse(yhat_inv, y_inv))
@@ -177,8 +184,22 @@ def main():
     # stats saved as {"mu": Series, "sigma": Series}
     # ----------------------------
     stats = load_zscore_stats(str(data_root / "zscore_stats_speed.pkl"))
-    mu = stats["mu"].values.astype(np.float32)       # [N]
-    sigma = stats["sigma"].values.astype(np.float32) # [N]
+
+    # segment_ids theo đúng thứ tự cột trong values của npz
+    seg_ids = train_pack["segment_ids"].astype(np.int64)
+
+    mu_s = stats["mu"]  # pandas Series, index = segment_id
+    sigma_s = stats["sigma"]  # pandas Series, index = segment_id
+
+    # reindex để mu/sigma khớp đúng thứ tự cột (seg_ids)
+    mu = mu_s.reindex(seg_ids).to_numpy(dtype=np.float32)
+    sigma = sigma_s.reindex(seg_ids).to_numpy(dtype=np.float32)
+
+    # guard: nếu có NaN nghĩa là seg_ids không khớp stats index
+    if np.isnan(mu).any() or np.isnan(sigma).any():
+        missing = seg_ids[np.isnan(mu) | np.isnan(sigma)]
+        raise ValueError(
+            f"[FATAL] mu/sigma missing for some segment_ids. Missing count={missing.size}. Example={missing[:10]}")
 
     # ----------------------------
     # Datasets / Loaders
