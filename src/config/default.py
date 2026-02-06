@@ -27,10 +27,10 @@ class TrainConfig:
 
     # ====== Model ======
     in_dim: int = 1              # speed z-score
-    gat_hidden: int = 32
-    gat_heads: int = 4
+    gat_hidden: int = 16
+    gat_heads: int = 2
     gat_layers: int = 2          # multi-hop
-    gru_hidden: int = 64
+    gru_hidden: int = 32
 
     # ====== Route sampling (Random Walk) ======
     use_routes_in_train: bool = True
