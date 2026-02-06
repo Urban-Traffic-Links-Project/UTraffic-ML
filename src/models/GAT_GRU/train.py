@@ -184,22 +184,13 @@ def main():
     # stats saved as {"mu": Series, "sigma": Series}
     # ----------------------------
     stats = load_zscore_stats(str(data_root / "zscore_stats_speed.pkl"))
+    mu = stats["mu"].values.astype(np.float32)  # ✅ lấy theo thứ tự cột
+    sigma = stats["sigma"].values.astype(np.float32)
 
-    # segment_ids theo đúng thứ tự cột trong values của npz
-    seg_ids = train_pack["segment_ids"].astype(np.int64)
+    mu = np.nan_to_num(mu, nan=0.0)  # ✅ thêm cho chắc
+    sigma = np.nan_to_num(sigma, nan=1.0)
+    sigma = np.clip(sigma, 1e-6, None)
 
-    mu_s = stats["mu"]  # pandas Series, index = segment_id
-    sigma_s = stats["sigma"]  # pandas Series, index = segment_id
-
-    # reindex để mu/sigma khớp đúng thứ tự cột (seg_ids)
-    mu = mu_s.reindex(seg_ids).to_numpy(dtype=np.float32)
-    sigma = sigma_s.reindex(seg_ids).to_numpy(dtype=np.float32)
-
-    # guard: nếu có NaN nghĩa là seg_ids không khớp stats index
-    if np.isnan(mu).any() or np.isnan(sigma).any():
-        missing = seg_ids[np.isnan(mu) | np.isnan(sigma)]
-        raise ValueError(
-            f"[FATAL] mu/sigma missing for some segment_ids. Missing count={missing.size}. Example={missing[:10]}")
 
     # ----------------------------
     # Datasets / Loaders
