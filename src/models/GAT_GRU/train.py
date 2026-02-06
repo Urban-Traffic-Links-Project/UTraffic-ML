@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from src.config.defaults import TrainConfig  # <-- đúng tên file defaults.py
+from src.config.default import TrainConfig  # <-- đúng tên file defaults.py
 from src.data.dataset import TrafficWindowDataset
 from src.data.graph import load_edge_index
 from src.data.tomtom_io import (
