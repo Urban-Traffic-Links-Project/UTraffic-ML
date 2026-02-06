@@ -16,7 +16,7 @@ class TrainConfig:
     H: int = 6
 
     # ====== Train ======
-    batch: int = 8
+    batch: int = 4
     epochs: int = 50
     lr: float = 1e-3
     seed: int = 42
