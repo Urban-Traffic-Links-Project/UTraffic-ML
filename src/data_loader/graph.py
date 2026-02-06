@@ -1,8 +1,8 @@
-# File: src/data/graph.py
 from __future__ import annotations
 import pandas as pd
 import torch
 from typing import Dict, Optional
+import pandas as pd
 
 def load_edge_index(edges_csv: str, num_nodes: int, segid_to_idx: Optional[Dict[int,int]] = None, add_self_loops: bool=True) -> torch.Tensor:
     df = pd.read_csv(edges_csv)
