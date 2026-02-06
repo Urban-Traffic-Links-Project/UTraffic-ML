@@ -34,7 +34,7 @@ class TrainConfig:
 
     # ====== Route sampling (Random Walk) ======
     use_routes_in_train: bool = True
-    routes_per_batch: int = 8
+    routes_per_batch: int = 4
     route_len_min: int = 6
     route_len_max: int = 16
     route_restart_prob: float = 0.15  # random-walk restart
