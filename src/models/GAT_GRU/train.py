@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from src.config.default import TrainConfig  # :contentReference[oaicite:3]{index=3}
 from src.data_loader.dataset import TrafficWindowDataset
 from src.data_loader.graph import load_edge_index
-from src.data_loader.tomtom_io import load_tomtom_tensor, load_zscore_stats
+from src.data_loader.tomtom_io import load_tomtom_tensor, load_zscore_stats, load_npz
 from src.utils.seed import set_seed
 from src.utils.metrics import mae, rmse, mape
 from src.models.GAT_GRU.model import GATGRU
@@ -88,7 +88,6 @@ def sample_random_walk_routes(
 
     return torch.from_numpy(routes)
 
-# OKAY STAY AT HERE
 
 @torch.no_grad()
 def evaluate(
@@ -143,9 +142,9 @@ def main():
     val_npz = val_dir / "traffic_tensor.npz"
     test_npz = test_dir / "traffic_tensor.npz"
 
-    Xtr = load_tomtom_tensor(train_npz)  # expected [T,N] or [T,N,1]
-    Xva = load_tomtom_tensor(val_npz)
-    Xte = load_tomtom_tensor(test_npz)
+    Xtr = load_npz(train_npz)  # expected [T,N] or [T,N,1]
+    Xva = load_npz(val_npz)
+    Xte = load_npz(test_npz)
 
     # ensure [T,N,1]
     if Xtr.ndim == 2:

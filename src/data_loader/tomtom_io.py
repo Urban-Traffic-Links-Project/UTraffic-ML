@@ -41,3 +41,5 @@ def load_segment_index(csv_path: str) -> Tuple[Dict[int,int], Dict[int,int]]:
 def inverse_z(z: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
     # z: [...,N]
     return z * sigma + mu
+
+
