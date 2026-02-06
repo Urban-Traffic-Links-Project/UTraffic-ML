@@ -28,7 +28,7 @@ class TrainConfig:
     # ====== Model ======
     in_dim: int = 1              # speed z-score
     gat_hidden: int = 16
-    gat_heads: int = 2
+    gat_heads: int = 4
     gat_layers: int = 2          # multi-hop
     gru_hidden: int = 32
 
