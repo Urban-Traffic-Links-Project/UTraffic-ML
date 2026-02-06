@@ -24,7 +24,9 @@ def ensure_dir(p: str) -> str:
 
 def inverse_z(y: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
     # y: [..., N]
-    return y * sigma[None, ...] + mu[None, ...]
+    shape = (1,) * (y.ndim - 1) + (mu.shape[0],)
+    return y * sigma.reshape(shape) + mu.reshape(shape)
+
 
 
 def build_adj_list(edge_index: torch.Tensor, num_nodes: int) -> List[List[int]]:
@@ -142,10 +144,13 @@ def main():
     val_npz = val_dir / "traffic_tensor.npz"
     test_npz = test_dir / "traffic_tensor.npz"
 
-    Xtr = load_npz(train_npz)  # expected [T,N] or [T,N,1]
-    Xva = load_npz(val_npz)
-    Xte = load_npz(test_npz)
+    train_pack = load_npz(train_npz)
+    val_pack = load_npz(val_npz)
+    test_pack = load_npz(test_npz)
 
+    Xtr = train_pack["values"]  # shape [T,N]
+    Xva = val_pack["values"]
+    Xte = test_pack["values"]
     # ensure [T,N,1]
     if Xtr.ndim == 2:
         Xtr = Xtr[..., None]
