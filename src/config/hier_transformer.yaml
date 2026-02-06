@@ -1,0 +1,16 @@
+# Example config (you can adapt)
+data:
+  traffic_npz: data/processed/traffic_tensor.npz
+  adj_npy: data/processed/adj_bool.npy
+  tran_npy: data/processed/Tran.npy
+  ar_npy: data/processed/A_R.npy
+train:
+  T_in: 12
+  H: 12
+  batch: 8
+  epochs: 10
+model:
+  d_model: 128
+  n_heads: 8
+  node_layers: 2
+  region_layers: 2
