@@ -97,6 +97,7 @@ def evaluate(
     device: str,
     mu: np.ndarray,
     sigma: np.ndarray,
+    cfg, adj, rng
 ) -> Dict[str, float]:
     model.eval()
     maes, rmses, mapes = [], [], []
@@ -222,7 +223,7 @@ def main():
                     rng=rng,
                 ).to(device)
 
-            out = model(x, routes=routes, return_attn=cfg.export_attn_every_epoch)
+            out = model(x, routes=routes, return_attn=False)
             yhat = out.y_hat
 
             # main loss: MAE on z-score space (ổn định train)
@@ -243,7 +244,8 @@ def main():
                 }
 
         # eval val
-        val_metrics = evaluate(model, dl_va, device, mu, sigma)
+        val_metrics = evaluate(model, dl_va, device, mu, sigma, cfg, adj, rng)
+
         train_loss = float(np.mean(losses))
 
         print(f"[Epoch {epoch:03d}] loss={train_loss:.4f} | val MAE={val_metrics['MAE']:.4f} RMSE={val_metrics['RMSE']:.4f} MAPE={val_metrics['MAPE']:.2f}")
