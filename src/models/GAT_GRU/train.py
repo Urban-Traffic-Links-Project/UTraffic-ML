@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from src.config.default import TrainConfig  # :contentReference[oaicite:3]{index=3}
 from src.data_loader.dataset import TrafficWindowDataset
 from src.data_loader.graph import load_edge_index
-from src.data_loader.tomtom_io import load_tomtom_tensor, load_zscore_stats, load_npz
+from src.data_loader.tomtom_io import load_npz, load_zscore_stats
 from src.utils.seed import set_seed
 from src.utils.metrics import mae, rmse, mape
 from src.models.GAT_GRU.model import GATGRU
