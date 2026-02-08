@@ -1,6 +1,7 @@
 # src/data_processing/collectors/tomtom_collector.py
 import gzip
 import json
+import datetime
 import time
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
@@ -12,6 +13,7 @@ from utils.logger import LoggerMixin
 class TomTomTrafficDataCollector(LoggerMixin):
     """
     Thu thập dữ liệu giao thông từ TomTom Traffic Stats API
+    Đã chỉnh sửa để lấy dữ liệu chuỗi thời gian (Time Series) liên tục
     """
     
     def __init__(self, api_key: Optional[str] = None):
@@ -23,7 +25,76 @@ class TomTomTrafficDataCollector(LoggerMixin):
         
         if not self.api_key:
             raise ValueError("TomTom API key is required")
-    
+
+    def _generate_time_slots_15min(self) -> List[Dict]:
+        """
+        Tạo 24 slots 15 phút để có timesteps dày đặc cho T-GCN.
+        Sử dụng khung giờ bạn đã chọn: 07:00-10:00 và 15:00-18:00
+        """
+        time_sets = []
+        # Các block giờ muốn lấy
+        blocks = [("07:00", "10:00"), ("15:00", "18:00")]
+        
+        for start_str, end_str in blocks:
+            start_dt = datetime.datetime.strptime(start_str, "%H:%M")
+            end_dt = datetime.datetime.strptime(end_str, "%H:%M")
+            
+            curr = start_dt
+            while curr < end_dt:
+                next_slot = curr + datetime.timedelta(minutes=15)
+                s_form = curr.strftime("%H:%M")
+                e_form = next_slot.strftime("%H:%M")
+                
+                time_sets.append({
+                    "name": f"Slot_{s_form.replace(':','')}",
+                    "timeGroups": [{
+                        "days": ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"],
+                        "times": [f"{s_form}-{e_form}"]
+                    }]
+                })
+                curr = next_slot
+        return time_sets
+
+    def collect_31_days_sequential(self, geometry: dict, start_date_str: str):
+        """
+        HÀM QUAN TRỌNG: Lặp qua 31 ngày, mỗi ngày tạo 1 Job riêng biệt.
+        Điều này đảm bảo dữ liệu không bị gộp trung bình và có đủ timesteps.
+
+        Returns:
+            tuple: (job_ids: List[str], all_results: List[dict])
+            - job_ids: danh sách job_id tương ứng từng ngày (để pipeline đọc file job_{id}_results.json)
+            - all_results: danh sách dữ liệu JSON đã tải (mỗi phần tử là kết quả 1 ngày)
+        """
+        start_date = datetime.datetime.strptime(start_date_str, "%Y-%m-%d")
+        time_slots = self._generate_time_slots_15min()
+
+        job_ids: List[str] = []
+        all_results: List[dict] = []
+
+        for i in range(31):
+            curr_date = (start_date + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+            self.logger.info(f"🚀 Processing Date: {curr_date} ({i+1}/31)")
+
+            job_id = self.create_area_analysis_job(
+                geometry=geometry,
+                date_from=curr_date,
+                date_to=curr_date,
+                job_name=f"Traffic_Series_{curr_date}",
+                time_sets=time_slots
+            )
+
+            if job_id:
+                job_ids.append(job_id)
+                status = self.wait_for_job_completion(job_id)
+                if status:
+                    data = self.download_results(job_id)
+                    if data:
+                        all_results.append(data)
+
+            time.sleep(2)
+
+        return job_ids, all_results
+
     def create_area_analysis_job(
         self, 
         geometry: dict, 
@@ -32,20 +103,7 @@ class TomTomTrafficDataCollector(LoggerMixin):
         job_name: str = "Traffic Analysis",
         time_sets: Optional[List[Dict]] = None
     ) -> Optional[str]:
-        """
-        Tạo job phân tích giao thông cho một khu vực
-        
-        Args:
-            geometry: GeoJSON MultiPolygon/Polygon
-            date_from: Ngày bắt đầu (YYYY-MM-DD)
-            date_to: Ngày kết thúc (YYYY-MM-DD)
-            job_name: Tên job
-            time_sets: Các time sets để phân tích
-            
-        Returns:
-            job_id nếu thành công, None nếu thất bại
-        """
-        
+        """Tạo job phân tích giao thông"""
         if time_sets is None:
             time_sets = self._get_default_time_sets()
         
@@ -56,11 +114,11 @@ class TomTomTrafficDataCollector(LoggerMixin):
                 "name": f"{job_name} Network",
                 "geometry": geometry,
                 "timeZoneId": "Asia/Ho_Chi_Minh",
-                "frcs": ["0", "1", "2", "3", "4", "5", "6", "7"],
+                "frcs": ["0", "1", "2", "3", "4", "5"], 
                 "probeSource": "ALL"
             },
             "dateRange": {
-                "name": f"{date_from} to {date_to}",
+                "name": f"Single Day {date_from}",
                 "from": date_from,
                 "to": date_to,
             },

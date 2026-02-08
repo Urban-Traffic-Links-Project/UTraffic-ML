@@ -7,10 +7,10 @@
 
 1. DỮ LIỆU GỐC (JSON)
    ├─ File: job_8375763_results.json
-   ├─ Job Name: District 1 Traffic August 2024
-   ├─ Time Period: 2024-08-01 to 2024-08-31
-   ├─ Số segments: 10637
-   ├─ Số records (segments × time_sets): 42548
+   ├─ Job Name: Traffic_Series_2024-08-01
+   ├─ Time Period: 2024-08-01 to 2024-08-01
+   ├─ Số segments: 515
+   ├─ Số records (segments × time_sets): 12360
    └─ Số features gốc: 20
 
 2. DỮ LIỆU ĐÃ XỬ LÝ (NPZ)

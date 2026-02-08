@@ -47,6 +47,38 @@ class TrafficDataPipelineNPZ:
         
         self.logger.info("✅ Pipeline initialized with NPZ storage")
     
+    def run_31_days_collection(
+        self,
+        geometry: Dict,
+        start_date: str,
+    ) -> Optional[List[str]]:
+        """
+        Stage 1 (31 ngày): Thu thập dữ liệu 31 ngày liên tiếp từ TomTom.
+        Mỗi ngày 1 job riêng, không gộp trung bình — phù hợp time series cho T-GCN.
+
+        Args:
+            geometry: Polygon geometry cho vùng phân tích.
+            start_date: Ngày bắt đầu (YYYY-MM-DD). Sẽ thu 31 ngày từ ngày này.
+
+        Returns:
+            Danh sách job_id tương ứng 31 ngày, hoặc None nếu thất bại.
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("STAGE 1: 31-DAY SEQUENTIAL DATA COLLECTION")
+        self.logger.info("=" * 60)
+
+        job_ids, all_results = self.collector.collect_31_days_sequential(
+            geometry=geometry,
+            start_date_str=start_date,
+        )
+
+        if not job_ids:
+            self.logger.error("No jobs created")
+            return None
+
+        self.logger.info(f"✅ Stage 1 complete: {len(job_ids)} jobs (31 days)")
+        return job_ids
+
     def run_batch_collection(
         self,
         geometry: Dict,
@@ -55,78 +87,104 @@ class TrafficDataPipelineNPZ:
         job_name: str = "Traffic Analysis"
     ) -> Optional[str]:
         """
-        Stage 1: Thu thập dữ liệu batch từ TomTom
+        Stage 1 (legacy): Thu thập dữ liệu batch một khoảng ngày từ TomTom.
+        Dùng run_31_days_collection nếu cần chuỗi 31 ngày riêng từng ngày.
         """
         self.logger.info("=" * 60)
         self.logger.info("STAGE 1: BATCH DATA COLLECTION")
         self.logger.info("=" * 60)
-        
+
         job_id = self.collector.create_area_analysis_job(
             geometry=geometry,
             date_from=date_from,
             date_to=date_to,
             job_name=job_name
         )
-        
+
         if not job_id:
             self.logger.error("Failed to create job")
             return None
-        
+
         status = self.collector.wait_for_job_completion(job_id, max_wait_minutes=60)
-        
+
         if not status or status.get('jobState') != 'DONE':
             self.logger.error("Job did not complete successfully")
             return None
-        
+
         results = self.collector.download_results(job_id)
-        
+
         if not results:
             self.logger.error("Failed to download results")
             return None
-        
+
         self.logger.info(f"✅ Stage 1 complete: Job {job_id}")
         return job_id
     
     def run_streaming_ingestion(self, job_id: str):
         """
-        Stage 2: Đưa dữ liệu vào Kafka stream
+        Stage 2: Đưa dữ liệu từ 1 file job vào Kafka stream.
         """
         self.logger.info("=" * 60)
         self.logger.info("STAGE 2: STREAMING INGESTION")
         self.logger.info("=" * 60)
-        
+        n = self._ingest_one_job_to_stream(job_id)
+        self.logger.info(f"✅ Stage 2 complete: {n} segments")
+
+    def run_streaming_ingestion_from_jobs(self, job_ids: List[str]):
+        """
+        Stage 2 (31 ngày): Đưa dữ liệu từ nhiều file job (31 ngày) vào Kafka stream.
+        Mỗi job tương ứng 1 ngày; thứ tự job_ids theo thứ tự ngày.
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("STAGE 2: STREAMING INGESTION (31 DAYS)")
+        self.logger.info("=" * 60)
+
+        total_sent = 0
+        for idx, job_id in enumerate(job_ids):
+            n = self._ingest_one_job_to_stream(job_id, day_index=idx + 1, total_days=len(job_ids))
+            total_sent += n
+
+        self.logger.info(f"✅ Stage 2 complete: {total_sent} segments from {len(job_ids)} days")
+
+    def _ingest_one_job_to_stream(
+        self,
+        job_id: str,
+        day_index: Optional[int] = None,
+        total_days: Optional[int] = None,
+    ) -> int:
+        """Đọc 1 file job_*_results.json và gửi segments vào Kafka. Trả về số segment đã gửi."""
         result_file = config.data.raw_dir / "tomtom_stats" / f"job_{job_id}_results.json"
-        
+
         if not result_file.exists():
             self.logger.error(f"Result file not found: {result_file}")
-            return
-        
-        with open(result_file, 'r') as f:
+            return 0
+
+        with open(result_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        
+
         sent_count = 0
-        
         with TrafficDataProducer() as producer:
             network = data.get('network', {})
             segment_results = network.get('segmentResults', [])
-            
+
             for segment in segment_results:
                 message = {
                     'job_id': job_id,
                     'segment': segment,
                     'job_name': data.get('jobName'),
                     'date_ranges': data.get('dateRanges'),
-                    'time_sets': data.get('timeSets')
+                    'time_sets': data.get('timeSets'),
                 }
-                
+
                 key = str(segment.get('segmentId'))
                 producer.send_raw_data(message, key=key)
                 sent_count += 1
-            
+
             producer.flush()
-            self.logger.info(f"✅ Sent {sent_count} segments to Kafka")
-        
-        self.logger.info("✅ Stage 2 complete")
+
+        label = f" (day {day_index}/{total_days})" if day_index and total_days else ""
+        self.logger.info(f"✅ Sent {sent_count} segments for job {job_id}{label}")
+        return sent_count
     
     def run_validation_processing(self):
         """
@@ -302,9 +360,14 @@ class TrafficDataPipelineNPZ:
         
         self.logger.info(f"Loaded {len(df)} records with {len(df.columns)} features")
         
-        # Sort by segment and time
-        if 'segment_id' in df.columns and 'time_set' in df.columns:
-            df = df.sort_values(['segment_id', 'time_set'])
+        # Sort by segment, date (31 ngày), rồi time_set để chuỗi thời gian đúng thứ tự
+        sort_cols = ['segment_id']
+        if 'date_range' in df.columns:
+            sort_cols.append('date_range')
+        if 'time_set' in df.columns:
+            sort_cols.append('time_set')
+        if len(sort_cols) > 1:
+            df = df.sort_values(sort_cols)
         
         # Get unique segments
         if 'segment_id' not in df.columns:
@@ -401,7 +464,7 @@ class TrafficDataPipelineNPZ:
     
     def build_graph_structure(
         self,
-        distance_threshold: float = 1.0,  # km
+        distance_threshold: float = 0.2,  # km
         output_name: str = 'graph_structure'
     ):
         """
@@ -515,38 +578,56 @@ class TrafficDataPipelineNPZ:
     def run_full_pipeline(
         self,
         geometry: Dict,
-        date_from: str,
-        date_to: str,
-        job_name: str = "Traffic Analysis"
+        start_date: str,
+        use_31_days: bool = True,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        job_name: str = "Traffic Analysis",
     ):
         """
-        Chạy toàn bộ pipeline từ collection đến export
+        Chạy toàn bộ pipeline từ collection đến export.
+
+        Args:
+            geometry: Polygon geometry cho vùng phân tích.
+            start_date: Ngày bắt đầu (YYYY-MM-DD). Dùng khi use_31_days=True.
+            use_31_days: True = thu 31 ngày liên tiếp (mỗi ngày 1 job); False = dùng date_from/date_to.
+            date_from: Ngày bắt đầu (legacy, khi use_31_days=False).
+            date_to: Ngày kết thúc (legacy, khi use_31_days=False).
+            job_name: Tên job (chủ yếu cho legacy batch).
         """
         self.logger.info("=" * 60)
         self.logger.info("STARTING FULL PIPELINE WITH NPZ STORAGE")
         self.logger.info("=" * 60)
-        
-        # Stage 1: Collection
-        job_id = self.run_batch_collection(geometry, date_from, date_to, job_name)
-        if not job_id:
-            self.logger.error("Pipeline failed at Stage 1")
-            return
-        
-        # Stage 2: Ingestion
-        self.run_streaming_ingestion(job_id)
-        
+
+        if use_31_days:
+            # Stage 1: 31 ngày, mỗi ngày 1 job
+            job_ids = self.run_31_days_collection(geometry=geometry, start_date=start_date)
+            if not job_ids:
+                self.logger.error("Pipeline failed at Stage 1 (31-day collection)")
+                return
+            # Stage 2: Ingestion từ nhiều file
+            self.run_streaming_ingestion_from_jobs(job_ids)
+        else:
+            date_f = date_from or start_date
+            date_t = date_to or start_date
+            job_id = self.run_batch_collection(geometry, date_f, date_t, job_name)
+            if not job_id:
+                self.logger.error("Pipeline failed at Stage 1")
+                return
+            self.run_streaming_ingestion(job_id)
+
         # Stage 3: Validation
         self.run_validation_processing()
-        
+
         # Stage 4: Feature Extraction
         self.run_feature_extraction()
-        
+
         # Stage 5: Export for training
         self.export_for_model_training()
-        
+
         # Stage 6: Build graph
         self.build_graph_structure()
-        
+
         self.logger.info("=" * 60)
         self.logger.info("✅ FULL PIPELINE COMPLETE")
         self.logger.info("=" * 60)
