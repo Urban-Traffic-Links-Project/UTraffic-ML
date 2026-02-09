@@ -17,7 +17,7 @@ class TrainConfig:
 
     # ====== Train ======
     batch: int = 4
-    epochs: int = 50
+    epochs: int = 300
     lr: float = 1e-3
     seed: int = 42
     weight_decay: float = 0.0
