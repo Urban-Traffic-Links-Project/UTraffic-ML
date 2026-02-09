@@ -57,8 +57,8 @@ def main():
     geometry = get_geometry_quan1()
 
     # --- Chế độ 1: Full pipeline 31 ngày (thu thập + ingestion + validation + features + export + graph)
-    RUN_FULL_31_DAYS = True
-    START_DATE = "2024-08-20"
+    RUN_FULL_31_DAYS = False
+    START_DATE = "2024-08-01"
 
     if RUN_FULL_31_DAYS:
         pipeline.run_full_pipeline(
