@@ -137,7 +137,6 @@ def evaluate(model: GATGRU, loader: DataLoader, device: str, mu: np.ndarray, sig
         "MAPE": float(np.mean(mapes)),
     }
 
-
 def main():
     cfg = TrainConfig()
     set_seed(cfg.seed)
@@ -147,17 +146,17 @@ def main():
 
     data_root = Path(cfg.dataset_root)
     train_dir = data_root / cfg.train_split
-    val_dir = data_root / cfg.val_split
-    test_dir = data_root / cfg.test_split
+    val_dir   = data_root / cfg.val_split
+    test_dir  = data_root / cfg.test_split
 
     # ----------------------------
     # Load npz -> dict -> values
     # ----------------------------
     train_pack = load_npz(str(train_dir / "traffic_tensor.npz"))
-    val_pack   = load_npz(str(val_dir / "traffic_tensor.npz"))
-    test_pack  = load_npz(str(test_dir / "traffic_tensor.npz"))
+    val_pack   = load_npz(str(val_dir   / "traffic_tensor.npz"))
+    test_pack  = load_npz(str(test_dir  / "traffic_tensor.npz"))
 
-    Xtr = get_values_3d(train_pack)  # [T,N,1] (auto add channel if needed)
+    Xtr = get_values_3d(train_pack)  # [T,N,1]
     Xva = get_values_3d(val_pack)
     Xte = get_values_3d(test_pack)
 
@@ -166,7 +165,6 @@ def main():
 
     # ----------------------------
     # Graph: edges.csv + segment_index.csv
-    # load_edge_index requires num_nodes & segid_to_idx
     # ----------------------------
     edges_csv = data_root / "edges.csv"
     seg_index_csv = data_root / "segment_index.csv"
@@ -181,23 +179,18 @@ def main():
 
     # ----------------------------
     # Z-score stats (for inverse metrics)
-    # stats saved as {"mu": Series, "sigma": Series}
     # ----------------------------
     stats = load_zscore_stats(str(data_root / "zscore_stats_speed.pkl"))
-    mu = stats["mu"].values.astype(np.float32)  # ✅ lấy theo thứ tự cột
+    mu = stats["mu"].values.astype(np.float32)
     sigma = stats["sigma"].values.astype(np.float32)
 
-    mu = np.nan_to_num(mu, nan=0.0)  # ✅ thêm cho chắc
+    # safety (tránh nan/inf do sigma=0)
+    mu = np.nan_to_num(mu, nan=0.0)
     sigma = np.nan_to_num(sigma, nan=1.0)
     sigma = np.clip(sigma, 1e-6, None)
 
-
     # ----------------------------
     # Datasets / Loaders
-    # dataset returns:
-    #   x: [P,N,F], y: [H,N]
-    # so DataLoader gives:
-    #   x: [B,P,N,F], y: [B,H,N]
     # ----------------------------
     ds_tr = TrafficWindowDataset(Xtr, P=cfg.P, H=cfg.H)
     ds_va = TrafficWindowDataset(Xva, P=cfg.P, H=cfg.H)
@@ -227,21 +220,49 @@ def main():
     optim = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
     save_dir = ensure_dir(cfg.save_dir)
-    best_path = save_dir / cfg.save_best_name
+    best_path = save_dir / getattr(cfg, "save_best_name", "best.pt")
+    last_path = save_dir / getattr(cfg, "save_last_name", "last.pt")
 
     # ----------------------------
     # Random-walk routes (static)
     # ----------------------------
-    adj = build_adj_list(edge_index, N)
+    adj = build_adj_list(edge_index, N)   # edge_index on CPU is fine for adj
     rng = np.random.default_rng(cfg.seed + 123)
 
+    # ----------------------------
+    # Resume (auto-detect)
+    # ----------------------------
+    start_epoch = 1
     best_val_mae = float("inf")
 
-    for epoch in range(1, cfg.epochs + 1):
+    if getattr(cfg, "resume", True):
+        ckpt_path = None
+        if last_path.exists():
+            ckpt_path = last_path
+        elif best_path.exists():
+            ckpt_path = best_path
+
+        if ckpt_path is not None:
+            ckpt = torch.load(ckpt_path, map_location=device)
+            if "model_state" in ckpt:
+                model.load_state_dict(ckpt["model_state"])
+            if "optim_state" in ckpt:
+                optim.load_state_dict(ckpt["optim_state"])
+
+            last_done = int(ckpt.get("epoch", 0))
+            start_epoch = last_done + 1
+            best_val_mae = float(ckpt.get("best_val_mae", best_val_mae))
+
+            print(f"[RESUME] Loaded {ckpt_path} | last_done={last_done} -> start_epoch={start_epoch} | best_val_mae={best_val_mae:.4f}")
+        else:
+            print("[RESUME] No checkpoint found. Train from scratch.")
+
+    # ----------------------------
+    # Train
+    # ----------------------------
+    for epoch in range(start_epoch, cfg.epochs + 1):
         model.train()
         losses = []
-
-        # dump attention from LAST batch of epoch (optional)
         last_attn_dump: Optional[Dict[str, np.ndarray]] = None
 
         for it, (x, y) in enumerate(dl_tr, start=1):
@@ -260,24 +281,25 @@ def main():
                     rng=rng,
                 ).to(device)
 
-            need_attn = bool(cfg.export_attn_every_epoch) and (it == len(dl_tr))
+            need_attn = bool(getattr(cfg, "export_attn_every_epoch", False)) and (it == len(dl_tr))
             out = model(x, routes=routes, return_attn=need_attn)
-            yhat = out.y_hat  # [B,H,N]
+            yhat = out.y_hat
 
             loss = torch.mean(torch.abs(yhat - y))  # MAE in z-space
             optim.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optim.step()
+
             losses.append(float(loss.item()))
 
             if need_attn:
                 last_attn_dump = {}
                 if out.gat_attn is not None:
                     for li, a in enumerate(out.gat_attn):
-                        last_attn_dump[f"gat_layer_{li}"] = a.detach().cpu().numpy()  # [B,E,heads]
+                        last_attn_dump[f"gat_layer_{li}"] = a.detach().cpu().numpy()
                 if out.route_pool_attn is not None:
-                    last_attn_dump["route_pool_attn"] = out.route_pool_attn.detach().cpu().numpy()  # [B,R,L]
+                    last_attn_dump["route_pool_attn"] = out.route_pool_attn.detach().cpu().numpy()
 
         train_loss = float(np.mean(losses))
         val_metrics = evaluate(model, dl_va, device, mu, sigma)
@@ -291,8 +313,8 @@ def main():
         # ----------------------------
         # Save BEST checkpoint
         # ----------------------------
-        if val_metrics["MAE"] < best_val_mae:
-            best_val_mae = val_metrics["MAE"]
+        if np.isfinite(val_metrics["MAE"]) and (val_metrics["MAE"] < best_val_mae):
+            best_val_mae = float(val_metrics["MAE"])
             torch.save(
                 {
                     "epoch": epoch,
@@ -306,24 +328,39 @@ def main():
             print(f"  ✅ Saved BEST -> {best_path} (val MAE={best_val_mae:.4f})")
 
         # ----------------------------
+        # Save LAST checkpoint (always)
+        # ----------------------------
+        torch.save(
+            {
+                "epoch": epoch,
+                "best_val_mae": best_val_mae,
+                "model_state": model.state_dict(),
+                "optim_state": optim.state_dict(),
+                "cfg": cfg.__dict__,
+            },
+            last_path,
+        )
+
+        # ----------------------------
         # Export attention per epoch (optional)
         # ----------------------------
-        if cfg.export_attn_every_epoch and last_attn_dump is not None:
+        if getattr(cfg, "export_attn_every_epoch", False) and last_attn_dump is not None:
             attn_dir = ensure_dir(save_dir / "attn")
             out_path = attn_dir / f"epoch_{epoch:03d}_attn.npz"
             np.savez_compressed(out_path, **last_attn_dump)
             print(f"  ✅ Exported attn -> {out_path}")
 
     # ----------------------------
-    # TEST with best
+    # TEST with best (fallback last)
     # ----------------------------
-    ckpt = torch.load(best_path, map_location=device)
+    best_or_last = best_path if best_path.exists() else last_path
+    ckpt = torch.load(best_or_last, map_location=device)
     model.load_state_dict(ckpt["model_state"])
+    print(f"[INFO] Testing with checkpoint: {best_or_last}")
 
     test_metrics = evaluate(model, dl_te, device, mu, sigma)
     print(f"[TEST] MAE={test_metrics['MAE']:.4f} RMSE={test_metrics['RMSE']:.4f} MAPE={test_metrics['MAPE']:.2f}")
-    print(f"[DONE] Best checkpoint: {best_path}")
-
+    print(f"[DONE] Best checkpoint: {best_path} | Last checkpoint: {last_path}")
 
 if __name__ == "__main__":
     main()

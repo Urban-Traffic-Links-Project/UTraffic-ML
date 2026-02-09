@@ -46,3 +46,8 @@ class TrainConfig:
     save_dir: str = os.path.join("saved_models", "GAT_GRU")
     save_best_name: str = "best.pt"
     export_attn_every_epoch: bool = True  # lưu attention weights theo epoch (hoặc chỉ best)
+
+    save_best_name: str = "best.pt"
+    save_last_name: str = "last.pt"
+    resume: bool = True
+
