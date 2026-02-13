@@ -253,6 +253,16 @@ class TrafficDataPipelineNPZ:
             try:
                 segment = value.get('segment', {})
                 time_results = segment.get('segmentTimeResults', [])
+
+                # Trong feature_processor callback
+                time_sets_map = {}
+                for ts in value.get('time_sets', []):
+                    time_sets_map[ts.get('@id')] = ts.get('name')
+
+                date_ranges_map = {}
+                for dr in value.get('date_ranges', []):
+                    date_ranges_map[dr.get('@id')] = dr.get('from')
+
                 
                 for time_result in time_results:
                     record = {
@@ -263,8 +273,8 @@ class TrafficDataPipelineNPZ:
                         'frc': segment.get('frc'),
                         'speed_limit': segment.get('speedLimit'),
                         
-                        'time_set': time_result.get('timeSet'),
-                        'date_range': time_result.get('dateRange'),
+                        'time_set': time_sets_map.get(time_result.get('timeSet')),  # "Slot_0700"
+                        'date_from': date_ranges_map.get(time_result.get('dateRange')),  # "2024-08-01"
                         
                         'harmonic_average_speed': time_result.get('harmonicAverageSpeed'),
                         'median_speed': time_result.get('medianSpeed'),
@@ -307,14 +317,22 @@ class TrafficDataPipelineNPZ:
         self.logger.info(f"✅ Stage 4 complete: {processed_count} records processed")
     
     def _process_and_save_batch(self):
-        """Xử lý và lưu batch vào NPZ"""
+        """Xử lý và lưu batch vào NPZ - FIXED to preserve metadata columns"""
         if not self.accumulated_data:
             return
         
         df = pd.DataFrame(self.accumulated_data)
         
-        # 1. Clean
+        # 1. Clean (GIỮ nguyên các cột metadata để không bị xóa trục thời gian)
+        #    - _remove_duplicates sẽ dùng segment_id + time_set + date_from
         df = self.cleaner.clean(df)
+        
+        # ===== CRITICAL: Preserve metadata columns TRƯỚC KHI transform features =====
+        metadata_cols = ['time_set', 'date_from']
+        preserved_data = {}
+        for col in metadata_cols:
+            if col in df.columns:
+                preserved_data[col] = df[col].copy()
         
         # 2. Extract features
         df = self.feature_extractor.extract_all_features(df)
@@ -328,154 +346,288 @@ class TrafficDataPipelineNPZ:
         # 5. Normalize
         df = self.normalizer.fit_transform(df, method='standard')
         
+        # ===== CRITICAL: Restore metadata columns AFTER processing =====
+        for col, data in preserved_data.items():
+            df[col] = data
+        
         # 6. Save to NPZ
         self.npz_writer.write_features(df)
         
-        self.logger.info(f"Processed and saved batch of {len(df)} records")
-    
+        self.logger.info(f"Processed and saved batch of {len(df)} records (with preserved metadata)")
+
     def export_for_model_training(
         self,
-        output_name: str = 'model_ready_data',
+        output_name: str = None,
         sequence_length: int = 12,
         prediction_horizon: int = 12
     ):
         """
-        Stage 5: Export data sẵn sàng cho model training
-        
-        Args:
-            output_name: Tên file output
-            sequence_length: Độ dài input sequence (số timesteps)
-            prediction_horizon: Độ dài prediction (số timesteps)
+        Stage 5: Export data với ĐÚNG SHAPE 4D cho T-GCN
+        FIX: Properly concatenate 31 days × 24 slots = 744 timesteps
         """
+        from datetime import datetime
+        import re
+        
         self.logger.info("=" * 60)
-        self.logger.info("STAGE 5: EXPORT FOR MODEL TRAINING")
+        self.logger.info("STAGE 5: EXPORT FOR MODEL TRAINING (31-DAY SEQUENTIAL FIX)")
         self.logger.info("=" * 60)
         
-        # Read processed features
         df = self.npz_reader.read_features()
         
         if df is None or df.empty:
             self.logger.error("No features found to export")
             return
         
-        self.logger.info(f"Loaded {len(df)} records with {len(df.columns)} features")
+        self.logger.info(f"Loaded {len(df)} records")
         
-        # Sort by segment, date (31 ngày), rồi time_set để chuỗi thời gian đúng thứ tự
-        sort_cols = ['segment_id']
-        if 'date_range' in df.columns:
-            sort_cols.append('date_range')
-        if 'time_set' in df.columns:
-            sort_cols.append('time_set')
-        if len(sort_cols) > 1:
-            df = df.sort_values(sort_cols)
-        
-        # Get unique segments
-        if 'segment_id' not in df.columns:
-            self.logger.error("segment_id column not found")
+        # ===== CRITICAL FIX: Check for correct column names =====
+        if 'time_set' not in df.columns:
+            self.logger.error("❌ Missing 'time_set' column!")
+            self.logger.info(f"Available columns: {df.columns.tolist()}")
             return
-        
-        segment_ids = df['segment_id'].unique()
-        self.logger.info(f"Found {len(segment_ids)} unique segments")
-        
-        # Select feature columns (exclude IDs and text)
-        exclude_cols = [
-            'segment_id', 'new_segment_id', 'street_name',
-            'date_range', 'time_set'
-        ]
-        feature_cols = [col for col in df.columns if col not in exclude_cols]
-        
-        self.logger.info(f"Using {len(feature_cols)} features for training")
-        
-        # Create sequences for each segment
-        sequences = []
-        targets = []
-        segment_indices = []
-        
-        for seg_id in segment_ids:
-            seg_data = df[df['segment_id'] == seg_id][feature_cols].values
-            
-            if len(seg_data) < sequence_length + prediction_horizon:
-                continue
-            
-            # Create sliding windows
-            for i in range(len(seg_data) - sequence_length - prediction_horizon + 1):
-                seq = seg_data[i:i + sequence_length]
-                target = seg_data[i + sequence_length:i + sequence_length + prediction_horizon]
+
+        # Detect date column (flexible - accept either name)
+        date_col = None
+        if 'date_from' in df.columns:
+            date_col = 'date_from'
+        elif 'date_range' in df.columns:
+            date_col = 'date_range'
+        else:
+            self.logger.error("❌ Missing date column! Need 'date_from' or 'date_range'")
+            self.logger.info(f"Available columns: {df.columns.tolist()}")
+            return
+
+        self.logger.info(f"Using date column: {date_col}")
+
+        # Extract date from "Single Day 2024-08-01" format
+        def extract_date(date_str):
+            date_str = str(date_str)
+            # If already in YYYY-MM-DD format
+            if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+                return date_str
+            # Extract from "Single Day 2024-08-01" format
+            match = re.search(r'\d{4}-\d{2}-\d{2}', date_str)
+            return match.group(0) if match else None
+
+        # Extract slot index from "Slot_0700" format
+        def extract_slot_index(time_str):
+            match = re.search(r'Slot_(\d{4})', str(time_str))
+            if match:
+                time_code = match.group(1)
+                hour = int(time_code[:2])
+                minute = int(time_code[2:])
                 
-                sequences.append(seq)
-                targets.append(target)
-                segment_indices.append(seg_id)
+                # Morning: 07:00-09:45 = indices 0-11
+                # Evening: 15:00-17:45 = indices 12-23
+                if 7 <= hour < 10:
+                    return (hour - 7) * 4 + minute // 15
+                elif 15 <= hour < 18:
+                    return 12 + (hour - 15) * 4 + minute // 15
+            return None
+
+        df['date'] = df[date_col].apply(extract_date)
+        df['slot_index'] = df['time_set'].apply(extract_slot_index)
+
+        # Debug info
+        self.logger.info(f"Sample dates: {df['date'].head(3).tolist()}")
+        self.logger.info(f"Sample time_sets: {df['time_set'].head(3).tolist()}")
+        self.logger.info(f"Sample slot_indices: {df['slot_index'].head(3).tolist()}")
+
+        # Remove invalid rows
+        df = df.dropna(subset=['date', 'slot_index'])
+        df['slot_index'] = df['slot_index'].astype(int)
+
+        self.logger.info(f"After cleaning: {len(df)} records remain")
+
+        # Create day index (0, 1, 2, ..., 30)
+        unique_dates = sorted(df['date'].unique())
+        num_days = len(unique_dates)
+
+        if num_days == 0:
+            self.logger.error("❌ No valid dates found!")
+            return
+
+        self.logger.info(f"Found {num_days} days: {unique_dates[0]} to {unique_dates[-1]}")
+
+        date_to_idx = {date: idx for idx, date in enumerate(unique_dates)}
+        df['day_index'] = df['date'].map(date_to_idx)
         
-        if not sequences:
-            self.logger.error("No sequences created")
+        # Create global timestamp: day * 24 + slot
+        df['global_timestamp'] = df['day_index'] * 24 + df['slot_index']
+        
+        # Sort by segment and global timestamp
+        df = df.sort_values(['segment_id', 'global_timestamp']).reset_index(drop=True)
+        
+        self.logger.info(f"Global timestamps range: {df['global_timestamp'].min()} - {df['global_timestamp'].max()}")
+        
+        # Get segments (tổng trước khi lọc)
+        all_segment_ids = sorted(df['segment_id'].unique())
+        self.logger.info(f"Found {len(all_segment_ids)} segments before filtering for completeness")
+        
+        # ===== Select Features =====
+        exclude_patterns = [
+            'segment_id', 'new_segment_id', 'street_name',
+            'date_range', 'time_set', 'date', 'slot_index', 'day_index', 'global_timestamp',
+            'latitude', 'longitude',
+            'grid_lat', 'grid_lon', 'grid_cell',
+            'congestion_level', 'distance_category',
+            'frc_encoded', 'time_set_encoded', 'frc_level'
+        ]
+        
+        feature_cols = [col for col in df.columns 
+                       if col not in exclude_patterns
+                       and pd.api.types.is_numeric_dtype(df[col])
+                       and not df[col].isnull().all()
+                       and df[col].nunique() > 1]
+        
+        num_features = len(feature_cols)
+        self.logger.info(f"Selected {num_features} features: {feature_cols[:10]}")
+        
+        if num_features == 0:
+            self.logger.error("❌ No features!")
             return
         
-        # Convert to numpy arrays
-        X = np.array(sequences)  # [num_samples, sequence_length, num_features]
-        y = np.array(targets)    # [num_samples, prediction_horizon, num_features]
-        segment_indices = np.array(segment_indices)
+        # ===== Check timesteps =====
+        timesteps_per_seg = df.groupby('segment_id')['global_timestamp'].count().to_dict()
+        min_ts = min(timesteps_per_seg.values())
+        max_ts = max(timesteps_per_seg.values())
+        expected_ts = num_days * 24
         
-        self.logger.info(f"Created {len(X)} sequences")
-        self.logger.info(f"X shape: {X.shape}, y shape: {y.shape}")
+        self.logger.info(f"Timesteps: min={min_ts}, max={max_ts}, expected={expected_ts}")
         
-        # Create train/val/test split (temporal split)
-        n_samples = len(X)
-        train_size = int(0.7 * n_samples)
-        val_size = int(0.15 * n_samples)
+        # Segments có đầy đủ 31 ngày × 24 slots
+        full_data_segs = [s for s, c in timesteps_per_seg.items() if c == expected_ts]
+        self.logger.info(
+            f"Segments with full {expected_ts} timesteps: {len(full_data_segs)}/{len(timesteps_per_seg)}"
+        )
         
-        X_train = X[:train_size]
-        y_train = y[:train_size]
+        # Số timestep tối thiểu cần cho 1 mẫu (seq + pred)
+        min_needed = sequence_length + prediction_horizon
         
-        X_val = X[train_size:train_size + val_size]
-        y_val = y[train_size:train_size + val_size]
+        if full_data_segs:
+            # Ưu tiên dùng các segment có đủ 744 timestep
+            selected_segs = full_data_segs
+            num_timesteps = expected_ts
+            self.logger.info(
+                f"Using {len(selected_segs)} segments with FULL {num_timesteps} timesteps "
+                f"({num_days} days × 24 slots)"
+            )
+        else:
+            # Nếu không có segment nào đủ 744, dùng các segment có ít nhất min_needed timesteps
+            candidate_segs = [s for s, c in timesteps_per_seg.items() if c >= min_needed]
+            if not candidate_segs:
+                self.logger.error(
+                    f"❌ Not enough timesteps in ANY segment: "
+                    f"max available per segment = {max_ts}, need at least {min_needed}"
+                )
+                return
+            
+            selected_segs = candidate_segs
+            # Lấy số timestep nhỏ nhất trong các segment được chọn để làm trục thời gian chung
+            num_timesteps = min(timesteps_per_seg[s] for s in selected_segs)
+            self.logger.info(
+                f"Using {len(selected_segs)} segments with at least {num_timesteps} timesteps "
+                f"(min_needed={min_needed})"
+            )
         
-        X_test = X[train_size + val_size:]
-        y_test = y[train_size + val_size:]
+        # Cập nhật lại danh sách nodes sau khi lọc theo độ đầy đủ
+        segment_ids = sorted(selected_segs)
+        num_nodes = len(segment_ids)
+        self.logger.info(f"Final selected segments: {num_nodes}")
         
-        # Save to NPZ
-        train_data = {
-            'X_train': X_train,
-            'y_train': y_train,
-            'X_val': X_val,
-            'y_val': y_val,
-            'X_test': X_test,
-            'y_test': y_test,
-            'segment_ids': segment_indices,
+        # ===== Create 3D tensor: (timesteps, nodes, features) =====
+        self.logger.info(f"Creating 3D: ({num_timesteps}, {num_nodes}, {num_features})")
+        
+        data_3d = np.zeros((num_timesteps, num_nodes, num_features), dtype=np.float32)
+        
+        for node_idx, seg_id in enumerate(segment_ids):
+            seg_df = df[df['segment_id'] == seg_id].sort_values('global_timestamp')
+            seg_data = seg_df[feature_cols].values.astype(np.float32)
+            
+            # Truncate or pad
+            if len(seg_data) > num_timesteps:
+                seg_data = seg_data[:num_timesteps]
+            elif len(seg_data) < num_timesteps:
+                if len(seg_data) > 0:
+                    pad = np.repeat([seg_data[-1]], num_timesteps - len(seg_data), axis=0)
+                    seg_data = np.vstack([seg_data, pad])
+                else:
+                    seg_data = np.zeros((num_timesteps, num_features), dtype=np.float32)
+            
+            # Clean
+            seg_data = np.nan_to_num(seg_data, nan=0.0, posinf=0.0, neginf=0.0)
+            data_3d[:, node_idx, :] = seg_data
+        
+        self.logger.info(f"✓ 3D tensor: {data_3d.shape}")
+        if num_timesteps == expected_ts:
+            self.logger.info(f"✅ PERFECT! {expected_ts} timesteps = {num_days} days × 24 slots")
+        
+        # ===== Create sliding windows =====
+        sequences, targets = [], []
+        max_start = num_timesteps - sequence_length - prediction_horizon + 1
+        
+        self.logger.info(f"Creating {max_start} sliding window samples")
+        
+        for i in range(max_start):
+            sequences.append(data_3d[i:i+sequence_length, :, :])
+            targets.append(data_3d[i+sequence_length:i+sequence_length+prediction_horizon, :, :])
+        
+        X = np.array(sequences, dtype=np.float32)
+        y = np.array(targets, dtype=np.float32)
+        
+        self.logger.info(f"✓ X: {X.shape}, y: {y.shape}")
+        assert len(X.shape) == 4 and len(y.shape) == 4
+        
+        # ===== Train/val/test split =====
+        n = len(X)
+        train_size = max(1, int(0.7 * n))
+        val_size = max(1, int(0.15 * n))
+        
+        X_train, y_train = X[:train_size], y[:train_size]
+        X_val, y_val = X[train_size:train_size+val_size], y[train_size:train_size+val_size]
+        X_test, y_test = X[train_size+val_size:], y[train_size+val_size:]
+        
+        # ===== Save =====
+        if output_name is None:
+            output_name = f"model_ready_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        data = {
+            'X_train': X_train, 'y_train': y_train,
+            'X_val': X_val, 'y_val': y_val,
+            'X_test': X_test, 'y_test': y_test,
+            'segment_ids': np.array(segment_ids),
             'feature_names': np.array(feature_cols)
         }
         
         metadata = {
             'sequence_length': sequence_length,
             'prediction_horizon': prediction_horizon,
-            'num_features': len(feature_cols),
-            'num_segments': len(segment_ids),
+            'num_features': num_features,
+            'num_nodes': num_nodes,
+            'num_timesteps': num_timesteps,
+            'num_days': num_days,
+            'expected_timesteps': expected_ts,
             'train_size': len(X_train),
             'val_size': len(X_val),
             'test_size': len(X_test),
-            'feature_columns': feature_cols
+            'date_range': f"{unique_dates[0]} to {unique_dates[-1]}"
         }
         
-        self.npz_writer.write_batch(train_data, output_name, metadata)
+        self.npz_writer.write_batch(data, output_name, metadata)
         
-        self.logger.info(f"✅ Exported training data to {output_name}")
-        self.logger.info(f"   Train: {X_train.shape}")
-        self.logger.info(f"   Val:   {X_val.shape}")
-        self.logger.info(f"   Test:  {X_test.shape}")
-    
+        self.logger.info(f"✅ Saved: {output_name}")
+        self.logger.info(f"   Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+        self.logger.info(f"   Date: {unique_dates[0]} to {unique_dates[-1]} ({num_days} days)")
+
     def build_graph_structure(
         self,
-        distance_threshold: float = 0.2,  # km
+        distance_threshold: float = 1.0,
+        min_degree: int = 3,
         output_name: str = 'graph_structure'
     ):
-        """
-        Stage 6: Xây dựng graph structure cho GNN
-        
-        Args:
-            distance_threshold: Khoảng cách tối đa để tạo edge (km)
-            output_name: Tên file output
-        """
+        """Stage 6: Build graph structure"""
         self.logger.info("=" * 60)
-        self.logger.info("STAGE 6: BUILD GRAPH STRUCTURE")
+        self.logger.info("STAGE 6: BUILD GRAPH STRUCTURE (IMPROVED)")
         self.logger.info("=" * 60)
         
         df = self.npz_reader.read_features()
@@ -484,12 +636,11 @@ class TrafficDataPipelineNPZ:
             self.logger.error("No features found")
             return
         
-        # Get unique segments with their coordinates
+        # Get coordinates
         if 'latitude' not in df.columns or 'longitude' not in df.columns:
             self.logger.error("Coordinates not found")
             return
         
-        # Group by segment to get representative coordinates
         segment_info = df.groupby('segment_id').agg({
             'latitude': 'first',
             'longitude': 'first'
@@ -498,9 +649,10 @@ class TrafficDataPipelineNPZ:
         segment_ids = segment_info['segment_id'].values
         coords = segment_info[['latitude', 'longitude']].values
         
-        self.logger.info(f"Building graph for {len(segment_ids)} nodes")
+        num_nodes = len(segment_ids)
+        self.logger.info(f"Building graph for {num_nodes} nodes")
         
-        # Create edge index based on distance
+        # ===== FIX: Tạo edges với distance threshold cao hơn =====
         edge_list = []
         
         for i in range(len(coords)):
@@ -511,35 +663,97 @@ class TrafficDataPipelineNPZ:
                 )
                 
                 if dist <= distance_threshold:
-                    # Bidirectional edges
                     edge_list.append([i, j])
                     edge_list.append([j, i])
         
-        if not edge_list:
-            self.logger.warning("No edges created with current threshold")
-            edge_index = np.array([[], []], dtype=np.int64)
+        # ===== FIX: Đảm bảo minimum degree cho mỗi node =====
+        # Tính degree hiện tại
+        degree_count = {}
+        for edge in edge_list:
+            src = edge[0]
+            degree_count[src] = degree_count.get(src, 0) + 1
+        
+        # Tính distance matrix
+        dist_matrix = np.zeros((num_nodes, num_nodes))
+        for i in range(num_nodes):
+            for j in range(num_nodes):
+                if i != j:
+                    dist_matrix[i, j] = self._haversine_distance(
+                        coords[i, 0], coords[i, 1],
+                        coords[j, 0], coords[j, 1]
+                    )
+                else:
+                    dist_matrix[i, j] = np.inf
+        
+        # Add edges to nodes with degree < min_degree
+        adjacency_set = set(tuple(edge) for edge in edge_list)
+        
+        for i in range(num_nodes):
+            current_degree = degree_count.get(i, 0)
+            
+            if current_degree < min_degree:
+                needed = min_degree - current_degree
+                
+                # Find nearest neighbors not already connected
+                candidates = []
+                for j in range(num_nodes):
+                    if i != j and (i, j) not in adjacency_set:
+                        candidates.append((j, dist_matrix[i, j]))
+                
+                # Sort by distance and add nearest
+                candidates.sort(key=lambda x: x[1])
+                
+                for j, _ in candidates[:needed]:
+                    edge_list.append([i, j])
+                    edge_list.append([j, i])
+                    adjacency_set.add((i, j))
+                    adjacency_set.add((j, i))
+                    degree_count[i] = degree_count.get(i, 0) + 1
+                    degree_count[j] = degree_count.get(j, 0) + 1
+        
+        # ===== LOG kết quả =====
+        num_edges = len(edge_list)
+        self.logger.info(f"Created {num_edges} edges")
+        
+        if num_edges > 0:
+            avg_degree = num_edges / num_nodes
+            self.logger.info(f"Average degree: {avg_degree:.2f}")
         else:
+            self.logger.warning("No edges created!")
+        
+        # Convert to edge_index
+        if edge_list:
             edge_index = np.array(edge_list, dtype=np.int64).T
+        else:
+            edge_index = np.array([[], []], dtype=np.int64)
         
-        self.logger.info(f"Created {edge_index.shape[1]} edges")
-        
-        # Create node features (segment-level aggregated features)
+        # Select features
+        exclude_cols = [
+            'segment_id', 'new_segment_id', 'street_name',
+            'latitude', 'longitude', 'date_range', 'time_set'
+        ]
         feature_cols = [col for col in df.columns 
-                       if col not in ['segment_id', 'new_segment_id', 'street_name',
-                                     'latitude', 'longitude', 'date_range', 'time_set']]
+                    if col not in exclude_cols and pd.api.types.is_numeric_dtype(df[col])]
         
+        # Create node features
         node_features_list = []
         for seg_id in segment_ids:
             seg_data = df[df['segment_id'] == seg_id][feature_cols]
-            # Use mean as representative features
-            node_features_list.append(seg_data.select_dtypes(include=np.number).mean().values)
+            node_feat = seg_data.select_dtypes(include=np.number).mean().values
+            node_features_list.append(node_feat)
         
-        node_features = np.array(node_features_list)
+        node_features = np.array(node_features_list, dtype=np.float32)
         
-        # Save graph data
+        # Create adjacency matrix
+        adj = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+        if len(edge_index) > 0 and edge_index.shape[1] > 0:
+            adj[edge_index[0], edge_index[1]] = 1.0
+        
+        # Save
         graph_data = {
             'node_features': node_features,
             'edge_index': edge_index,
+            'adjacency_matrix': adj,  # ← THÊM adjacency matrix
             'segment_ids': segment_ids,
             'coordinates': coords,
             'feature_names': np.array(feature_cols)
@@ -547,18 +761,18 @@ class TrafficDataPipelineNPZ:
         
         metadata = {
             'num_nodes': len(segment_ids),
-            'num_edges': edge_index.shape[1],
+            'num_edges': edge_index.shape[1] if len(edge_index) > 0 else 0,
             'num_features': node_features.shape[1],
             'distance_threshold': distance_threshold,
-            'avg_degree': edge_index.shape[1] / len(segment_ids) if len(segment_ids) > 0 else 0
+            'min_degree': min_degree,
+            'avg_degree': num_edges / num_nodes if num_nodes > 0 else 0
         }
         
         self.npz_writer.write_batch(graph_data, output_name, metadata)
         
         self.logger.info(f"✅ Graph structure saved to {output_name}")
         self.logger.info(f"   Nodes: {len(segment_ids)}")
-        self.logger.info(f"   Edges: {edge_index.shape[1]}")
-        self.logger.info(f"   Avg degree: {metadata['avg_degree']:.2f}")
+        self.logger.info(f"   Edges: {num_edges}")
     
     @staticmethod
     def _haversine_distance(lat1, lon1, lat2, lon2):

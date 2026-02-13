@@ -74,9 +74,9 @@ def main():
             pipeline.logger.warning("No job_*_results.json found. Run full pipeline first.")
             return
         pipeline.logger.info(f"Found {len(job_ids)} job files. Running from Stage 2.")
-        pipeline.run_streaming_ingestion_from_jobs(job_ids)
-        pipeline.run_validation_processing()
-        pipeline.run_feature_extraction()
+        # pipeline.run_streaming_ingestion_from_jobs(job_ids)
+        # pipeline.run_validation_processing()
+        # pipeline.run_feature_extraction()
         pipeline.export_for_model_training()
         pipeline.build_graph_structure()
         pipeline.logger.info("=" * 60)
