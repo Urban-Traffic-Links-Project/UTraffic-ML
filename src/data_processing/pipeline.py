@@ -94,7 +94,7 @@ class TrafficDataPipeline:
         self.logger.info("=" * 60)
         
         # Load results from file
-        result_file = config.data.raw_dir / "tomtom_stats" / f"job_{job_id}_results.json"
+        result_file = config.data.raw_dir / "tomtom_stats_frc5" / f"job_{job_id}_results.json"
         
         if not result_file.exists():
             self.logger.error(f"Result file not found: {result_file}")

@@ -4,12 +4,14 @@ __pycache__/
 *$py.class
 
 # --- Ignore toàn bộ dữ liệu ---
-# data/**
+data/**
+checkpoints/**
 data/raw/**
 !data/.gitkeep
 !data/raw/.gitkeep
-# !data/processed/.gitkeep
-
+!data/processed/.gitkeep
+venv/
+*.pth
 
 
 # C extensions

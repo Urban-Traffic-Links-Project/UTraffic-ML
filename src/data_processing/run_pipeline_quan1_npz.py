@@ -25,22 +25,22 @@ def get_geometry_quan1():
     return {
         "type": "Polygon",
         "coordinates": [[
-            [106.6850, 10.7850],  # SW
-            [106.7100, 10.7850],  # SE
-            [106.7100, 10.8000],  # NE
-            [106.6850, 10.8000],  # NW
-            [106.6850, 10.7850],  # đóng lại = SW
-        ]],
+            [106.6750, 10.7600],
+            [106.7150, 10.7600],
+            [106.7150, 10.8050],
+            [106.6750, 10.8050],
+            [106.6750, 10.7600],
+        ]]
     }
 
 
 def job_ids_from_raw_dir():
     """
-    Lấy danh sách job_id từ các file job_*_results.json trong data/raw/tomtom_stats.
+    Lấy danh sách job_id từ các file job_*_results.json trong data/raw/tomtom_stats_frc5.
     Dùng khi đã thu 31 ngày và chỉ cần chạy từ Stage 2 (ingestion).
     Thứ tự theo tên file (job_id).
     """
-    raw_dir = config.data.raw_dir / "tomtom_stats"
+    raw_dir = config.data.raw_dir / "tomtom_stats_frc5"
     if not raw_dir.exists():
         return []
     pattern = re.compile(r"job_(\d+)_results\.json")
@@ -74,10 +74,10 @@ def main():
             pipeline.logger.warning("No job_*_results.json found. Run full pipeline first.")
             return
         pipeline.logger.info(f"Found {len(job_ids)} job files. Running from Stage 2.")
-        pipeline.run_streaming_ingestion_from_jobs(job_ids)
-        pipeline.run_validation_processing()
-        pipeline.run_feature_extraction()
-        pipeline.export_for_model_training()
+        # pipeline.run_streaming_ingestion_from_jobs(job_ids)
+        # pipeline.run_validation_processing()
+        # pipeline.run_feature_extraction()
+        # pipeline.export_for_model_training()
         pipeline.build_graph_structure()
         pipeline.logger.info("=" * 60)
         pipeline.logger.info("✅ PIPELINE (FROM INGESTION) COMPLETE")

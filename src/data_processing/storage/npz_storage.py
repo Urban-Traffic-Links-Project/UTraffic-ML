@@ -233,40 +233,66 @@ class NPZReader(LoggerMixin):
         """
         Đọc NPZ và convert về DataFrame
         """
-        data = self.read_latest(dataset_name)
-        if not data:
+        dataset_path = self.base_path / dataset_name
+        
+        if not dataset_path.exists():
+            self.logger.error(f"Dataset {dataset_name} not found at {dataset_path}")
             return None
         
-        # Extract metadata
-        metadata = data.get('_metadata', {})
-        if isinstance(metadata, np.ndarray):
-            import json
-            metadata = json.loads(str(metadata[0]))
+        # Đọc TẤT CẢ các file NPZ của dataset và concat lại
+        npz_files = sorted(dataset_path.glob(f"{dataset_name}_*.npz"))
+        if not npz_files:
+            self.logger.error(f"No NPZ files found in {dataset_path}")
+            return None
         
-        # Remove metadata from data
-        data_arrays = {k: v for k, v in data.items() if not k.startswith('_')}
-        
-        # Handle index
-        index = None
-        if '_index' in data:
-            index = data['_index']
+        dfs = []
+        for file_path in npz_files:
+            data = self.read_file(file_path)
+            if not data:
+                continue
             
-        # Create DataFrame
-        df = pd.DataFrame(data_arrays, index=index)
+            # Extract metadata
+            metadata = data.get('_metadata', {})
+            if isinstance(metadata, np.ndarray):
+                import json
+                metadata = json.loads(str(metadata[0]))
+            
+            # Remove metadata and internal keys
+            data_arrays = {
+                k: v for k, v in data.items()
+                if not k.startswith('_') and k not in ['_index']
+            }
+            
+            # Handle index if present
+            index = data.get('_index', None)
+            
+            df_part = pd.DataFrame(data_arrays, index=index)
+            
+            # Restore dtypes if available
+            if isinstance(metadata, dict) and 'dtypes' in metadata:
+                for col, dtype_str in metadata['dtypes'].items():
+                    if col in df_part.columns:
+                        try:
+                            df_part[col] = df_part[col].astype(dtype_str)
+                        except Exception:
+                            # Nếu cast lỗi thì giữ nguyên
+                            pass
+            
+            dfs.append(df_part)
         
-        # Restore dtypes if available
-        if 'dtypes' in metadata:
-            for col, dtype_str in metadata['dtypes'].items():
-                if col in df.columns:
-                    try:
-                        df[col] = df[col].astype(dtype_str)
-                    except:
-                        pass
+        if not dfs:
+            self.logger.error(f"Failed to read any NPZ files for {dataset_name}")
+            return None
         
-        return df
+        # Concatenate tất cả batches lại
+        full_df = pd.concat(dfs, ignore_index=True)
+        return full_df
     
     def read_features(self) -> Optional[pd.DataFrame]:
-        """Đọc traffic features"""
+        """
+        Đọc traffic features từ TẤT CẢ các file traffic_features_*.npz
+        (gộp toàn bộ 31 ngày × 24 time slots lại)
+        """
         return self.read_as_dataframe('traffic_features')
     
     def read_graph_data(self, dataset_name: str = 'graph_data') -> Optional[Dict]:

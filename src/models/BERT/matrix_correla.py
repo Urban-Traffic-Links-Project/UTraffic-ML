@@ -144,7 +144,7 @@ def haversine_distance(lat1, lon1, lat2, lon2) -> float:
 def load_node_positions(output_dir: Union[str, Path]) -> Dict[int, Tuple[float, float]]:
     """
     Đọc nodes.csv → map node_id -> (lat, lon)
-    Giả sử file nằm trong: output_dir / "tomtom_stats" / "nodes.csv"
+    Giả sử file nằm trong: output_dir / "tomtom_stats_frc5" / "nodes.csv"
     """
     nodes_path = output_dir  / "nodes.csv"
     df_nodes = pd.read_csv(nodes_path)

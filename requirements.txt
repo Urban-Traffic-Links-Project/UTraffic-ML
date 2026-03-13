@@ -39,3 +39,4 @@ seaborn
 scikit-learn
 dotenv
 torch_directml
+statsmodels 

@@ -1,15 +1,15 @@
 Metric,Value
-Total Records,6788
+Total Records,9530
 Total Features,55
 Original Features,20
-New Features,36
+New Features,37
 Speed-related Features,18
 Time Series Features,0
 Statistical Features,1
 Geospatial Features,8
 Encoding Features,7
 Congestion Features,1
-Graph Nodes,514
-Graph Edges,906
+Graph Nodes,499
+Graph Edges,1868
 Features per Node,46
-Average Node Degree,1.76
+Average Node Degree,3.74

@@ -28,7 +28,7 @@ class TomTomTrafficDataCollector(LoggerMixin):
 
     def _generate_time_slots_15min(self) -> List[Dict]:
         """
-        Tạo 24 slots 15 phút để có timesteps dày đặc cho T-GCN.
+        Tạo 32 slots 15 phút để có timesteps dày đặc cho T-GCN.
         Sử dụng khung giờ bạn đã chọn: 07:00-10:00 và 15:00-18:00
         """
         time_sets = []
@@ -114,7 +114,7 @@ class TomTomTrafficDataCollector(LoggerMixin):
                 "name": f"{job_name} Network",
                 "geometry": geometry,
                 "timeZoneId": "Asia/Ho_Chi_Minh",
-                "frcs": ["0", "1", "2", "3", "4", "5"], 
+                "frcs": ["0", "1", "2", "3", "4", "5", "6", "7"], 
                 "probeSource": "ALL"
             },
             "dateRange": {
@@ -232,7 +232,7 @@ class TomTomTrafficDataCollector(LoggerMixin):
             output_dir: Thư mục lưu kết quả (mặc định: config.data.raw_dir)
         """
         if output_dir is None:
-            output_dir = config.data.raw_dir / "tomtom_stats"
+            output_dir = config.data.raw_dir / "tomtom_stats_frc5"
         
         output_dir.mkdir(parents=True, exist_ok=True)
         
