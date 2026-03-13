@@ -5,7 +5,7 @@ __pycache__/
 
 # --- Ignore toàn bộ dữ liệu ---
 # data/**
-checkpoints/**
+# checkpoints/**
 data/raw/**
 data/processed/**
 !data/.gitkeep
