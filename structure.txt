@@ -7,7 +7,6 @@ C:.
 │   README.MD
 │   requirements.txt
 │   structure.txt
-│   stucture.txt
 │   
 ├───checkpoints
 │   ├───DTC-STGCN
@@ -30,6 +29,20 @@ C:.
 │   │           training_20260311_173542.log
 │   │           training_20260311_180448.log
 │   │           training_20260313_104916.log
+│   │           training_20260314_070541.log
+│   │           training_20260314_071052.log
+│   │           training_20260314_071840.log
+│   │           training_20260314_080545.log
+│   │           training_20260314_080719.log
+│   │           training_20260314_081150.log
+│   │           training_20260314_081741.log
+│   │           training_20260314_082617.log
+│   │           training_20260314_082736.log
+│   │           training_20260314_084140.log
+│   │           training_20260314_085200.log
+│   │           training_20260314_092818.log
+│   │           training_20260314_093749.log
+│   │           training_20260314_100746.log
 │   │           
 │   └───T-GCN
 │       │   best_model.pth
@@ -44,55 +57,57 @@ C:.
 │               training_20260311_161905.log
 │               training_20260311_161928.log
 │               training_20260311_172321.log
+│               training_20260314_093749.log
 │               
 ├───data
 │   ├───processed
 │   │   ├───graph_structure
-│   │   │       graph_structure_20260311_161339.npz
+│   │   │       graph_structure_20260314_092730.npz
 │   │   │       
 │   │   ├───model_ready_data
-│   │   │       model_ready_data_20260311_001743_20260311_001743.npz
+│   │   │       model_ready_data_20260314_092611_20260314_092611.npz
 │   │   │       
+│   │   ├───parquet
 │   │   └───traffic_features
-│   │           traffic_features_20260311_001550.npz
-│   │           traffic_features_20260311_001552.npz
-│   │           traffic_features_20260311_001555.npz
-│   │           traffic_features_20260311_001557.npz
-│   │           traffic_features_20260311_001600.npz
-│   │           traffic_features_20260311_001602.npz
-│   │           traffic_features_20260311_001604.npz
-│   │           traffic_features_20260311_001607.npz
-│   │           traffic_features_20260311_001610.npz
-│   │           traffic_features_20260311_001612.npz
-│   │           traffic_features_20260311_001614.npz
-│   │           traffic_features_20260311_001617.npz
-│   │           traffic_features_20260311_001619.npz
-│   │           traffic_features_20260311_001621.npz
-│   │           traffic_features_20260311_001624.npz
-│   │           traffic_features_20260311_001626.npz
-│   │           traffic_features_20260311_001628.npz
-│   │           traffic_features_20260311_001631.npz
-│   │           traffic_features_20260311_001633.npz
-│   │           traffic_features_20260311_001635.npz
-│   │           traffic_features_20260311_001637.npz
-│   │           traffic_features_20260311_001639.npz
-│   │           traffic_features_20260311_001642.npz
-│   │           traffic_features_20260311_001644.npz
-│   │           traffic_features_20260311_001646.npz
-│   │           traffic_features_20260311_001648.npz
-│   │           traffic_features_20260311_001650.npz
-│   │           traffic_features_20260311_001652.npz
-│   │           traffic_features_20260311_001655.npz
-│   │           traffic_features_20260311_001657.npz
-│   │           traffic_features_20260311_001659.npz
-│   │           traffic_features_20260311_001702.npz
-│   │           traffic_features_20260311_001704.npz
-│   │           traffic_features_20260311_001706.npz
-│   │           traffic_features_20260311_001709.npz
-│   │           traffic_features_20260311_001711.npz
-│   │           traffic_features_20260311_001713.npz
-│   │           traffic_features_20260311_001715.npz
-│   │           traffic_features_20260311_001733.npz
+│   │           traffic_features_20260314_092306.npz
+│   │           traffic_features_20260314_092308.npz
+│   │           traffic_features_20260314_092310.npz
+│   │           traffic_features_20260314_092312.npz
+│   │           traffic_features_20260314_092315.npz
+│   │           traffic_features_20260314_092317.npz
+│   │           traffic_features_20260314_092320.npz
+│   │           traffic_features_20260314_092323.npz
+│   │           traffic_features_20260314_092326.npz
+│   │           traffic_features_20260314_092329.npz
+│   │           traffic_features_20260314_092332.npz
+│   │           traffic_features_20260314_092335.npz
+│   │           traffic_features_20260314_092337.npz
+│   │           traffic_features_20260314_092339.npz
+│   │           traffic_features_20260314_092343.npz
+│   │           traffic_features_20260314_092346.npz
+│   │           traffic_features_20260314_092349.npz
+│   │           traffic_features_20260314_092352.npz
+│   │           traffic_features_20260314_092355.npz
+│   │           traffic_features_20260314_092358.npz
+│   │           traffic_features_20260314_092402.npz
+│   │           traffic_features_20260314_092408.npz
+│   │           traffic_features_20260314_092414.npz
+│   │           traffic_features_20260314_092419.npz
+│   │           traffic_features_20260314_092424.npz
+│   │           traffic_features_20260314_092429.npz
+│   │           traffic_features_20260314_092437.npz
+│   │           traffic_features_20260314_092444.npz
+│   │           traffic_features_20260314_092451.npz
+│   │           traffic_features_20260314_092455.npz
+│   │           traffic_features_20260314_092500.npz
+│   │           traffic_features_20260314_092504.npz
+│   │           traffic_features_20260314_092509.npz
+│   │           traffic_features_20260314_092514.npz
+│   │           traffic_features_20260314_092518.npz
+│   │           traffic_features_20260314_092523.npz
+│   │           traffic_features_20260314_092528.npz
+│   │           traffic_features_20260314_092533.npz
+│   │           traffic_features_20260314_092550.npz
 │   │           
 │   ├───raw
 │   │   ├───kaggle
@@ -169,6 +184,7 @@ C:.
 │   │           job_8694330_results.json
 │   │           
 │   └───results
+│           attn_mean_matrix (3).csv
 │           comparison_horizon_1days.csv
 │           comparison_horizon_2days.csv
 │           comparison_horizon_3days.csv
@@ -192,6 +208,7 @@ C:.
 │           correlation_spatial_20260311_183735.csv
 │           correlation_summary_20260311_181422.csv
 │           correlation_summary_20260311_183735.csv
+│           corr_mean_nxn.csv
 │           
 ├───deployment
 │   │   docker-compose.yml
@@ -391,7 +408,9 @@ C:.
     │           
     ├───visualization
     │       conclusion.txt
+    │       correlation_network.py
     │       data_visualization_pipeline.ipynb
+    │       my_graph.html
     │       plot_utils.py
     │       processing_statistics.csv
     │       processing_summary.txt
