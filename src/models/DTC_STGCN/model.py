@@ -29,27 +29,32 @@ from .graph.graph_builder import DynamicAdjacencyBuilder
 class SpatialAttention(nn.Module):
     """
     Spatial Attention mechanism (Equations 11-12 in DTC-STGCN paper).
-    
-    Pt = Vs · σ((Ft-1·Wst)·Wpt·(Wat·Ât-1) + bst)
-    Pt_ij = softmax(Pt_ij) = exp(Pt_ij) / Σ exp(Pt_ik)
-    
-    Adaptively captures the most significant spatial correlations between nodes.
+
+    Pt = Vs · sigma((Ft-1 · Ws) · Wp · (Wa · At-1) + bs)
+    Pt_ij = softmax(Pt_ij)
+
+    Paper assumes scalar input per node (speed only, in_features=1).
+    When in_features > 1, feat_proj reduces F to (batch, N, 1) first so that
+    Ws can remain (1, N) and term1 = F @ Ws gives (batch, N, N) as expected.
     """
 
     def __init__(self, num_nodes, in_features, hidden_size=None):
         super(SpatialAttention, self).__init__()
         self.num_nodes = num_nodes
         self.in_features = in_features
-        H = hidden_size or num_nodes
 
-        # Learnable parameters: Vs, Wst, Wpt, Wat, bst (all ∈ R^{N×N})
+        # Project multi-feature input to 1 scalar per node before attention.
+        # If in_features==1 this is skipped and F_prev is used directly.
+        self.feat_proj = nn.Linear(in_features, 1, bias=False) if in_features > 1 else None
+
+        # All weight matrices are N x N as in the paper.
+        # Ws shape is (1, N): maps (batch,N,1) -> (batch,N,N) via matmul.
         self.Vs = nn.Parameter(torch.FloatTensor(num_nodes, num_nodes))
-        self.Ws = nn.Parameter(torch.FloatTensor(in_features, num_nodes))
+        self.Ws = nn.Parameter(torch.FloatTensor(1, num_nodes))   # (1, N)
         self.Wp = nn.Parameter(torch.FloatTensor(num_nodes, num_nodes))
         self.Wa = nn.Parameter(torch.FloatTensor(num_nodes, num_nodes))
         self.bs = nn.Parameter(torch.FloatTensor(num_nodes, num_nodes))
 
-        # Initialize
         nn.init.xavier_uniform_(self.Vs)
         nn.init.xavier_uniform_(self.Ws)
         nn.init.xavier_uniform_(self.Wp)
@@ -59,19 +64,26 @@ class SpatialAttention(nn.Module):
     def forward(self, F_prev, A_prev):
         """
         Args:
-            F_prev: (batch, N, M) feature matrix at t-1 (M = in_features)
-            A_prev: (batch, N, N) dynamic adjacency at t-1
+            F_prev: (batch, N, in_features)
+            A_prev: (batch, N, N)
         Returns:
-            Pt: (batch, N, N) normalized spatial attention matrix
+            Pt: (batch, N, N)
         """
-        # Pt = Vs · σ(F_{t-1}·Ws · Wp · (Wa·Ât-1) + bs)
-        term1 = torch.matmul(F_prev, self.Ws)       # (batch, N, N)
-        term2 = torch.matmul(term1, self.Wp)         # (batch, N, N)
-        term3 = torch.matmul(self.Wa, A_prev)        # (batch, N, N)
-        pre_sigmoid = torch.matmul(term2, term3) + self.bs  # (batch, N, N)
-        Pt = torch.matmul(torch.sigmoid(pre_sigmoid), self.Vs)  # (batch, N, N)
+        # Step 1: reduce to scalar per node -> (batch, N, 1)
+        if self.feat_proj is not None:
+            F_scalar = self.feat_proj(F_prev)   # (batch, N, 1)
+        else:
+            F_scalar = F_prev                    # already (batch, N, 1)
 
-        # Softmax normalization (Eq. 12)
+        # Step 2: Pt = Vs * sigma(F*Ws * Wp * (Wa*A) + bs)
+        # (batch,N,1) @ (1,N) -> (batch,N,N)
+        term1 = torch.matmul(F_scalar, self.Ws)      # (batch, N, N)
+        term2 = torch.matmul(term1, self.Wp)          # (batch, N, N)
+        term3 = torch.matmul(self.Wa, A_prev)         # (batch, N, N)
+        pre_sig = torch.matmul(term2, term3) + self.bs
+        Pt = torch.matmul(torch.sigmoid(pre_sig), self.Vs)  # (batch, N, N)
+
+        # Step 3: row-wise softmax (Eq. 12)
         Pt = F.softmax(Pt, dim=-1)
         return Pt
 
@@ -99,7 +111,7 @@ class GCNLayer(nn.Module):
         # Graph convolution: A · H · W
         support = self.W(H)           # (batch, N, out_features)
         output = torch.bmm(A, support)  # (batch, N, out_features)
-        return F.relu(output)
+        return F.leaky_relu(output, negative_slope=0.01)
 
 
 class AttentionGCNBlock(nn.Module):
@@ -247,14 +259,22 @@ class DTCSTGCN(nn.Module):
             gcn_hidden=gcn_hidden,
             out_features=gcn_out,
         )
-        # Spatial feature: Hs = H1 ⊕ ... ⊕ Hn ∈ R^{N × (gcn_out * seq_len)}
-        spatial_feat_dim = gcn_out * seq_len  # 'a' = gcn_out, total 'a*n'
+        # Spatial feature: dùng mean pooling qua seq_len thay vì concat.
+        # Paper (Eq.13) dùng concat → spatial_feat_dim = gcn_out * seq_len,
+        # nhưng với seq_len=12 và gcn_out=64 → 768-dim combined feature → quá lớn
+        # so với dataset nhỏ (504 train, 92 nodes).
+        # Mean pooling giữ nguyên ý nghĩa semantic và giảm combined_feat_dim
+        # từ 832 xuống 128, phù hợp với quy mô dữ liệu thực tế.
+        spatial_feat_dim = gcn_out  # sau mean pooling: (batch, N, gcn_out)
 
         # ── Component 3: LSTM for Temporal Features ──
         # Input: historical observations On ∈ R^{N × n}
         # We feed each node's time series through LSTM
+        # LSTM chỉ nhận speed feature (dim 0) làm temporal signal,
+        # đúng với paper: "feed historical observations On" (traffic speed/flow scalar).
+        # Với input_dim=40, chỉ feature đầu (speed) có ý nghĩa temporal rõ ràng.
         self.lstm = nn.LSTM(
-            input_size=input_dim,
+            input_size=1,          # chỉ speed scalar (feature dim 0)
             hidden_size=lstm_hidden,
             num_layers=1,
             batch_first=True,
@@ -276,6 +296,9 @@ class DTCSTGCN(nn.Module):
         self.hybrid_gcn2 = GCNLayer(hybrid_hidden1, hybrid_hidden2)
 
         # Final prediction: FC layer
+        # output_dim nên = 1 (predict speed scalar) để metrics có nghĩa.
+        # Khi caller truyền output_dim=40, model predict 40 features nhưng
+        # chỉ feature 0 (speed) được học từ LSTM và GCN signal.
         self.fc = nn.Linear(hybrid_hidden2, output_dim * pred_len)
 
         # Fixed adjacency for hybrid GCN (normalized)
@@ -322,13 +345,16 @@ class DTCSTGCN(nn.Module):
             F_prev = F_t
             A_prev = At
 
-        # Concatenate: Hs = H1 ⊕ H2 ⊕ ... ⊕ Hn ∈ R^{N × (gcn_out*seq_len)}  (Eq. 13)
-        Hs = torch.cat(spatial_feats, dim=-1)  # (batch, N, gcn_out*seq_len)
+        # Hs: mean pooling qua seq_len → (batch, N, gcn_out)
+        # Thay concat (Eq.13) để tránh combined_feat_dim quá lớn.
+        Hs = torch.stack(spatial_feats, dim=1).mean(dim=1)  # (batch, N, gcn_out)
 
         # ── Temporal Features (LSTM per node) ──
-        # x: (batch, seq_len, N, input_dim) → process each node's time series
-        x_permuted = x.permute(0, 2, 1, 3)   # (batch, N, seq_len, input_dim)
-        x_lstm = x_permuted.reshape(batch_size * num_nodes, seq_len, input_dim)
+        # Chỉ dùng feature dim 0 (speed) cho LSTM, đúng với paper.
+        # x: (batch, seq_len, N, input_dim) → lấy dim 0 → (batch, seq_len, N, 1)
+        x_speed = x[..., :1]                               # (batch, seq_len, N, 1)
+        x_permuted = x_speed.permute(0, 2, 1, 3)          # (batch, N, seq_len, 1)
+        x_lstm = x_permuted.reshape(batch_size * num_nodes, seq_len, 1)
 
         _, (h_n, _) = self.lstm(x_lstm)
         # h_n: (1, batch*N, lstm_hidden) → last hidden state

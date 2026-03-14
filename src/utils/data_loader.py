@@ -192,12 +192,29 @@ def load_model_ready_data(filepath):
         else:
             print(f"Warning: {key} not found in npz file")
     
-    # Optional metadata: segment_ids, feature_names
+    # Optional metadata: segment_ids, feature_names, scaler params
     if 'segment_ids' in data:
         result['segment_ids'] = data['segment_ids']
     if 'feature_names' in data:
         result['feature_names'] = data['feature_names']
-    
+
+    # Scaler params lưu bởi export_for_model_training (để normalize khi load hoặc inverse-transform)
+    if 'scaler_mean' in data:
+        result['scaler_mean'] = data['scaler_mean']
+    if 'scaler_scale' in data:
+        result['scaler_scale'] = data['scaler_scale']
+
+    # Đọc _metadata để biết dữ liệu trong NPZ đã được normalize hay chưa (dữ liệu gốc)
+    if '_metadata' in data:
+        try:
+            import json
+            meta = json.loads(str(data['_metadata'].flat[0]))
+            result['data_normalized'] = bool(meta.get('normalized', True))
+        except Exception:
+            result['data_normalized'] = True
+    else:
+        result['data_normalized'] = True  # NPZ cũ không có metadata → mặc định coi là đã normalize
+
     # Check if all required keys are present
     required_keys = ['X_train', 'y_train', 'X_val', 'y_val', 'X_test', 'y_test']
     missing_keys = [key for key in required_keys if key not in result]
@@ -507,29 +524,75 @@ class DataManager:
             else:
                 print("Warning: No overlapping segment_ids between graph and model data; using original adjacency and data.")
         
-        # Normalize
+        # ── Normalization ──────────────────────────────────────────────────────
+        # NPZ có thể chứa: (1) dữ liệu đã normalize + scaler, hoặc (2) dữ liệu gốc + scaler.
+        # Metadata 'normalized' trong NPZ cho biết dữ liệu đã được scale khi export hay chưa.
+        data_already_normalized = self.data.get('data_normalized', True)
+        has_scaler = 'scaler_mean' in self.data and 'scaler_scale' in self.data
+
         if normalize:
-            X_train, X_val, X_test, self.scaler = normalize_data(X_train, X_val, X_test)
-            y_train_scaled = self.scaler.transform(y_train.reshape(-1, y_train.shape[-1])).reshape(y_train.shape)
-            y_val_scaled = self.scaler.transform(y_val.reshape(-1, y_val.shape[-1])).reshape(y_val.shape)
-            y_test_scaled = self.scaler.transform(y_test.reshape(-1, y_test.shape[-1])).reshape(y_test.shape)
+            if has_scaler and data_already_normalized:
+                # Dữ liệu trong file đã được normalize khi export → không scale lại
+                print("Data in NPZ is already normalized; no extra scaling applied.")
+                y_train_scaled = y_train
+                y_val_scaled   = y_val
+                y_test_scaled  = y_test
+            elif has_scaler and not data_already_normalized:
+                # Dữ liệu gốc trong NPZ, có scaler → áp dụng transform (mean/scale) khi load
+                mean = np.asarray(self.data['scaler_mean'], dtype=np.float32)
+                scale = np.asarray(self.data['scaler_scale'], dtype=np.float32)
+                scale_safe = np.where(scale != 0, scale, 1.0)
+
+                def _apply_scaler(arr):
+                    sh = arr.shape
+                    flat = arr.reshape(-1, sh[-1])
+                    out = (flat - mean) / scale_safe
+                    return out.reshape(sh).astype(np.float32)
+
+                X_train = _apply_scaler(X_train)
+                X_val = _apply_scaler(X_val)
+                X_test = _apply_scaler(X_test)
+                y_train_scaled = _apply_scaler(y_train)
+                y_val_scaled = _apply_scaler(y_val)
+                y_test_scaled = _apply_scaler(y_test)
+                print("Applied saved scaler to raw data (normalize=True).")
+            else:
+                # Không có scaler trong NPZ → fit trên train rồi transform
+                X_train, X_val, X_test, self.scaler = normalize_data(X_train, X_val, X_test)
+                y_train_scaled = self.scaler.transform(
+                    y_train.reshape(-1, y_train.shape[-1])
+                ).reshape(y_train.shape)
+                y_val_scaled = self.scaler.transform(
+                    y_val.reshape(-1, y_val.shape[-1])
+                ).reshape(y_val.shape)
+                y_test_scaled = self.scaler.transform(
+                    y_test.reshape(-1, y_test.shape[-1])
+                ).reshape(y_test.shape)
         else:
             y_train_scaled = y_train
-            y_val_scaled = y_val
-            y_test_scaled = y_test
-        
+            y_val_scaled   = y_val
+            y_test_scaled  = y_test
+
+        # Expose scaler params từ NPZ để trainer có thể inverse-transform predictions
+        if 'scaler_mean' in self.data:
+            self.scaler_mean  = self.data['scaler_mean']
+            self.scaler_scale = self.data['scaler_scale']
+
         # Create loaders
         train_loader, val_loader, test_loader = prepare_data_loaders(
             X_train, y_train_scaled,
-            X_val, y_val_scaled,
-            X_test, y_test_scaled,
-            batch_size=batch_size
+            X_val,   y_val_scaled,
+            X_test,  y_test_scaled,
+            batch_size=batch_size,
         )
         
         # Prepare adjacency matrix
+        # NOTE: Raw binary adjacency is returned here intentionally.
+        # Normalization (D^-1/2 * A * D^-1/2) is performed ONCE inside each model
+        # (DTCSTGCN._normalize_adj, TGCNTrainer, etc.).  Normalizing here AND inside
+        # the model would apply the transform twice, corrupting graph propagation.
         if self.adj is not None:
-            adj_normalized = normalize_adj(self.adj)
-            adj_tensor = torch.FloatTensor(adj_normalized)
+            adj_tensor = torch.FloatTensor(self.adj)
         else:
             # Create fully connected graph if no adjacency matrix
             num_nodes = X_train.shape[2]
@@ -537,6 +600,31 @@ class DataManager:
             print(f"Warning: Creating fully connected graph with {num_nodes} nodes")
         
         return train_loader, val_loader, test_loader, adj_tensor
+
+    def inverse_transform(self, arr):
+        """
+        Inverse-transform predictions/targets từ normalized space về đơn vị gốc.
+
+        Dùng scaler_mean và scaler_scale được lưu trong NPZ bởi
+        export_for_model_training(). Cần gọi prepare_for_training() trước.
+
+        Args:
+            arr: numpy array bất kỳ shape, dimension cuối = num_features
+        Returns:
+            arr_orig: cùng shape, đã inverse-transform
+        """
+        if not hasattr(self, 'scaler_mean') or self.scaler_mean is None:
+            raise RuntimeError(
+                "Không tìm thấy scaler_mean/scaler_scale. "
+                "Đảm bảo NPZ được tạo với normalize=True trong export_for_model_training(), "
+                "và đã gọi prepare_for_training() trước."
+            )
+        mean  = self.scaler_mean   # (num_features,)
+        scale = self.scaler_scale  # (num_features,)
+        original_shape = arr.shape
+        arr_2d = arr.reshape(-1, original_shape[-1])
+        arr_orig = arr_2d * scale + mean
+        return arr_orig.reshape(original_shape).astype(np.float32)
 
 
 if __name__ == "__main__":

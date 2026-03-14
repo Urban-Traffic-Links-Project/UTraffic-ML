@@ -305,81 +305,93 @@ class TrafficDataPipelineNPZ:
     
     def _process_and_save_batch(self):
         """
-        Xử lý và lưu batch vào NPZ.
-        
-        FIX: Luôn lưu tọa độ gốc vào cột riêng `raw_latitude/raw_longitude`.
-        Tránh việc `read_features()` gộp nhiều file (cũ/mới) khiến graph builder
-        đôi lúc dùng nhầm lat/lon đã MinMax normalize ([0,1]) để tính Haversine.
+        Xử lý và lưu batch vào NPZ — KHÔNG normalize ở đây.
+
+        Normalization (StandardScaler) được dời sang export_for_model_training()
+        để scaler được fit MỘT LẦN DUY NHẤT trên toàn bộ tập train, sau đó
+        transform val/test với cùng scaler đó. Việc gọi fit_transform() trên
+        từng batch 10k record sẽ tạo ra mean/std khác nhau giữa các batch,
+        khiến data_3d không nhất quán và gradient hỗn loạn khi train.
+
+        FIX còn lại: luôn lưu tọa độ gốc vào `raw_latitude/raw_longitude`
+        để graph builder không dùng nhầm lat/lon đã MinMax-normalize.
         """
         if not self.accumulated_data:
             return
-        
+
         df = pd.DataFrame(self.accumulated_data)
-        
+
         # 1. Clean
         df = self.cleaner.clean(df)
-        
+
         # ===== Preserve metadata + raw coordinates TRƯỚC KHI transform =====
         metadata_cols = ['time_set', 'date_from', 'latitude', 'longitude']
         preserved_data = {}
         for col in metadata_cols:
             if col in df.columns:
                 preserved_data[col] = df[col].copy()
-        
+
         # 2. Extract features
         df = self.feature_extractor.extract_all_features(df)
-        
+
         # 3. Encode categorical
         df = self.categorical_encoder.fit_transform(df)
-        
-        # 4. Process spatial (normalize=True sẽ biến lat/lon thành [0,1])
+
+        # 4. Process spatial (normalize=True biến lat/lon → [0,1])
         df = self.spatial_processor.fit_transform(df)
-        
-        # 5. Normalize
-        df = self.normalizer.fit_transform(df, method='standard')
-        
+
+        # 5. KHÔNG gọi self.normalizer.fit_transform() ở đây.
+        #    StandardScaler sẽ được fit đúng cách trong export_for_model_training().
+
         # ===== Restore metadata AFTER processing =====
         for col in ['time_set', 'date_from']:
             if col in preserved_data:
                 df[col] = preserved_data[col]
 
         # ===== Store RAW coordinates in dedicated columns =====
-        # Keep normalized `latitude/longitude` (if created by spatial processor) for modeling/visualization,
-        # and store real degrees in `raw_latitude/raw_longitude` for graph construction.
         if 'latitude' in preserved_data:
             df['raw_latitude'] = preserved_data['latitude']
         if 'longitude' in preserved_data:
             df['raw_longitude'] = preserved_data['longitude']
-        
-        # 6. Save to NPZ
+
+        # 6. Save to NPZ (raw — chưa normalize feature số)
         self.npz_writer.write_features(df)
-        
-        self.logger.info(f"Processed and saved batch of {len(df)} records")
+
+        self.logger.info(f"Processed and saved batch of {len(df)} records (normalization deferred)")
 
     def export_for_model_training(
         self,
         output_name: str = None,
         sequence_length: int = 12,
-        prediction_horizon: int = 12
+        prediction_horizon: int = 12,
+        normalize: bool = True,
     ):
         """
-        Stage 5: Export data với ĐÚNG SHAPE 4D cho T-GCN
+        Stage 5: Export data với ĐÚNG SHAPE 4D cho T-GCN.
+
+        FIX NORMALIZATION:
+        - StandardScaler được fit MỘT LẦN trên X_train (sau khi split).
+        - X_val, X_test, y_train, y_val, y_test đều dùng cùng scaler đó để transform.
+        - Scaler được lưu kèm vào NPZ dưới dạng mean/scale arrays để có thể
+          inverse-transform kết quả dự đoán sau này.
+        - Đặt normalize=False nếu data đã được scale đúng từ trước.
         """
         from datetime import datetime
         import re
-        
+        from sklearn.preprocessing import StandardScaler
+
         self.logger.info("=" * 60)
-        self.logger.info("STAGE 5: EXPORT FOR MODEL TRAINING (31-DAY SEQUENTIAL FIX)")
+        self.logger.info("STAGE 5: EXPORT FOR MODEL TRAINING")
         self.logger.info("=" * 60)
-        
+
         df = self.npz_reader.read_features()
-        
+
         if df is None or df.empty:
             self.logger.error("No features found to export")
             return
-        
+
         self.logger.info(f"Loaded {len(df)} records")
-        
+
         if 'time_set' not in df.columns:
             self.logger.error("❌ Missing 'time_set' column!")
             self.logger.info(f"Available columns: {df.columns.tolist()}")
@@ -441,12 +453,14 @@ class TrafficDataPipelineNPZ:
         df['day_index'] = df['date'].map(date_to_idx)
         df['global_timestamp'] = df['day_index'] * 24 + df['slot_index']
         df = df.sort_values(['segment_id', 'global_timestamp']).reset_index(drop=True)
-        
-        self.logger.info(f"Global timestamps range: {df['global_timestamp'].min()} - {df['global_timestamp'].max()}")
-        
+
+        self.logger.info(
+            f"Global timestamps range: {df['global_timestamp'].min()} - {df['global_timestamp'].max()}"
+        )
+
         all_segment_ids = sorted(df['segment_id'].unique())
         self.logger.info(f"Found {len(all_segment_ids)} segments before filtering for completeness")
-        
+
         exclude_patterns = [
             'segment_id', 'new_segment_id', 'street_name',
             'date_range', 'time_set', 'date', 'slot_index', 'day_index', 'global_timestamp',
@@ -454,36 +468,38 @@ class TrafficDataPipelineNPZ:
             'raw_latitude', 'raw_longitude',
             'grid_lat', 'grid_lon', 'grid_cell',
             'congestion_level', 'distance_category',
-            'frc_encoded', 'time_set_encoded', 'frc_level'
+            'frc_encoded', 'time_set_encoded', 'frc_level',
         ]
-        
-        feature_cols = [col for col in df.columns 
-                       if col not in exclude_patterns
-                       and pd.api.types.is_numeric_dtype(df[col])
-                       and not df[col].isnull().all()
-                       and df[col].nunique() > 1]
-        
+
+        feature_cols = [
+            col for col in df.columns
+            if col not in exclude_patterns
+            and pd.api.types.is_numeric_dtype(df[col])
+            and not df[col].isnull().all()
+            and df[col].nunique() > 1
+        ]
+
         num_features = len(feature_cols)
         self.logger.info(f"Selected {num_features} features: {feature_cols[:10]}")
-        
+
         if num_features == 0:
             self.logger.error("❌ No features!")
             return
-        
+
         timesteps_per_seg = df.groupby('segment_id')['global_timestamp'].count().to_dict()
         min_ts = min(timesteps_per_seg.values())
         max_ts = max(timesteps_per_seg.values())
         expected_ts = num_days * 24
-        
+
         self.logger.info(f"Timesteps: min={min_ts}, max={max_ts}, expected={expected_ts}")
-        
+
         full_data_segs = [s for s, c in timesteps_per_seg.items() if c == expected_ts]
         self.logger.info(
             f"Segments with full {expected_ts} timesteps: {len(full_data_segs)}/{len(timesteps_per_seg)}"
         )
-        
+
         min_needed = sequence_length + prediction_horizon
-        
+
         if full_data_segs:
             selected_segs = full_data_segs
             num_timesteps = expected_ts
@@ -499,25 +515,24 @@ class TrafficDataPipelineNPZ:
                     f"max available = {max_ts}, need at least {min_needed}"
                 )
                 return
-            
             selected_segs = candidate_segs
             num_timesteps = min(timesteps_per_seg[s] for s in selected_segs)
             self.logger.info(
                 f"Using {len(selected_segs)} segments with at least {num_timesteps} timesteps"
             )
-        
+
         segment_ids = sorted(selected_segs)
         num_nodes = len(segment_ids)
         self.logger.info(f"Final selected segments: {num_nodes}")
-        
-        self.logger.info(f"Creating 3D: ({num_timesteps}, {num_nodes}, {num_features})")
-        
+
+        self.logger.info(f"Creating 3D tensor: ({num_timesteps}, {num_nodes}, {num_features})")
+
         data_3d = np.zeros((num_timesteps, num_nodes, num_features), dtype=np.float32)
-        
+
         for node_idx, seg_id in enumerate(segment_ids):
             seg_df = df[df['segment_id'] == seg_id].sort_values('global_timestamp')
             seg_data = seg_df[feature_cols].values.astype(np.float32)
-            
+
             if len(seg_data) > num_timesteps:
                 seg_data = seg_data[:num_timesteps]
             elif len(seg_data) < num_timesteps:
@@ -526,65 +541,109 @@ class TrafficDataPipelineNPZ:
                     seg_data = np.vstack([seg_data, pad])
                 else:
                     seg_data = np.zeros((num_timesteps, num_features), dtype=np.float32)
-            
+
             seg_data = np.nan_to_num(seg_data, nan=0.0, posinf=0.0, neginf=0.0)
             data_3d[:, node_idx, :] = seg_data
-        
-        self.logger.info(f"✓ 3D tensor: {data_3d.shape}")
-        
+
+        self.logger.info(f"✓ 3D tensor built: {data_3d.shape}")
+
+        # ── Sliding window ──────────────────────────────────────────────────────
         sequences, targets = [], []
         max_start = num_timesteps - sequence_length - prediction_horizon + 1
-        
+
         self.logger.info(f"Creating {max_start} sliding window samples")
-        
+
         for i in range(max_start):
-            sequences.append(data_3d[i:i+sequence_length, :, :])
-            targets.append(data_3d[i+sequence_length:i+sequence_length+prediction_horizon, :, :])
-        
-        X = np.array(sequences, dtype=np.float32)
-        y = np.array(targets, dtype=np.float32)
-        
+            sequences.append(data_3d[i : i + sequence_length])
+            targets.append(data_3d[i + sequence_length : i + sequence_length + prediction_horizon])
+
+        X = np.array(sequences, dtype=np.float32)  # (N, seq_len, nodes, features)
+        y = np.array(targets, dtype=np.float32)    # (N, pred_len, nodes, features)
+
         self.logger.info(f"✓ X: {X.shape}, y: {y.shape}")
-        assert len(X.shape) == 4 and len(y.shape) == 4
-        
+        assert X.ndim == 4 and y.ndim == 4
+
+        # ── Train / Val / Test split (temporal, NO shuffle) ─────────────────────
         n = len(X)
         train_size = max(1, int(0.7 * n))
-        val_size = max(1, int(0.15 * n))
-        
-        X_train, y_train = X[:train_size], y[:train_size]
-        X_val, y_val = X[train_size:train_size+val_size], y[train_size:train_size+val_size]
-        X_test, y_test = X[train_size+val_size:], y[train_size+val_size:]
-        
+        val_size   = max(1, int(0.15 * n))
+
+        X_train, y_train = X[:train_size],                       y[:train_size]
+        X_val,   y_val   = X[train_size:train_size + val_size],  y[train_size:train_size + val_size]
+        X_test,  y_test  = X[train_size + val_size:],            y[train_size + val_size:]
+
+        self.logger.info(
+            f"Split → Train: {X_train.shape[0]}, Val: {X_val.shape[0]}, Test: {X_test.shape[0]}"
+        )
+
+        # ── Normalization (FIT scaler trên train; transform hoặc để loader làm) ─
+        # Luôn fit scaler trên X_train và lưu mean/scale vào NPZ (để loader có thể
+        # normalize khi load nếu export raw, và để inverse-transform sau này).
+        n_tr, sl, nd, nf = X_train.shape
+        X_tr_2d = X_train.reshape(-1, nf)
+        scaler = StandardScaler()
+        scaler.fit(X_tr_2d)
+        scaler_mean  = scaler.mean_.astype(np.float32)
+        scaler_scale = scaler.scale_.astype(np.float32)
+
+        if normalize:
+            self.logger.info("Normalizing with StandardScaler (fit on train only)...")
+            def _apply(arr):
+                s0, s1, s2, s3 = arr.shape
+                return scaler.transform(arr.reshape(-1, s3)).reshape(s0, s1, s2, s3).astype(np.float32)
+            X_train = _apply(X_train)
+            X_val   = _apply(X_val)
+            X_test  = _apply(X_test)
+            y_train = _apply(y_train)
+            y_val   = _apply(y_val)
+            y_test  = _apply(y_test)
+            self.logger.info(
+                f"✓ Normalization done. "
+                f"Feature mean range: [{scaler_mean.min():.4f}, {scaler_mean.max():.4f}], "
+                f"scale range: [{scaler_scale.min():.4f}, {scaler_scale.max():.4f}]"
+            )
+        else:
+            self.logger.info(
+                "Exporting raw data (normalize=False). Scaler saved; loader will normalize when prepare_for_training(normalize=True)."
+            )
+
+        # ── Save ────────────────────────────────────────────────────────────────
         if output_name is None:
             output_name = f"model_ready_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        
-        data = {
+
+        data_dict = {
             'X_train': X_train, 'y_train': y_train,
-            'X_val': X_val, 'y_val': y_val,
-            'X_test': X_test, 'y_test': y_test,
-            'segment_ids': np.array(segment_ids),
-            'feature_names': np.array(feature_cols)
+            'X_val':   X_val,   'y_val':   y_val,
+            'X_test':  X_test,  'y_test':  y_test,
+            'segment_ids':  np.array(segment_ids),
+            'feature_names': np.array(feature_cols),
         }
-        
+
+        # Luôn lưu scaler params (để loader normalize khi data gốc, và inverse-transform)
+        data_dict['scaler_mean']  = scaler_mean
+        data_dict['scaler_scale'] = scaler_scale
+
         metadata = {
-            'sequence_length': sequence_length,
+            'sequence_length':    sequence_length,
             'prediction_horizon': prediction_horizon,
-            'num_features': num_features,
-            'num_nodes': num_nodes,
-            'num_timesteps': num_timesteps,
-            'num_days': num_days,
+            'num_features':       num_features,
+            'num_nodes':          num_nodes,
+            'num_timesteps':      num_timesteps,
+            'num_days':           num_days,
             'expected_timesteps': expected_ts,
-            'train_size': len(X_train),
-            'val_size': len(X_val),
-            'test_size': len(X_test),
-            'date_range': f"{unique_dates[0]} to {unique_dates[-1]}"
+            'train_size':         len(X_train),
+            'val_size':           len(X_val),
+            'test_size':          len(X_test),
+            'normalized':         normalize,
+            'date_range':         f"{unique_dates[0]} to {unique_dates[-1]}",
         }
-        
-        self.npz_writer.write_batch(data, output_name, metadata)
-        
+
+        self.npz_writer.write_batch(data_dict, output_name, metadata)
+
         self.logger.info(f"✅ Saved: {output_name}")
-        self.logger.info(f"   Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
-        self.logger.info(f"   Date: {unique_dates[0]} to {unique_dates[-1]} ({num_days} days)")
+        self.logger.info(f"   Train: {X_train.shape} | Val: {X_val.shape} | Test: {X_test.shape}")
+        self.logger.info(f"   Date range: {unique_dates[0]} → {unique_dates[-1]} ({num_days} days)")
+        self.logger.info("   Scaler params (mean, scale) saved for normalize/inverse_transform.")
 
     @staticmethod
     def _haversine_distance(lat1, lon1, lat2, lon2) -> float:

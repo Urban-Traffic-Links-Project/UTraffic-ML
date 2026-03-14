@@ -50,6 +50,23 @@ class DynamicAdjacencyBuilder(nn.Module):
         self.method = method.upper()
         self.normalize = normalize
         self.eps = eps
+
+        # Sanity check: fixed_adj should be a raw binary (0/1) connectivity matrix.
+        # If it looks pre-normalized (values mostly < 1 and no integer structure) warn loudly,
+        # because applying D^-1/2·A·D^-1/2 on an already-normalized matrix corrupts propagation.
+        _adj_vals = np.asarray(fixed_adj).ravel()
+        _nonzero = _adj_vals[_adj_vals > 0]
+        if len(_nonzero) > 0 and float(_nonzero.max()) < 0.99:
+            import warnings
+            warnings.warn(
+                "DynamicAdjacencyBuilder received a fixed_adj whose non-zero values are all < 1 "
+                "(max={:.4f}). This looks like a pre-normalized matrix. "
+                "Pass the raw binary adjacency instead — normalization is applied internally.".format(
+                    float(_nonzero.max())
+                ),
+                UserWarning,
+                stacklevel=2,
+            )
         
         # Register fixed adjacency (binary connectivity)
         fixed_adj_tensor = torch.FloatTensor(fixed_adj)

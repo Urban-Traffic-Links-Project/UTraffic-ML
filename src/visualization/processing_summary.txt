@@ -16,18 +16,18 @@
 2. DỮ LIỆU ĐÃ XỬ LÝ (NPZ)
 
    A. Traffic Features (traffic_features_20260122_191403.npz)
-      ├─ Số records: 9530
-      ├─ Số features: 55
-      ├─ Features mới: 37 (+185.0%)
+      ├─ Số records: 9539
+      ├─ Số features: 57
+      ├─ Features mới: 39 (+195.0%)
       └─ Đã normalize: ✓ (Z-score standardization)
 
    B. Graph Structure (graph_structure_20260122_191428.npz)
-      ├─ Số nodes: 499
-      ├─ Số edges: 1868
+      ├─ Số nodes: 498
+      ├─ Số edges: 3480
       ├─ Features per node: 46
-      └─ Average degree: 3.74
+      └─ Average degree: 6.99
 
-3. FEATURES MỚI ĐƯỢC THÊM (37)
+3. FEATURES MỚI ĐƯỢC THÊM (39)
 
    🔴 Speed Related (18)
       • distance_speed
@@ -49,7 +49,7 @@
    🟡 Statistical (1)
       • travel_time_skewness
 
-   🟢 Geospatial (8)
+   🟢 Geospatial (10)
       • distance_from_center
       • grid_cell
       • grid_lat
@@ -58,6 +58,8 @@
       • lat_sin
       • lon_cos
       • lon_sin
+      • raw_latitude
+      • raw_longitude
 
    🔵 Encoding (7)
       • congestion_level
