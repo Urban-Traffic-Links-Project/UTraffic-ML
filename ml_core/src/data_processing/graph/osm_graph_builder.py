@@ -184,11 +184,20 @@ class OSMGraphBuilder(LoggerMixin):
             self.logger.info(f"Loading cached OSM graph: {cache_file.name}")
             self.G = ox.load_graphml(str(cache_file))
         else:
-            self.G = ox.graph_from_bbox(
-                bbox=(north, south, east, west),
-                network_type="drive",
-                simplify=simplify,
-            )
+            try:
+                # osmnx >= 1.3: bbox là positional tuple (north, south, east, west)
+                self.G = ox.graph_from_bbox(
+                    bbox=(north, south, east, west),
+                    network_type="drive",
+                    simplify=simplify,
+                )
+            except TypeError:
+                # osmnx < 1.3: positional args
+                self.G = ox.graph_from_bbox(
+                    north, south, east, west,
+                    network_type="drive",
+                    simplify=simplify,
+                )
             if self.cache_graph:
                 ox.save_graphml(self.G, str(cache_file))
 

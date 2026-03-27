@@ -283,8 +283,9 @@ class TrafficDataPipelineNPZ:
                 shape = segment.get("shape", [])
                 lats = [p.get("latitude", 0) for p in shape]
                 lons = [p.get("longitude", 0) for p in shape]
-                mean_lat = float(np.mean(lats)) if lats else None
-                mean_lon = float(np.mean(lons)) if lons else None
+                mid_idx = len(shape) // 2
+                mid_lat = shape[mid_idx]["latitude"]
+                mid_lon = shape[mid_idx]["longitude"]
 
                 for tr in time_results:
                     record = {
@@ -306,8 +307,8 @@ class TrafficDataPipelineNPZ:
                         "travel_time_ratio":        tr.get("travelTimeRatio"),
                         "sample_size":              tr.get("sampleSize"),
                         # Raw coordinates (KHÔNG normalize ở đây)
-                        "raw_latitude":             mean_lat,
-                        "raw_longitude":            mean_lon,
+                        "raw_latitude":             mid_lat,
+                        "raw_longitude":            mid_lon,
                     }
                     self.accumulated_data.append(record)
 
@@ -492,7 +493,7 @@ class TrafficDataPipelineNPZ:
         geometry: Dict,
         osm_output_name: str = "osm_graph",
         graph_output_name: str = "graph_structure",
-        match_threshold_m: float = 50.0,
+        match_threshold_m: float = 100.0,
         force_rebuild_osm: bool = False,
     ):
         """
@@ -859,33 +860,49 @@ class TrafficDataPipelineNPZ:
 
     @staticmethod
     def _rebuild_nx_graph(osm_data: Dict[str, np.ndarray]) -> "nx.MultiDiGraph":
-        """
-        Tái tạo NetworkX graph từ OSM arrays để dùng ox.nearest_edges.
-        Nhẹ hơn nhiều so với re-download OSM.
-        """
         import networkx as nx
+        from shapely.geometry import LineString
 
         G = nx.MultiDiGraph()
-        G.graph["crs"] = "epsg:4326"
+        G.graph["crs"] = "EPSG:4326"  # viết hoa để chắc chắn
+
         node_ids = osm_data["osm_node_ids"]
         coords = osm_data["coordinates"]
         edge_index = osm_data["edge_index"]
         edge_lengths = osm_data.get("edge_lengths", np.zeros(edge_index.shape[1]))
 
-        # Add nodes
+        # ── Add nodes ─────────────────────────────────────────────
         for idx, nid in enumerate(node_ids):
-            G.add_node(int(nid), y=float(coords[idx, 0]), x=float(coords[idx, 1]))
+            lat = float(coords[idx, 0])
+            lon = float(coords[idx, 1])
+            G.add_node(int(nid), y=lat, x=lon)
 
-        # Add edges — giữ NGUYÊN chiều của từng cung trong edge_index.
-        # BUG CŨ: dùng key=(min,max) để dedup → mất cung ngược chiều trên đường 1 chiều.
-        # FIX: thêm tất cả cung, dùng e_idx làm key để tránh MultiDiGraph ghi đè.
+        # ── Add edges WITH GEOMETRY ───────────────────────────────
         for e_idx in range(edge_index.shape[1]):
             u_idx = edge_index[0, e_idx]
             v_idx = edge_index[1, e_idx]
+
             u_nid = int(node_ids[u_idx])
             v_nid = int(node_ids[v_idx])
+
+            lat_u, lon_u = coords[u_idx]
+            lat_v, lon_v = coords[v_idx]
+
             length = float(edge_lengths[e_idx]) if e_idx < len(edge_lengths) else 0.0
-            G.add_edge(u_nid, v_nid, key=e_idx, length=length)
+
+            # ✅ FIX QUAN TRỌNG: tạo LineString
+            geom = LineString([
+                (lon_u, lat_u),  # (x, y)
+                (lon_v, lat_v)
+            ])
+
+            G.add_edge(
+                u_nid,
+                v_nid,
+                key=e_idx,
+                length=length,
+                geometry=geom
+            )
 
         return G
 

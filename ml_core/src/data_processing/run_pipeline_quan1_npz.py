@@ -17,7 +17,7 @@ from utils.config import config
 #   "graph_only"    ← Chỉ build graph với map matching
 #   "osm_only"      ← Chỉ build OSM skeleton (để test)
 #   "full_pipeline" ← Chạy toàn bộ từ đầu
-MODE = "graph_only"
+MODE = "from_stage_2b"
 
 START_DATE = "2024-08-01"
 

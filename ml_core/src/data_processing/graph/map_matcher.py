@@ -209,10 +209,14 @@ class TomTomOSMMapMatcher(LoggerMixin):
             self.logger.error("DataFrame rỗng sau khi prepare.")
             return {}
 
-        # Tạo unique timestamps theo (date, time_slot)
-        date_col = "date_from"
-        if "date_from" not in df.columns:
-            date_col = "date_range" if "date_range" in df.columns else "date"
+        # BUG FIX: ưu tiên "date_from" rồi mới đến "date_range", "date"
+        date_col = next(
+            (c for c in ["date_from", "date_range", "date"] if c in df.columns),
+            None,
+        )
+        if date_col is None:
+            self.logger.error("Không tìm thấy cột ngày trong DataFrame.")
+            return {}
 
         df["_ts_key"] = df[date_col].astype(str) + "__" + df["time_set"].astype(str)
         ts_keys = sorted(df["_ts_key"].unique())
@@ -225,6 +229,10 @@ class TomTomOSMMapMatcher(LoggerMixin):
         # [N, T, F] — khởi tạo với NaN, fill sau
         temporal_tensor = np.full((N, T, F), np.nan, dtype=np.float32)
 
+        # BUG FIX: track coverage để set _coverage_ratio sau
+        total_segments = df["segment_id"].nunique()
+        matched_segments_set: set = set()
+
         for t_idx, ts_key in enumerate(ts_keys):
             slot_df = df[df["_ts_key"] == ts_key].copy()
             if slot_df.empty:
@@ -232,6 +240,8 @@ class TomTomOSMMapMatcher(LoggerMixin):
 
             try:
                 matched_df = self._map_match_segments(slot_df, osm_networkx_graph)
+                if not matched_df.empty:
+                    matched_segments_set.update(matched_df["segment_id"].unique())
                 node_features_df = self._aggregate_to_nodes(matched_df)
                 result = self._build_feature_arrays(node_features_df)
                 node_feat = result["node_features"]  # [N, F]
@@ -249,6 +259,15 @@ class TomTomOSMMapMatcher(LoggerMixin):
 
             if (t_idx + 1) % 50 == 0:
                 self.logger.info(f"Progress: {t_idx + 1}/{T} time slots")
+
+        # BUG FIX: set coverage ratio sau khi xử lý tất cả slots
+        self._coverage_ratio = (
+            len(matched_segments_set) / max(total_segments, 1)
+        )
+        self.logger.info(
+            f"Coverage: {len(matched_segments_set)}/{total_segments} unique segments "
+            f"({self._coverage_ratio:.1%})"
+        )
 
         # Fill NaN bằng forward-fill theo thời gian (per node)
         temporal_tensor = self._fill_nan_temporal(temporal_tensor)
@@ -380,17 +399,24 @@ class TomTomOSMMapMatcher(LoggerMixin):
                 osm_u_idx, osm_v_idx — index trong node array
                 match_dist_m    — khoảng cách match (m)
         """
+        # BUG FIX: reset_index để đảm bảo positional index (iloc) khớp với
+        # thứ tự của lats/lons array được truyền vào ox.nearest_edges.
+        seg_df = seg_df.reset_index(drop=True)
         lats = seg_df["_lat"].values
         lons = seg_df["_lon"].values
 
         # ox.nearest_edges nhận (X=lon, Y=lat)
         try:
             if len(lats) == 1:
-                # THÊM return_dist=True ĐỂ OSMNX TRẢ VỀ KHOẢNG CÁCH CHÍNH XÁC NHẤT ĐẾN ĐƯỜNG CONG
-                u, v, k, dist = ox.nearest_edges(G, X=lons[0], Y=lats[0], return_dist=True)
-                nearest_edges = [(u, v, k)]
-                distances = [dist]
-            else:nearest_edges, distances = ox.nearest_edges(G, X=lons, Y=lats, return_dist=True)
+                # BUG FIX: ox.nearest_edges với single point trả về (u, v, k), dist
+                # (không phải list), cần wrap vào list để xử lý thống nhất.
+                result = ox.nearest_edges(G, X=float(lons[0]), Y=float(lats[0]), return_dist=True)
+                # result là ((u, v, k), dist) cho single point
+                nearest_edges = [result[0]]
+                distances = [float(result[1])]
+            else:
+                # Multi-point: trả về (list_of_(u,v,k), list_of_dist)
+                nearest_edges, distances = ox.nearest_edges(G, X=lons, Y=lats, return_dist=True)
         except Exception as e:
             self.logger.error(f"ox.nearest_edges failed: {e}")
             return pd.DataFrame()
@@ -404,12 +430,13 @@ class TomTomOSMMapMatcher(LoggerMixin):
                 continue
 
             # Lấy khoảng cách chuẩn từ OSMnx (mét)
-            dist_m = distances[idx]
+            dist_m = float(distances[idx])
 
             # Dùng khoảng cách chuẩn này để filter
             if dist_m > self.match_threshold_m:
                 continue  # Bỏ qua nếu điểm centroid nằm quá xa bất kỳ con đường nào
 
+            # BUG FIX: dùng iloc[idx] trên DataFrame đã reset_index (đồng bộ với lats/lons)
             row = seg_df.iloc[idx].to_dict()
             row["osm_u"] = int(u)
             row["osm_v"] = int(v)

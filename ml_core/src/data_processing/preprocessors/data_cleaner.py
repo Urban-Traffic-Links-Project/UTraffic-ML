@@ -103,7 +103,7 @@ class DataCleaner(LoggerMixin):
                         )
                     
                     # Fill remaining with global median
-                    df[col].fillna(df[col].median())
+                    df[col] = df[col].fillna(df[col].median())
         
         # Travel time columns
         time_cols = [col for col in df.columns if 'travel_time' in col.lower()]
@@ -115,7 +115,7 @@ class DataCleaner(LoggerMixin):
                     df[col] = df.groupby('segment_id')[col].transform(
                         lambda x: x.fillna(x.median())
                     )
-                df[col].fillna(df[col].median())
+                df[col] = df[col].fillna(df[col].median())
         
         # Sample size: fill with 0 or median
         if 'sample_size' in df.columns:
@@ -165,11 +165,12 @@ class DataCleaner(LoggerMixin):
         """
         before = len(df)
         
-        # Remove rows with speed = 0 (likely errors)
+        # Remove rows with speed <= 0 (likely errors) — dùng fillna(0) để NaN không bị xóa nhầm
         speed_cols = [col for col in df.columns if 'speed' in col.lower()]
         for col in speed_cols:
             if col in df.columns:
-                df = df[df[col] > 0]
+                invalid_mask = df[col].notna() & (df[col] <= 0)
+                df = df[~invalid_mask]
         
         # Remove rows with very low sample size
         if 'sample_size' in df.columns:
