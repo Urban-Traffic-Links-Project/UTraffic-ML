@@ -3,6 +3,6 @@
 Data processing modules for traffic data pipeline
 """
 
-from .pipeline import TrafficDataPipeline
+from .pipeline_npz import TrafficDataPipelineNPZ
 
 __all__ = ['TrafficDataPipeline']

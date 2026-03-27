@@ -1,4 +1,5 @@
 # src/data_processing/storage/npz_storage.py
+import json
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -6,6 +7,17 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 
 from utils.logger import LoggerMixin
+
+class NumpyEncoder(json.JSONEncoder):
+    """Custom encoder cho phép json dump các biến numpy."""
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
 
 class NPZWriter(LoggerMixin):
     """
@@ -48,9 +60,8 @@ class NPZWriter(LoggerMixin):
         # Add metadata to data dict
         save_dict = data.copy()
         if metadata:
-            # Serialize metadata as JSON string
-            import json
-            save_dict['_metadata'] = np.array([json.dumps(metadata)])
+            # Serialize metadata as JSON string, DÙNG NumpyEncoder để fix lỗi crash
+            save_dict['_metadata'] = np.array([json.dumps(metadata, cls=NumpyEncoder)])
         
         # Write
         if compress:

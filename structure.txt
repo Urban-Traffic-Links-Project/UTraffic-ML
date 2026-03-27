@@ -8,428 +8,430 @@ C:.
 │   requirements.txt
 │   structure.txt
 │   
-├───checkpoints
-│   ├───DTC-STGCN
-│   │   │   best_model.pth
-│   │   │   last_checkpoint.pth
-│   │   │   training_history.json
-│   │   │   
-│   │   └───logs
-│   │           training_20260303_161547.log
-│   │           training_20260303_164726.log
-│   │           training_20260303_164833.log
-│   │           training_20260303_165834.log
-│   │           training_20260303_173451.log
-│   │           training_20260303_174200.log
-│   │           training_20260311_161702.log
-│   │           training_20260311_162953.log
-│   │           training_20260311_163056.log
-│   │           training_20260311_170806.log
-│   │           training_20260311_170929.log
-│   │           training_20260311_173542.log
-│   │           training_20260311_180448.log
-│   │           training_20260313_104916.log
-│   │           training_20260314_070541.log
-│   │           training_20260314_071052.log
-│   │           training_20260314_071840.log
-│   │           training_20260314_080545.log
-│   │           training_20260314_080719.log
-│   │           training_20260314_081150.log
-│   │           training_20260314_081741.log
-│   │           training_20260314_082617.log
-│   │           training_20260314_082736.log
-│   │           training_20260314_084140.log
-│   │           training_20260314_085200.log
-│   │           training_20260314_092818.log
-│   │           training_20260314_093749.log
-│   │           training_20260314_100746.log
-│   │           
-│   └───T-GCN
-│       │   best_model.pth
-│       │   last_checkpoint.pth
-│       │   training_history.json
-│       │   
-│       └───logs
-│               training_20260227_171444.log
-│               training_20260303_160855.log
-│               training_20260303_164428.log
-│               training_20260303_164655.log
-│               training_20260311_161905.log
-│               training_20260311_161928.log
-│               training_20260311_172321.log
-│               training_20260314_093749.log
-│               
-├───data
-│   ├───processed
-│   │   ├───graph_structure
-│   │   │       graph_structure_20260314_092730.npz
-│   │   │       
-│   │   ├───model_ready_data
-│   │   │       model_ready_data_20260314_092611_20260314_092611.npz
-│   │   │       
-│   │   ├───parquet
-│   │   └───traffic_features
-│   │           traffic_features_20260314_092306.npz
-│   │           traffic_features_20260314_092308.npz
-│   │           traffic_features_20260314_092310.npz
-│   │           traffic_features_20260314_092312.npz
-│   │           traffic_features_20260314_092315.npz
-│   │           traffic_features_20260314_092317.npz
-│   │           traffic_features_20260314_092320.npz
-│   │           traffic_features_20260314_092323.npz
-│   │           traffic_features_20260314_092326.npz
-│   │           traffic_features_20260314_092329.npz
-│   │           traffic_features_20260314_092332.npz
-│   │           traffic_features_20260314_092335.npz
-│   │           traffic_features_20260314_092337.npz
-│   │           traffic_features_20260314_092339.npz
-│   │           traffic_features_20260314_092343.npz
-│   │           traffic_features_20260314_092346.npz
-│   │           traffic_features_20260314_092349.npz
-│   │           traffic_features_20260314_092352.npz
-│   │           traffic_features_20260314_092355.npz
-│   │           traffic_features_20260314_092358.npz
-│   │           traffic_features_20260314_092402.npz
-│   │           traffic_features_20260314_092408.npz
-│   │           traffic_features_20260314_092414.npz
-│   │           traffic_features_20260314_092419.npz
-│   │           traffic_features_20260314_092424.npz
-│   │           traffic_features_20260314_092429.npz
-│   │           traffic_features_20260314_092437.npz
-│   │           traffic_features_20260314_092444.npz
-│   │           traffic_features_20260314_092451.npz
-│   │           traffic_features_20260314_092455.npz
-│   │           traffic_features_20260314_092500.npz
-│   │           traffic_features_20260314_092504.npz
-│   │           traffic_features_20260314_092509.npz
-│   │           traffic_features_20260314_092514.npz
-│   │           traffic_features_20260314_092518.npz
-│   │           traffic_features_20260314_092523.npz
-│   │           traffic_features_20260314_092528.npz
-│   │           traffic_features_20260314_092533.npz
-│   │           traffic_features_20260314_092550.npz
-│   │           
-│   ├───raw
-│   │   ├───kaggle
-│   │   │       nodes.csv
-│   │   │       segments.csv
-│   │   │       segment_status.csv
-│   │   │       streets.csv
-│   │   │       train.csv
-│   │   │       
-│   │   ├───tomtom_stats_frc5
-│   │   │       job_8644951_results.json
-│   │   │       job_8644962_results.json
-│   │   │       job_8644964_results.json
-│   │   │       job_8644967_results.json
-│   │   │       job_8644970_results.json
-│   │   │       job_8644974_results.json
-│   │   │       job_8644976_results.json
-│   │   │       job_8644980_results.json
-│   │   │       job_8644984_results.json
-│   │   │       job_8644987_results.json
-│   │   │       job_8644988_results.json
-│   │   │       job_8644992_results.json
-│   │   │       job_8644995_results.json
-│   │   │       job_8644997_results.json
-│   │   │       job_8645001_results.json
-│   │   │       job_8645002_results.json
-│   │   │       job_8645010_results.json
-│   │   │       job_8645013_results.json
-│   │   │       job_8645014_results.json
-│   │   │       job_8645168_results.json
-│   │   │       job_8645183_results.json
-│   │   │       job_8645190_results.json
-│   │   │       job_8645195_results.json
-│   │   │       job_8645203_results.json
-│   │   │       job_8645204_results.json
-│   │   │       job_8645208_results.json
-│   │   │       job_8645215_results.json
-│   │   │       job_8645220_results.json
-│   │   │       job_8645226_results.json
-│   │   │       job_8645233_results.json
-│   │   │       job_8645238_results.json
-│   │   │       
-│   │   └───tomtom_stats_frc7
-│   │           job_8693779_results.json
-│   │           job_8693786_results.json
-│   │           job_8693787_results.json
-│   │           job_8693792_results.json
-│   │           job_8693798_results.json
-│   │           job_8693801_results.json
-│   │           job_8693805_results.json
-│   │           job_8693808_results.json
-│   │           job_8693815_results.json
-│   │           job_8693817_results.json
-│   │           job_8693821_results.json
-│   │           job_8693823_results.json
-│   │           job_8693827_results.json
-│   │           job_8693831_results.json
-│   │           job_8693834_results.json
-│   │           job_8693835_results.json
-│   │           job_8693840_results.json
-│   │           job_8693843_results.json
-│   │           job_8693845_results.json
-│   │           job_8693887_results.json
-│   │           job_8693896_results.json
-│   │           job_8693898_results.json
-│   │           job_8693900_results.json
-│   │           job_8693904_results.json
-│   │           job_8694299_results.json
-│   │           job_8694304_results.json
-│   │           job_8694310_results.json
-│   │           job_8694312_results.json
-│   │           job_8694317_results.json
-│   │           job_8694325_results.json
-│   │           job_8694330_results.json
-│   │           
-│   └───results
-│           attn_mean_matrix (3).csv
-│           comparison_horizon_1days.csv
-│           comparison_horizon_2days.csv
-│           comparison_horizon_3days.csv
-│           comparison_horizon_4days.csv
-│           comparison_results.json
-│           comparison_summary.csv
-│           correlation_dynamic_20260303_184644.csv
-│           correlation_dynamic_20260303_184836.csv
-│           correlation_dynamic_20260311_181422.csv
-│           correlation_dynamic_20260311_183735.csv
-│           correlation_matrices_20260303_161627.npz
-│           correlation_matrices_20260303_184644.npz
-│           correlation_matrices_20260303_184836.npz
-│           correlation_matrices_20260311_181422.npz
-│           correlation_matrices_20260311_183735.npz
-│           correlation_pearson_20260303_184644.csv
-│           correlation_pearson_20260303_184836.csv
-│           correlation_pearson_20260311_181422.csv
-│           correlation_pearson_20260311_183735.csv
-│           correlation_spatial_20260311_181422.csv
-│           correlation_spatial_20260311_183735.csv
-│           correlation_summary_20260311_181422.csv
-│           correlation_summary_20260311_183735.csv
-│           corr_mean_nxn.csv
-│           
-├───deployment
-│   │   docker-compose.yml
-│   │   Dockerfile
+├───backend
+│   │   requirements.txt
 │   │   
-│   └───api
-│           main.py
-│           requirements.txt
-│           schemas.py
-│           
-├───logs
-├───notebooks
-│       check_parquet.ipynb
-│       preprocess_data.ipynb
-│       test.ipynb
-│       
-├───scripts
-│       preprocess_data.py
-│       
-└───src
-    │   __init__.py
+│   └───app
+│       ├───routers
+│       └───services
+├───frontend
+│   │   Dockerfile.frontend
+│   │   
+│   └───src
+└───ml_core
+    │   Dockerfile.ml_worker
     │   
-    ├───data_processing
-    │   │   debug_check_data.py
-    │   │   kafka.yml
-    │   │   pipeline.py
-    │   │   pipeline_npz.py
-    │   │   README.md
-    │   │   run_pipeline_quan1.py
-    │   │   run_pipeline_quan1_npz.py
-    │   │   __init__.py
-    │   │   
-    │   ├───collectors
-    │   │   │   tomtom_collector.ipynb
-    │   │   │   tomtom_collector.py
-    │   │   │   __init__.py
+    ├───checkpoints
+    │   ├───DTC-STGCN
+    │   │   │   best_model.pth
+    │   │   │   last_checkpoint.pth
+    │   │   │   training_history.json
     │   │   │   
-    │   │   └───__pycache__
-    │   │           tomtom_collector.cpython-311.pyc
-    │   │           __init__.cpython-311.pyc
+    │   │   └───logs
+    │   │           training_20260303_161547.log
+    │   │           training_20260303_164726.log
+    │   │           training_20260303_164833.log
+    │   │           training_20260303_165834.log
+    │   │           training_20260303_173451.log
+    │   │           training_20260303_174200.log
+    │   │           training_20260311_161702.log
+    │   │           training_20260311_162953.log
+    │   │           training_20260311_163056.log
+    │   │           training_20260311_170806.log
+    │   │           training_20260311_170929.log
+    │   │           training_20260311_173542.log
+    │   │           training_20260311_180448.log
+    │   │           training_20260313_104916.log
+    │   │           training_20260314_070541.log
+    │   │           training_20260314_071052.log
+    │   │           training_20260314_071840.log
+    │   │           training_20260314_080545.log
+    │   │           training_20260314_080719.log
+    │   │           training_20260314_081150.log
+    │   │           training_20260314_081741.log
+    │   │           training_20260314_082617.log
+    │   │           training_20260314_082736.log
+    │   │           training_20260314_084140.log
+    │   │           training_20260314_085200.log
+    │   │           training_20260314_092818.log
+    │   │           training_20260314_093749.log
+    │   │           training_20260314_100746.log
     │   │           
-    │   ├───preprocessors
-    │   │   │   categorical_encoder.py
-    │   │   │   data_cleaner.py
-    │   │   │   data_normalizer.py
-    │   │   │   data_validator.py
-    │   │   │   feature_extractor.py
-    │   │   │   spatial_processor.py
-    │   │   │   __init__.py
-    │   │   │   
-    │   │   └───__pycache__
-    │   │           categorical_encoder.cpython-311.pyc
-    │   │           data_cleaner.cpython-311.pyc
-    │   │           data_normalizer.cpython-311.pyc
-    │   │           data_validator.cpython-311.pyc
-    │   │           feature_extractor.cpython-311.pyc
-    │   │           spatial_processor.cpython-311.pyc
-    │   │           __init__.cpython-311.pyc
+    │   └───T-GCN
+    │       │   best_model.pth
+    │       │   last_checkpoint.pth
+    │       │   training_history.json
+    │       │   
+    │       └───logs
+    │               training_20260227_171444.log
+    │               training_20260303_160855.log
+    │               training_20260303_164428.log
+    │               training_20260303_164655.log
+    │               training_20260311_161905.log
+    │               training_20260311_161928.log
+    │               training_20260311_172321.log
+    │               training_20260314_093749.log
+    │               
+    ├───data
+    │   ├───processed
+    │   │   ├───graph_structure
+    │   │   │       graph_structure_20260314_092730.npz
+    │   │   │       
+    │   │   ├───model_ready_data
+    │   │   │       model_ready_data_20260314_092611_20260314_092611.npz
+    │   │   │       
+    │   │   ├───parquet
+    │   │   └───traffic_features
+    │   │           traffic_features_20260314_092306.npz
+    │   │           traffic_features_20260314_092308.npz
+    │   │           traffic_features_20260314_092310.npz
+    │   │           traffic_features_20260314_092312.npz
+    │   │           traffic_features_20260314_092315.npz
+    │   │           traffic_features_20260314_092317.npz
+    │   │           traffic_features_20260314_092320.npz
+    │   │           traffic_features_20260314_092323.npz
+    │   │           traffic_features_20260314_092326.npz
+    │   │           traffic_features_20260314_092329.npz
+    │   │           traffic_features_20260314_092332.npz
+    │   │           traffic_features_20260314_092335.npz
+    │   │           traffic_features_20260314_092337.npz
+    │   │           traffic_features_20260314_092339.npz
+    │   │           traffic_features_20260314_092343.npz
+    │   │           traffic_features_20260314_092346.npz
+    │   │           traffic_features_20260314_092349.npz
+    │   │           traffic_features_20260314_092352.npz
+    │   │           traffic_features_20260314_092355.npz
+    │   │           traffic_features_20260314_092358.npz
+    │   │           traffic_features_20260314_092402.npz
+    │   │           traffic_features_20260314_092408.npz
+    │   │           traffic_features_20260314_092414.npz
+    │   │           traffic_features_20260314_092419.npz
+    │   │           traffic_features_20260314_092424.npz
+    │   │           traffic_features_20260314_092429.npz
+    │   │           traffic_features_20260314_092437.npz
+    │   │           traffic_features_20260314_092444.npz
+    │   │           traffic_features_20260314_092451.npz
+    │   │           traffic_features_20260314_092455.npz
+    │   │           traffic_features_20260314_092500.npz
+    │   │           traffic_features_20260314_092504.npz
+    │   │           traffic_features_20260314_092509.npz
+    │   │           traffic_features_20260314_092514.npz
+    │   │           traffic_features_20260314_092518.npz
+    │   │           traffic_features_20260314_092523.npz
+    │   │           traffic_features_20260314_092528.npz
+    │   │           traffic_features_20260314_092533.npz
+    │   │           traffic_features_20260314_092550.npz
     │   │           
-    │   ├───storage
-    │   │   │   npz_storage.py
-    │   │   │   parquet_writer.py
-    │   │   │   __init__.py
-    │   │   │   
-    │   │   └───__pycache__
-    │   │           npz_storage.cpython-311.pyc
-    │   │           npz_writer.cpython-311.pyc
-    │   │           parquet_writer.cpython-311.pyc
-    │   │           __init__.cpython-311.pyc
+    │   ├───raw
+    │   │   ├───kaggle
+    │   │   │       nodes.csv
+    │   │   │       segments.csv
+    │   │   │       segment_status.csv
+    │   │   │       streets.csv
+    │   │   │       train.csv
+    │   │   │       
+    │   │   ├───tomtom_stats_frc5
+    │   │   │       job_8644951_results.json
+    │   │   │       job_8644962_results.json
+    │   │   │       job_8644964_results.json
+    │   │   │       job_8644967_results.json
+    │   │   │       job_8644970_results.json
+    │   │   │       job_8644974_results.json
+    │   │   │       job_8644976_results.json
+    │   │   │       job_8644980_results.json
+    │   │   │       job_8644984_results.json
+    │   │   │       job_8644987_results.json
+    │   │   │       job_8644988_results.json
+    │   │   │       job_8644992_results.json
+    │   │   │       job_8644995_results.json
+    │   │   │       job_8644997_results.json
+    │   │   │       job_8645001_results.json
+    │   │   │       job_8645002_results.json
+    │   │   │       job_8645010_results.json
+    │   │   │       job_8645013_results.json
+    │   │   │       job_8645014_results.json
+    │   │   │       job_8645168_results.json
+    │   │   │       job_8645183_results.json
+    │   │   │       job_8645190_results.json
+    │   │   │       job_8645195_results.json
+    │   │   │       job_8645203_results.json
+    │   │   │       job_8645204_results.json
+    │   │   │       job_8645208_results.json
+    │   │   │       job_8645215_results.json
+    │   │   │       job_8645220_results.json
+    │   │   │       job_8645226_results.json
+    │   │   │       job_8645233_results.json
+    │   │   │       job_8645238_results.json
+    │   │   │       
+    │   │   └───tomtom_stats_frc7
+    │   │           job_8693779_results.json
+    │   │           job_8693786_results.json
+    │   │           job_8693787_results.json
+    │   │           job_8693792_results.json
+    │   │           job_8693798_results.json
+    │   │           job_8693801_results.json
+    │   │           job_8693805_results.json
+    │   │           job_8693808_results.json
+    │   │           job_8693815_results.json
+    │   │           job_8693817_results.json
+    │   │           job_8693821_results.json
+    │   │           job_8693823_results.json
+    │   │           job_8693827_results.json
+    │   │           job_8693831_results.json
+    │   │           job_8693834_results.json
+    │   │           job_8693835_results.json
+    │   │           job_8693840_results.json
+    │   │           job_8693843_results.json
+    │   │           job_8693845_results.json
+    │   │           job_8693887_results.json
+    │   │           job_8693896_results.json
+    │   │           job_8693898_results.json
+    │   │           job_8693900_results.json
+    │   │           job_8693904_results.json
+    │   │           job_8694299_results.json
+    │   │           job_8694304_results.json
+    │   │           job_8694310_results.json
+    │   │           job_8694312_results.json
+    │   │           job_8694317_results.json
+    │   │           job_8694325_results.json
+    │   │           job_8694330_results.json
     │   │           
-    │   ├───streaming
-    │   │   │   kafka_consumer.ipynb
-    │   │   │   kafka_consumer.py
-    │   │   │   kafka_producer.ipynb
-    │   │   │   kafka_producer.py
-    │   │   │   __init__.py
-    │   │   │   
-    │   │   └───__pycache__
-    │   │           kafka_consumer.cpython-311.pyc
-    │   │           kafka_producer.cpython-311.pyc
-    │   │           __init__.cpython-311.pyc
-    │   │           
-    │   └───__pycache__
-    │           debug_check_data.cpython-311.pyc
-    │           pipeline.cpython-311.pyc
-    │           pipeline_npz.cpython-311.pyc
-    │           run_pipeline_quan1_npz.cpython-311.pyc
-    │           __init__.cpython-311.pyc
+    │   └───results
+    │           attn_mean_matrix (3).csv
+    │           comparison_horizon_1days.csv
+    │           comparison_horizon_2days.csv
+    │           comparison_horizon_3days.csv
+    │           comparison_horizon_4days.csv
+    │           comparison_results.json
+    │           comparison_summary.csv
+    │           correlation_dynamic_20260303_184644.csv
+    │           correlation_dynamic_20260303_184836.csv
+    │           correlation_dynamic_20260311_181422.csv
+    │           correlation_dynamic_20260311_183735.csv
+    │           correlation_matrices_20260303_161627.npz
+    │           correlation_matrices_20260303_184644.npz
+    │           correlation_matrices_20260303_184836.npz
+    │           correlation_matrices_20260311_181422.npz
+    │           correlation_matrices_20260311_183735.npz
+    │           correlation_pearson_20260303_184644.csv
+    │           correlation_pearson_20260303_184836.csv
+    │           correlation_pearson_20260311_181422.csv
+    │           correlation_pearson_20260311_183735.csv
+    │           correlation_spatial_20260311_181422.csv
+    │           correlation_spatial_20260311_183735.csv
+    │           correlation_summary_20260311_181422.csv
+    │           correlation_summary_20260311_183735.csv
+    │           corr_mean_nxn.csv
     │           
-    ├───data_processing_old
-    │   │   compared_dataset.ipynb
-    │   │   __init__.py
-    │   │   
-    │   ├───bktraffic
-    │   │       traffic_mongo_loader.ipynb
-    │   │       traffic_mongo_loader.py
-    │   │       
-    │   ├───cache
-    │   │       29737ef463d589837eaff28bed2650472918e0a5.json
-    │   │       b17d098f3ee157087856e3cc52eef2f961d2bf49.json
-    │   │       
-    │   └───tomtom
-    │           build_tomtom_tables.ipynb
-    │           flatten_timeseries.ipynb
-    │           preprocessor.ipynb
-    │           spatial_tomtom_csv.ipynb
-    │           tomtom_collector.ipynb
-    │           trend_stats_per_segment.csv
-    │           
-    ├───experiments
-    │   │   compare_model.py
-    │   │   quick_start.py
-    │   │   resume_training.py
-    │   │   test_dtc_stgcn.py
-    │   │   train_and_compare.py
-    │   │   
-    │   └───__pycache__
-    │           compare_model.cpython-311.pyc
-    │           quick_start.cpython-311.pyc
-    │           resume_training.cpython-311.pyc
-    │           train_and_compare.cpython-311.pyc
-    │           
-    ├───logs
-    │       pipeline.log
+    ├───notebooks
+    │       check_parquet.ipynb
+    │       preprocess_data.ipynb
+    │       test.ipynb
     │       
-    ├───models
-    │   │   __init__.py
-    │   │   
-    │   ├───base
-    │   │       base_model.py
-    │   │       base_trainer.py
-    │   │       
-    │   ├───BERT
-    │   │       2.model.ipynb
-    │   │       matrix_correla.py
-    │   │       matrix_correlation.py
-    │   │       
-    │   ├───DTC_STGCN
-    │   │   │   model.py
-    │   │   │   test.ipynb
-    │   │   │   trainer.py
-    │   │   │   __init__.py
-    │   │   │   
-    │   │   ├───graph
-    │   │   │   │   correlation_matrix.py
-    │   │   │   │   graph_builder.py
-    │   │   │   │   __init__.py
-    │   │   │   │   
-    │   │   │   └───__pycache__
-    │   │   │           correlation_matrix.cpython-311.pyc
-    │   │   │           graph_builder.cpython-311.pyc
-    │   │   │           __init__.cpython-311.pyc
-    │   │   │           
-    │   │   └───__pycache__
-    │   │           model.cpython-311.pyc
-    │   │           trainer.cpython-311.pyc
-    │   │           __init__.cpython-311.pyc
-    │   │           
-    │   ├───T_GCN
-    │   │   │   gcn.ipynb
-    │   │   │   gcn.py
-    │   │   │   gru.ipynb
-    │   │   │   gru.py
-    │   │   │   README.md
-    │   │   │   test.ipynb
-    │   │   │   test.py
-    │   │   │   tgcn.py
-    │   │   │   trainer.py
-    │   │   │   __init__.py
-    │   │   │   
-    │   │   └───__pycache__
-    │   │           gcn.cpython-311.pyc
-    │   │           gru.cpython-311.pyc
-    │   │           tgcn.cpython-311.pyc
-    │   │           trainer.cpython-311.pyc
-    │   │           __init__.cpython-311.pyc
-    │   │           
-    │   └───__pycache__
-    │           __init__.cpython-311.pyc
-    │           
-    ├───utils
-    │   │   baselines.py
-    │   │   config.py
-    │   │   data_loader.py
-    │   │   logger.py
-    │   │   metrics.py
-    │   │   seed.py
-    │   │   __init__.py
-    │   │   
-    │   └───__pycache__
-    │           baselines.cpython-311.pyc
-    │           config.cpython-311.pyc
-    │           data_loader.cpython-311.pyc
-    │           logger.cpython-311.pyc
-    │           metrics.cpython-311.pyc
-    │           __init__.cpython-311.pyc
-    │           
-    ├───visualization
-    │       conclusion.txt
-    │       correlation_network.py
-    │       data_visualization_pipeline.ipynb
-    │       my_graph.html
-    │       plot_utils.py
-    │       processing_statistics.csv
-    │       processing_summary.txt
-    │       step10_original_vs_processed.png
-    │       step11_normalization_comparison.png
-    │       step12_feature_evolution_summary.png
-    │       step1_raw_data_overview.png
-    │       step2_speed_related_features.png
-    │       step3_congestion_features.png
-    │       step4_time_series_features.png
-    │       step5_statistical_features.png
-    │       step6_geospatial_features.png
-    │       step7_graph_structure.png
-    │       step8_correlation_matrix.png
-    │       step9_feature_importance.png
-    │       test_map.html
-    │       visualize_adjacent_matrix.ipynb
-    │       __init__.py
+    ├───scripts
+    │       preprocess_data.py
     │       
-    └───__pycache__
-            __init__.cpython-311.pyc
-            
+    └───src
+        ├───data_processing
+        │   │   debug_check_data.py
+        │   │   kafka.yml
+        │   │   pipeline.py
+        │   │   pipeline_npz.py
+        │   │   README.md
+        │   │   run_pipeline_quan1.py
+        │   │   run_pipeline_quan1_npz.py
+        │   │   __init__.py
+        │   │   
+        │   ├───collectors
+        │   │   │   tomtom_collector.ipynb
+        │   │   │   tomtom_collector.py
+        │   │   │   __init__.py
+        │   │   │   
+        │   │   └───__pycache__
+        │   │           tomtom_collector.cpython-311.pyc
+        │   │           __init__.cpython-311.pyc
+        │   │           
+        │   ├───preprocessors
+        │   │   │   categorical_encoder.py
+        │   │   │   data_cleaner.py
+        │   │   │   data_normalizer.py
+        │   │   │   data_validator.py
+        │   │   │   feature_extractor.py
+        │   │   │   spatial_processor.py
+        │   │   │   __init__.py
+        │   │   │   
+        │   │   └───__pycache__
+        │   │           categorical_encoder.cpython-311.pyc
+        │   │           data_cleaner.cpython-311.pyc
+        │   │           data_normalizer.cpython-311.pyc
+        │   │           data_validator.cpython-311.pyc
+        │   │           feature_extractor.cpython-311.pyc
+        │   │           spatial_processor.cpython-311.pyc
+        │   │           __init__.cpython-311.pyc
+        │   │           
+        │   ├───storage
+        │   │   │   npz_storage.py
+        │   │   │   parquet_writer.py
+        │   │   │   __init__.py
+        │   │   │   
+        │   │   └───__pycache__
+        │   │           npz_storage.cpython-311.pyc
+        │   │           npz_writer.cpython-311.pyc
+        │   │           parquet_writer.cpython-311.pyc
+        │   │           __init__.cpython-311.pyc
+        │   │           
+        │   ├───streaming
+        │   │   │   kafka_consumer.ipynb
+        │   │   │   kafka_consumer.py
+        │   │   │   kafka_producer.ipynb
+        │   │   │   kafka_producer.py
+        │   │   │   __init__.py
+        │   │   │   
+        │   │   └───__pycache__
+        │   │           kafka_consumer.cpython-311.pyc
+        │   │           kafka_producer.cpython-311.pyc
+        │   │           __init__.cpython-311.pyc
+        │   │           
+        │   └───__pycache__
+        │           debug_check_data.cpython-311.pyc
+        │           pipeline.cpython-311.pyc
+        │           pipeline_npz.cpython-311.pyc
+        │           run_pipeline_quan1_npz.cpython-311.pyc
+        │           __init__.cpython-311.pyc
+        │           
+        ├───data_processing_old
+        │   │   compared_dataset.ipynb
+        │   │   __init__.py
+        │   │   
+        │   ├───bktraffic
+        │   │       traffic_mongo_loader.ipynb
+        │   │       traffic_mongo_loader.py
+        │   │       
+        │   ├───cache
+        │   │       29737ef463d589837eaff28bed2650472918e0a5.json
+        │   │       b17d098f3ee157087856e3cc52eef2f961d2bf49.json
+        │   │       
+        │   └───tomtom
+        │           build_tomtom_tables.ipynb
+        │           flatten_timeseries.ipynb
+        │           preprocessor.ipynb
+        │           spatial_tomtom_csv.ipynb
+        │           tomtom_collector.ipynb
+        │           trend_stats_per_segment.csv
+        │           
+        ├───experiments
+        │   │   compare_model.py
+        │   │   quick_start.py
+        │   │   resume_training.py
+        │   │   test_dtc_stgcn.py
+        │   │   train_and_compare.py
+        │   │   
+        │   └───__pycache__
+        │           compare_model.cpython-311.pyc
+        │           quick_start.cpython-311.pyc
+        │           resume_training.cpython-311.pyc
+        │           train_and_compare.cpython-311.pyc
+        │           
+        ├───logs
+        │       pipeline.log
+        │       
+        ├───models
+        │   │   __init__.py
+        │   │   
+        │   ├───base
+        │   │       base_model.py
+        │   │       base_trainer.py
+        │   │       
+        │   ├───BERT
+        │   │       2.model.ipynb
+        │   │       matrix_correla.py
+        │   │       matrix_correlation.py
+        │   │       
+        │   ├───DTC_STGCN
+        │   │   │   model.py
+        │   │   │   test.ipynb
+        │   │   │   trainer.py
+        │   │   │   __init__.py
+        │   │   │   
+        │   │   ├───graph
+        │   │   │   │   correlation_matrix.py
+        │   │   │   │   graph_builder.py
+        │   │   │   │   __init__.py
+        │   │   │   │   
+        │   │   │   └───__pycache__
+        │   │   │           correlation_matrix.cpython-311.pyc
+        │   │   │           graph_builder.cpython-311.pyc
+        │   │   │           __init__.cpython-311.pyc
+        │   │   │           
+        │   │   └───__pycache__
+        │   │           model.cpython-311.pyc
+        │   │           trainer.cpython-311.pyc
+        │   │           __init__.cpython-311.pyc
+        │   │           
+        │   ├───T_GCN
+        │   │   │   gcn.ipynb
+        │   │   │   gcn.py
+        │   │   │   gru.ipynb
+        │   │   │   gru.py
+        │   │   │   README.md
+        │   │   │   test.ipynb
+        │   │   │   test.py
+        │   │   │   tgcn.py
+        │   │   │   trainer.py
+        │   │   │   __init__.py
+        │   │   │   
+        │   │   └───__pycache__
+        │   │           gcn.cpython-311.pyc
+        │   │           gru.cpython-311.pyc
+        │   │           tgcn.cpython-311.pyc
+        │   │           trainer.cpython-311.pyc
+        │   │           __init__.cpython-311.pyc
+        │   │           
+        │   └───__pycache__
+        │           __init__.cpython-311.pyc
+        │           
+        ├───utils
+        │   │   baselines.py
+        │   │   config.py
+        │   │   data_loader.py
+        │   │   logger.py
+        │   │   metrics.py
+        │   │   seed.py
+        │   │   __init__.py
+        │   │   
+        │   └───__pycache__
+        │           baselines.cpython-311.pyc
+        │           config.cpython-311.pyc
+        │           data_loader.cpython-311.pyc
+        │           logger.cpython-311.pyc
+        │           metrics.cpython-311.pyc
+        │           __init__.cpython-311.pyc
+        │           
+        ├───visualization
+        │   ├───correlation_network
+        │   │       correlation_network.py
+        │   │       my_graph.html
+        │   │       
+        │   └───eda
+        │           conclusion.txt
+        │           data_visualization_pipeline.ipynb
+        │           processing_statistics.csv
+        │           processing_summary.txt
+        │           step10_original_vs_processed.png
+        │           step11_normalization_comparison.png
+        │           step12_feature_evolution_summary.png
+        │           step1_raw_data_overview.png
+        │           step2_speed_related_features.png
+        │           step3_congestion_features.png
+        │           step4_time_series_features.png
+        │           step5_statistical_features.png
+        │           step6_geospatial_features.png
+        │           step7_graph_structure.png
+        │           step8_correlation_matrix.png
+        │           step9_feature_importance.png
+        │           test_map.html
+        │           visualize_adjacent_matrix.ipynb
+        │           
+        └───__pycache__
+                __init__.cpython-311.pyc
+                

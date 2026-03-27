@@ -119,7 +119,7 @@ class DataCleaner(LoggerMixin):
         
         # Sample size: fill with 0 or median
         if 'sample_size' in df.columns:
-            df['sample_size'].fillna(0, inplace=True)
+            df['sample_size'] = df['sample_size'].fillna(0)
         
         return df
     

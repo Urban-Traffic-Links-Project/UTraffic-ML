@@ -1,66 +1,82 @@
-# src/data_processing/pipeline_npz.py
-import pandas as pd
-import numpy as np
+from __future__ import annotations
+
 import json
-from typing import Dict, Any, Optional, List
+import re
+from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Any
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 
 from .collectors.tomtom_collector import TomTomTrafficDataCollector
 from .streaming.kafka_producer import TrafficDataProducer
 from .streaming.kafka_consumer import RawDataConsumer, ValidatedDataConsumer
 from .preprocessors.data_validator import DataValidator
 from .preprocessors.data_cleaner import DataCleaner
-from .preprocessors.feature_extractor import FeatureExtractor
-from .preprocessors.categorical_encoder import CategoricalFeatureEncoder
-from .preprocessors.spatial_processor import SpatialFeatureProcessor
+from .preprocessors.feature_extractor import (
+    FeatureExtractor,
+    FINAL_FEATURE_COLS,
+    NORMALIZE_COLS,
+    MINMAX_COLS,
+)
 from .preprocessors.data_normalizer import DataNormalizer
+from .graph.osm_graph_builder import OSMGraphBuilder
+from .graph.map_matcher import TomTomOSMMapMatcher
 from .storage.npz_storage import NPZWriter, NPZReader
 
 from utils.config import config
 from utils.logger import setup_logger
 
+
 class TrafficDataPipelineNPZ:
     """
-    Pipeline xử lý dữ liệu giao thông theo Kappa Architecture
-    Lưu trữ vào NPZ files thay vì database
+    Pipeline xử lý dữ liệu giao thông theo Kappa Architecture.
+    OSM Skeleton + TomTom Features hybrid.
     """
-    
+
     def __init__(self):
-        self.logger = setup_logger('TrafficDataPipelineNPZ', config.log_file, config.log_level)
-        
-        # Initialize components
+        self.logger = setup_logger(
+            "TrafficDataPipelineNPZ", config.log_file, config.log_level
+        )
+
+        # Core components
         self.collector = TomTomTrafficDataCollector()
         self.validator = DataValidator()
         self.cleaner = DataCleaner()
         self.feature_extractor = FeatureExtractor()
-        self.categorical_encoder = CategoricalFeatureEncoder(encoding_strategy='ordinal')
-        self.spatial_processor = SpatialFeatureProcessor(normalize=True, create_features=True)
         self.normalizer = DataNormalizer()
-        
+
         # Storage
         self.npz_writer = NPZWriter()
         self.npz_reader = NPZReader()
-        
+
         # Batch accumulator
-        self.accumulated_data = []
-        self.batch_size = 10000
-        
-        self.logger.info("✅ Pipeline initialized with NPZ storage")
-    
+        self.accumulated_data: List[Dict] = []
+        self.batch_size = 10_000
+
+        # OSM graph (populated after build_osm_skeleton)
+        self._osm_builder: Optional[OSMGraphBuilder] = None
+        self._osm_graph_data: Optional[Dict[str, np.ndarray]] = None
+
+        self.logger.info("✅ Pipeline (OSM+TomTom hybrid) initialized")
+
+    # =========================================================================
+    # STAGE 1 — TomTom Collection
+    # =========================================================================
+
     def run_31_days_collection(
         self,
         geometry: Dict,
         start_date: str,
     ) -> Optional[List[str]]:
-        """
-        Stage 1 (31 ngày): Thu thập dữ liệu 31 ngày liên tiếp từ TomTom.
-        Mỗi ngày 1 job riêng, không gộp trung bình — phù hợp time series cho T-GCN.
-        """
+        """Stage 1: Thu thập 31 ngày từ TomTom API."""
         self.logger.info("=" * 60)
         self.logger.info("STAGE 1: 31-DAY SEQUENTIAL DATA COLLECTION")
         self.logger.info("=" * 60)
 
-        job_ids, all_results = self.collector.collect_31_days_sequential(
+        job_ids, _ = self.collector.collect_31_days_sequential(
             geometry=geometry,
             start_date_str=start_date,
         )
@@ -69,73 +85,29 @@ class TrafficDataPipelineNPZ:
             self.logger.error("No jobs created")
             return None
 
-        self.logger.info(f"✅ Stage 1 complete: {len(job_ids)} jobs (31 days)")
+        self.logger.info(f"✅ Stage 1 complete: {len(job_ids)} jobs")
         return job_ids
 
-    def run_batch_collection(
-        self,
-        geometry: Dict,
-        date_from: str,
-        date_to: str,
-        job_name: str = "Traffic Analysis"
-    ) -> Optional[str]:
-        """
-        Stage 1 (legacy): Thu thập dữ liệu batch một khoảng ngày từ TomTom.
-        """
-        self.logger.info("=" * 60)
-        self.logger.info("STAGE 1: BATCH DATA COLLECTION")
-        self.logger.info("=" * 60)
-
-        job_id = self.collector.create_area_analysis_job(
-            geometry=geometry,
-            date_from=date_from,
-            date_to=date_to,
-            job_name=job_name
-        )
-
-        if not job_id:
-            self.logger.error("Failed to create job")
-            return None
-
-        status = self.collector.wait_for_job_completion(job_id, max_wait_minutes=60)
-
-        if not status or status.get('jobState') != 'DONE':
-            self.logger.error("Job did not complete successfully")
-            return None
-
-        results = self.collector.download_results(job_id)
-
-        if not results:
-            self.logger.error("Failed to download results")
-            return None
-
-        self.logger.info(f"✅ Stage 1 complete: Job {job_id}")
-        return job_id
-    
-    def run_streaming_ingestion(self, job_id: str):
-        """
-        Stage 2: Đưa dữ liệu từ 1 file job vào Kafka stream.
-        """
-        self.logger.info("=" * 60)
-        self.logger.info("STAGE 2: STREAMING INGESTION")
-        self.logger.info("=" * 60)
-        n = self._ingest_one_job_to_stream(job_id)
-        self.logger.info(f"✅ Stage 2 complete: {n} segments")
+    # =========================================================================
+    # STAGE 2A — Kafka Streaming Ingestion
+    # =========================================================================
 
     def run_streaming_ingestion_from_jobs(self, job_ids: List[str]):
-        """
-        Stage 2 (31 ngày): Đưa dữ liệu từ nhiều file job vào Kafka stream.
-        """
+        """Stage 2a: Đưa dữ liệu từ file JSON vào Kafka stream."""
         self.logger.info("=" * 60)
-        self.logger.info("STAGE 2: STREAMING INGESTION (31 DAYS)")
+        self.logger.info("STAGE 2a: STREAMING INGESTION")
         self.logger.info("=" * 60)
 
         total_sent = 0
         for idx, job_id in enumerate(job_ids):
-            n = self._ingest_one_job_to_stream(job_id, day_index=idx + 1, total_days=len(job_ids))
+            n = self._ingest_one_job_to_stream(
+                job_id, day_index=idx + 1, total_days=len(job_ids)
+            )
             total_sent += n
 
-        self.logger.info(f"✅ Stage 2 complete: {total_sent} segments from {len(job_ids)} days")
+        self.logger.info(
+            f"✅ Stage 2a complete: {total_sent} segments from {len(job_ids)} days"
+        )
 
     def _ingest_one_job_to_stream(
         self,
@@ -143,178 +115,230 @@ class TrafficDataPipelineNPZ:
         day_index: Optional[int] = None,
         total_days: Optional[int] = None,
     ) -> int:
-        """Đọc 1 file job_*_results.json và gửi segments vào Kafka."""
-        result_file = config.data.raw_dir / "tomtom_stats_frc5" / f"job_{job_id}_results.json"
+        """Đọc 1 file job_*_results.json và push vào Kafka."""
+        result_file = (
+            config.data.raw_dir / "tomtom_stats_frc5" / f"job_{job_id}_results.json"
+        )
 
         if not result_file.exists():
             self.logger.error(f"Result file not found: {result_file}")
             return 0
 
-        with open(result_file, 'r', encoding='utf-8') as f:
+        with open(result_file, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         sent_count = 0
         with TrafficDataProducer() as producer:
-            network = data.get('network', {})
-            segment_results = network.get('segmentResults', [])
-
-            for segment in segment_results:
+            network = data.get("network", {})
+            for segment in network.get("segmentResults", []):
                 message = {
-                    'job_id': job_id,
-                    'segment': segment,
-                    'job_name': data.get('jobName'),
-                    'date_ranges': data.get('dateRanges'),
-                    'time_sets': data.get('timeSets'),
+                    "job_id": job_id,
+                    "segment": segment,
+                    "job_name": data.get("jobName"),
+                    "date_ranges": data.get("dateRanges"),
+                    "time_sets": data.get("timeSets"),
                 }
-                key = str(segment.get('segmentId'))
-                producer.send_raw_data(message, key=key)
+                producer.send_raw_data(message, key=str(segment.get("segmentId")))
                 sent_count += 1
-
             producer.flush()
 
         label = f" (day {day_index}/{total_days})" if day_index and total_days else ""
-        self.logger.info(f"✅ Sent {sent_count} segments for job {job_id}{label}")
+        self.logger.info(f"  Sent {sent_count} segments for job {job_id}{label}")
         return sent_count
-    
+
+    # =========================================================================
+    # STAGE 2B — OSM Skeleton (MỚI)
+    # =========================================================================
+
+    def build_osm_skeleton(
+        self,
+        geometry: Dict,
+        output_name: str = "osm_graph",
+        force_rebuild: bool = False,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Stage 2b: Xây đồ thị OSM từ polygon geometry.
+
+        Chạy SONG SONG với Stage 2a (independent, không cần Kafka).
+        Kết quả lưu cache GraphML để không cần tải lại OSM mỗi lần chạy.
+
+        Args:
+            geometry     : GeoJSON Polygon (cùng format với TomTom collector).
+            output_name  : Tên NPZ output.
+            force_rebuild: Bỏ qua cache, tải lại từ OSM.
+
+        Returns:
+            Dict với node_ids, coordinates, edge_index, adjacency_matrix, ...
+        """
+        self.logger.info("=" * 60)
+        self.logger.info("STAGE 2b: BUILD OSM SKELETON GRAPH")
+        self.logger.info("=" * 60)
+
+        # Thử load từ NPZ cache trước
+        if not force_rebuild:
+            cached = OSMGraphBuilder.load_latest(output_name, config.data.processed_dir)
+            if cached is not None:
+                self.logger.info(
+                    f"✅ Loaded cached OSM graph: "
+                    f"{len(cached['osm_node_ids'])} nodes, "
+                    f"{cached['edge_index'].shape[1]} directed edges"
+                )
+                self._osm_graph_data = cached
+                return cached
+
+        self._osm_builder = OSMGraphBuilder(
+            output_dir=config.data.processed_dir,
+            cache_graph=True,
+        )
+
+        self._osm_graph_data = self._osm_builder.build_from_polygon(
+            polygon=geometry,
+            simplify=True,
+            retain_all=False,
+            output_name=output_name,
+        )
+
+        self.logger.info(
+            f"✅ Stage 2b complete: "
+            f"{len(self._osm_graph_data['osm_node_ids'])} OSM nodes, "
+            f"{self._osm_graph_data['edge_index'].shape[1] // 2} undirected edges"
+        )
+        return self._osm_graph_data
+
+    # =========================================================================
+    # STAGE 3 — Validation
+    # =========================================================================
+
     def run_validation_processing(self):
-        """
-        Stage 3: Validate và gửi vào traffic.validated
-        """
+        """Stage 3: Validate segments từ Kafka, gửi sang traffic.validated."""
         self.logger.info("=" * 60)
         self.logger.info("STAGE 3: VALIDATION PROCESSING")
         self.logger.info("=" * 60)
-        
+
         validated_count = 0
-        
+
         def validate_processor(key, value, topic, partition, offset):
             nonlocal validated_count
-            
             try:
-                segment = value.get('segment', {})
-                
+                segment = value.get("segment", {})
                 is_valid, errors = self.validator.validate_segment(segment)
                 if not is_valid:
-                    self.logger.warning(f"Invalid segment {key}: {errors}")
+                    self.logger.debug(f"Invalid segment {key}: {errors}")
                     return True
-                
-                time_results = segment.get('segmentTimeResults', [])
-                valid_time_results = []
-                
-                for time_result in time_results:
-                    is_valid, errors = self.validator.validate_time_result(time_result)
-                    if is_valid:
-                        valid_time_results.append(time_result)
-                
-                if not valid_time_results:
+
+                time_results = segment.get("segmentTimeResults", [])
+                valid_trs = [
+                    tr for tr in time_results
+                    if self.validator.validate_time_result(tr)[0]
+                ]
+
+                if not valid_trs:
                     return True
-                
-                value['segment']['segmentTimeResults'] = valid_time_results
-                
+
+                value["segment"]["segmentTimeResults"] = valid_trs
+
                 with TrafficDataProducer() as producer:
                     producer.send_validated_data(value, key=key)
-                
+
                 validated_count += 1
                 return True
-                
+
             except Exception as e:
-                self.logger.error(f"Error in validate_processor: {e}")
+                self.logger.error(f"validate_processor error: {e}")
                 return False
-        
+
         with RawDataConsumer() as consumer:
             consumer.consume(validate_processor, max_messages=None)
-        
-        self.logger.info(f"✅ Stage 3 complete: {validated_count} validated")
-    
+
+        self.logger.info(f"✅ Stage 3 complete: {validated_count} segments validated")
+
+    # =========================================================================
+    # STAGE 4 — Feature Extraction
+    # =========================================================================
+
     def run_feature_extraction(self):
-        """
-        Stage 4: Extract features và lưu NPZ
-        """
+        """Stage 4: Extract features (~28) từ validated data."""
         self.logger.info("=" * 60)
-        self.logger.info("STAGE 4: FEATURE EXTRACTION & NPZ STORAGE")
+        self.logger.info("STAGE 4: FEATURE EXTRACTION (v2 — ~28 features)")
         self.logger.info("=" * 60)
-        
+
         self.accumulated_data = []
         processed_count = 0
-        
+
         def feature_processor(key, value, topic, partition, offset):
             nonlocal processed_count
-            
             try:
-                segment = value.get('segment', {})
-                time_results = segment.get('segmentTimeResults', [])
+                segment = value.get("segment", {})
+                time_results = segment.get("segmentTimeResults", [])
 
-                time_sets_map = {}
-                for ts in value.get('time_sets', []):
-                    time_sets_map[ts.get('@id')] = ts.get('name')
+                time_sets_map = {
+                    ts.get("@id"): ts.get("name")
+                    for ts in value.get("time_sets", [])
+                }
+                date_ranges_map = {
+                    dr.get("@id"): dr.get("from")
+                    for dr in value.get("date_ranges", [])
+                }
 
-                date_ranges_map = {}
-                for dr in value.get('date_ranges', []):
-                    date_ranges_map[dr.get('@id')] = dr.get('from')
+                shape = segment.get("shape", [])
+                lats = [p.get("latitude", 0) for p in shape]
+                lons = [p.get("longitude", 0) for p in shape]
+                mean_lat = float(np.mean(lats)) if lats else None
+                mean_lon = float(np.mean(lons)) if lons else None
 
-                for time_result in time_results:
+                for tr in time_results:
                     record = {
-                        'segment_id': segment.get('segmentId'),
-                        'new_segment_id': segment.get('newSegmentId'),
-                        'street_name': segment.get('streetName'),
-                        'distance': segment.get('distance'),
-                        'frc': segment.get('frc'),
-                        'speed_limit': segment.get('speedLimit'),
-                        
-                        'time_set': time_sets_map.get(time_result.get('timeSet')),
-                        'date_from': date_ranges_map.get(time_result.get('dateRange')),
-                        
-                        'harmonic_average_speed': time_result.get('harmonicAverageSpeed'),
-                        'median_speed': time_result.get('medianSpeed'),
-                        'average_speed': time_result.get('averageSpeed'),
-                        'std_speed': time_result.get('standardDeviationSpeed'),
-                        
-                        'average_travel_time': time_result.get('averageTravelTime'),
-                        'median_travel_time': time_result.get('medianTravelTime'),
-                        'travel_time_std': time_result.get('travelTimeStandardDeviation'),
-                        'travel_time_ratio': time_result.get('travelTimeRatio'),
-                        
-                        'sample_size': time_result.get('sampleSize')
+                        "segment_id":              segment.get("segmentId"),
+                        "new_segment_id":           segment.get("newSegmentId"),
+                        "street_name":              segment.get("streetName"),
+                        "distance":                 segment.get("distance"),
+                        "frc":                      segment.get("frc"),
+                        "speed_limit":              segment.get("speedLimit"),
+                        "time_set":                 time_sets_map.get(tr.get("timeSet")),
+                        "date_from":                date_ranges_map.get(tr.get("dateRange")),
+                        "harmonic_average_speed":   tr.get("harmonicAverageSpeed"),
+                        "median_speed":             tr.get("medianSpeed"),
+                        "average_speed":            tr.get("averageSpeed"),
+                        "std_speed":                tr.get("standardDeviationSpeed"),
+                        "average_travel_time":      tr.get("averageTravelTime"),
+                        "median_travel_time":       tr.get("medianTravelTime"),
+                        "travel_time_std":          tr.get("travelTimeStandardDeviation"),
+                        "travel_time_ratio":        tr.get("travelTimeRatio"),
+                        "sample_size":              tr.get("sampleSize"),
+                        # Raw coordinates (KHÔNG normalize ở đây)
+                        "raw_latitude":             mean_lat,
+                        "raw_longitude":            mean_lon,
                     }
-                    
-                    shape = segment.get('shape', [])
-                    if shape:
-                        record['latitude'] = shape[0].get('latitude')
-                        record['longitude'] = shape[0].get('longitude')
-                    
                     self.accumulated_data.append(record)
-                
+
                 if len(self.accumulated_data) >= self.batch_size:
                     self._process_and_save_batch()
                     processed_count += len(self.accumulated_data)
                     self.accumulated_data.clear()
-                
+
                 return True
-                
+
             except Exception as e:
-                self.logger.error(f"Error in feature_processor: {e}")
+                self.logger.error(f"feature_processor error: {e}")
                 return False
-        
+
         with ValidatedDataConsumer() as consumer:
             consumer.consume(feature_processor, max_messages=None)
-        
+
         if self.accumulated_data:
             self._process_and_save_batch()
             processed_count += len(self.accumulated_data)
-        
-        self.logger.info(f"✅ Stage 4 complete: {processed_count} records processed")
-    
+
+        self.logger.info(
+            f"✅ Stage 4 complete: {processed_count} records processed"
+        )
+
     def _process_and_save_batch(self):
         """
-        Xử lý và lưu batch vào NPZ — KHÔNG normalize ở đây.
+        Clean + Extract features + Save batch vào NPZ.
 
-        Normalization (StandardScaler) được dời sang export_for_model_training()
-        để scaler được fit MỘT LẦN DUY NHẤT trên toàn bộ tập train, sau đó
-        transform val/test với cùng scaler đó. Việc gọi fit_transform() trên
-        từng batch 10k record sẽ tạo ra mean/std khác nhau giữa các batch,
-        khiến data_3d không nhất quán và gradient hỗn loạn khi train.
-
-        FIX còn lại: luôn lưu tọa độ gốc vào `raw_latitude/raw_longitude`
-        để graph builder không dùng nhầm lat/lon đã MinMax-normalize.
+        Normalization được DEFER sang export_for_model_training()
+        để StandardScaler được fit một lần trên toàn bộ train set.
         """
         if not self.accumulated_data:
             return
@@ -323,780 +347,587 @@ class TrafficDataPipelineNPZ:
 
         # 1. Clean
         df = self.cleaner.clean(df)
+        if df.empty:
+            self.logger.warning("Batch empty after cleaning, skipping.")
+            return
 
-        # ===== Preserve metadata + raw coordinates TRƯỚC KHI transform =====
-        metadata_cols = ['time_set', 'date_from', 'latitude', 'longitude']
-        preserved_data = {}
-        for col in metadata_cols:
-            if col in df.columns:
-                preserved_data[col] = df[col].copy()
-
-        # 2. Extract features
+        # 2. Extract features (v2 — ~28 features)
         df = self.feature_extractor.extract_all_features(df)
 
-        # 3. Encode categorical
-        df = self.categorical_encoder.fit_transform(df)
-
-        # 4. Process spatial (normalize=True biến lat/lon → [0,1])
-        df = self.spatial_processor.fit_transform(df)
-
-        # 5. KHÔNG gọi self.normalizer.fit_transform() ở đây.
-        #    StandardScaler sẽ được fit đúng cách trong export_for_model_training().
-
-        # ===== Restore metadata AFTER processing =====
-        for col in ['time_set', 'date_from']:
-            if col in preserved_data:
-                df[col] = preserved_data[col]
-
-        # ===== Store RAW coordinates in dedicated columns =====
-        if 'latitude' in preserved_data:
-            df['raw_latitude'] = preserved_data['latitude']
-        if 'longitude' in preserved_data:
-            df['raw_longitude'] = preserved_data['longitude']
-
-        # 6. Save to NPZ (raw — chưa normalize feature số)
+        # 3. Save (raw — chưa normalize)
         self.npz_writer.write_features(df)
 
-        self.logger.info(f"Processed and saved batch of {len(df)} records (normalization deferred)")
+        self.logger.info(
+            f"  Saved batch: {len(df)} records, {len(df.columns)} columns"
+        )
+
+    # =========================================================================
+    # STAGE 5 — Export for Model Training
+    # =========================================================================
 
     def export_for_model_training(
         self,
-        output_name: str = None,
+        output_name: Optional[str] = None,
         sequence_length: int = 12,
         prediction_horizon: int = 12,
         normalize: bool = True,
     ):
         """
-        Stage 5: Export data với ĐÚNG SHAPE 4D cho T-GCN.
+        Stage 5: Tạo sliding-window dataset cho T-GCN / DTC-STGCN.
 
-        FIX NORMALIZATION:
-        - StandardScaler được fit MỘT LẦN trên X_train (sau khi split).
-        - X_val, X_test, y_train, y_val, y_test đều dùng cùng scaler đó để transform.
-        - Scaler được lưu kèm vào NPZ dưới dạng mean/scale arrays để có thể
-          inverse-transform kết quả dự đoán sau này.
-        - Đặt normalize=False nếu data đã được scale đúng từ trước.
+        Sử dụng StandardScaler fit trên train set.
+        Output shape: X [N_samples, seq_len, N_nodes, N_features].
+
+        Normalization strategy (tối ưu):
+            - NORMALIZE_COLS     → StandardScaler (fit trên train)
+            - MINMAX_COLS        → MinMaxScaler (fit trên train)
+            - Cyclic, binary     → không normalize
         """
-        from datetime import datetime
-        import re
-        from sklearn.preprocessing import StandardScaler
-
         self.logger.info("=" * 60)
         self.logger.info("STAGE 5: EXPORT FOR MODEL TRAINING")
         self.logger.info("=" * 60)
 
         df = self.npz_reader.read_features()
-
         if df is None or df.empty:
             self.logger.error("No features found to export")
             return
 
-        self.logger.info(f"Loaded {len(df)} records")
+        self.logger.info(f"Loaded {len(df)} records, {len(df.columns)} columns")
 
-        if 'time_set' not in df.columns:
-            self.logger.error("❌ Missing 'time_set' column!")
-            self.logger.info(f"Available columns: {df.columns.tolist()}")
+        # ── Parse timestamps ─────────────────────────────────────────────────
+        df = self._parse_timestamps(df)
+        if df is None or df.empty:
             return
 
-        date_col = None
-        if 'date_from' in df.columns:
-            date_col = 'date_from'
-        elif 'date_range' in df.columns:
-            date_col = 'date_range'
-        else:
-            self.logger.error("❌ Missing date column! Need 'date_from' or 'date_range'")
-            self.logger.info(f"Available columns: {df.columns.tolist()}")
-            return
-
-        self.logger.info(f"Using date column: {date_col}")
-
-        def extract_date(date_str):
-            date_str = str(date_str)
-            if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
-                return date_str
-            match = re.search(r'\d{4}-\d{2}-\d{2}', date_str)
-            return match.group(0) if match else None
-
-        def extract_slot_index(time_str):
-            match = re.search(r'Slot_(\d{4})', str(time_str))
-            if match:
-                time_code = match.group(1)
-                hour = int(time_code[:2])
-                minute = int(time_code[2:])
-                if 7 <= hour < 10:
-                    return (hour - 7) * 4 + minute // 15
-                elif 15 <= hour < 18:
-                    return 12 + (hour - 15) * 4 + minute // 15
-            return None
-
-        df['date'] = df[date_col].apply(extract_date)
-        df['slot_index'] = df['time_set'].apply(extract_slot_index)
-
-        self.logger.info(f"Sample dates: {df['date'].head(3).tolist()}")
-        self.logger.info(f"Sample time_sets: {df['time_set'].head(3).tolist()}")
-        self.logger.info(f"Sample slot_indices: {df['slot_index'].head(3).tolist()}")
-
-        df = df.dropna(subset=['date', 'slot_index'])
-        df['slot_index'] = df['slot_index'].astype(int)
-
-        self.logger.info(f"After cleaning: {len(df)} records remain")
-
-        unique_dates = sorted(df['date'].unique())
-        num_days = len(unique_dates)
-
-        if num_days == 0:
-            self.logger.error("❌ No valid dates found!")
-            return
-
-        self.logger.info(f"Found {num_days} days: {unique_dates[0]} to {unique_dates[-1]}")
-
-        date_to_idx = {date: idx for idx, date in enumerate(unique_dates)}
-        df['day_index'] = df['date'].map(date_to_idx)
-        df['global_timestamp'] = df['day_index'] * 24 + df['slot_index']
-        df = df.sort_values(['segment_id', 'global_timestamp']).reset_index(drop=True)
-
-        self.logger.info(
-            f"Global timestamps range: {df['global_timestamp'].min()} - {df['global_timestamp'].max()}"
-        )
-
-        all_segment_ids = sorted(df['segment_id'].unique())
-        self.logger.info(f"Found {len(all_segment_ids)} segments before filtering for completeness")
-
-        exclude_patterns = [
-            'segment_id', 'new_segment_id', 'street_name',
-            'date_range', 'time_set', 'date', 'slot_index', 'day_index', 'global_timestamp',
-            'latitude', 'longitude',
-            'raw_latitude', 'raw_longitude',
-            'grid_lat', 'grid_lon', 'grid_cell',
-            'congestion_level', 'distance_category',
-            'frc_encoded', 'time_set_encoded', 'frc_level',
-        ]
-
+        # ── Select feature columns ────────────────────────────────────────────
         feature_cols = [
-            col for col in df.columns
-            if col not in exclude_patterns
+            col for col in FINAL_FEATURE_COLS
+            if col in df.columns
             and pd.api.types.is_numeric_dtype(df[col])
-            and not df[col].isnull().all()
             and df[col].nunique() > 1
         ]
 
-        num_features = len(feature_cols)
-        self.logger.info(f"Selected {num_features} features: {feature_cols[:10]}")
-
-        if num_features == 0:
-            self.logger.error("❌ No features!")
+        if not feature_cols:
+            self.logger.error("No valid feature columns found.")
             return
 
-        timesteps_per_seg = df.groupby('segment_id')['global_timestamp'].count().to_dict()
-        min_ts = min(timesteps_per_seg.values())
-        max_ts = max(timesteps_per_seg.values())
-        expected_ts = num_days * 24
+        self.logger.info(f"Feature columns ({len(feature_cols)}): {feature_cols}")
 
-        self.logger.info(f"Timesteps: min={min_ts}, max={max_ts}, expected={expected_ts}")
-
-        full_data_segs = [s for s, c in timesteps_per_seg.items() if c == expected_ts]
-        self.logger.info(
-            f"Segments with full {expected_ts} timesteps: {len(full_data_segs)}/{len(timesteps_per_seg)}"
+        # ── Build 3D tensor [T, N, F] ─────────────────────────────────────────
+        data_3d, segment_ids, num_timesteps = self._build_3d_tensor(
+            df, feature_cols, sequence_length + prediction_horizon
         )
+        if data_3d is None:
+            return
 
-        min_needed = sequence_length + prediction_horizon
+        num_nodes, num_features = data_3d.shape[1], data_3d.shape[2]
 
-        if full_data_segs:
-            selected_segs = full_data_segs
-            num_timesteps = expected_ts
-            self.logger.info(
-                f"Using {len(selected_segs)} segments with FULL {num_timesteps} timesteps "
-                f"({num_days} days × 24 slots)"
-            )
-        else:
-            candidate_segs = [s for s, c in timesteps_per_seg.items() if c >= min_needed]
-            if not candidate_segs:
-                self.logger.error(
-                    f"❌ Not enough timesteps in ANY segment: "
-                    f"max available = {max_ts}, need at least {min_needed}"
-                )
-                return
-            selected_segs = candidate_segs
-            num_timesteps = min(timesteps_per_seg[s] for s in selected_segs)
-            self.logger.info(
-                f"Using {len(selected_segs)} segments with at least {num_timesteps} timesteps"
-            )
+        # ── Sliding window ────────────────────────────────────────────────────
+        X, y = self._create_sliding_windows(data_3d, sequence_length, prediction_horizon)
 
-        segment_ids = sorted(selected_segs)
-        num_nodes = len(segment_ids)
-        self.logger.info(f"Final selected segments: {num_nodes}")
-
-        self.logger.info(f"Creating 3D tensor: ({num_timesteps}, {num_nodes}, {num_features})")
-
-        data_3d = np.zeros((num_timesteps, num_nodes, num_features), dtype=np.float32)
-
-        for node_idx, seg_id in enumerate(segment_ids):
-            seg_df = df[df['segment_id'] == seg_id].sort_values('global_timestamp')
-            seg_data = seg_df[feature_cols].values.astype(np.float32)
-
-            if len(seg_data) > num_timesteps:
-                seg_data = seg_data[:num_timesteps]
-            elif len(seg_data) < num_timesteps:
-                if len(seg_data) > 0:
-                    pad = np.repeat([seg_data[-1]], num_timesteps - len(seg_data), axis=0)
-                    seg_data = np.vstack([seg_data, pad])
-                else:
-                    seg_data = np.zeros((num_timesteps, num_features), dtype=np.float32)
-
-            seg_data = np.nan_to_num(seg_data, nan=0.0, posinf=0.0, neginf=0.0)
-            data_3d[:, node_idx, :] = seg_data
-
-        self.logger.info(f"✓ 3D tensor built: {data_3d.shape}")
-
-        # ── Sliding window ──────────────────────────────────────────────────────
-        sequences, targets = [], []
-        max_start = num_timesteps - sequence_length - prediction_horizon + 1
-
-        self.logger.info(f"Creating {max_start} sliding window samples")
-
-        for i in range(max_start):
-            sequences.append(data_3d[i : i + sequence_length])
-            targets.append(data_3d[i + sequence_length : i + sequence_length + prediction_horizon])
-
-        X = np.array(sequences, dtype=np.float32)  # (N, seq_len, nodes, features)
-        y = np.array(targets, dtype=np.float32)    # (N, pred_len, nodes, features)
-
-        self.logger.info(f"✓ X: {X.shape}, y: {y.shape}")
-        assert X.ndim == 4 and y.ndim == 4
-
-        # ── Train / Val / Test split (temporal, NO shuffle) ─────────────────────
+        # ── Train / Val / Test split (temporal, NO shuffle) ───────────────────
         n = len(X)
-        train_size = max(1, int(0.7 * n))
-        val_size   = max(1, int(0.15 * n))
+        train_end = max(1, int(0.7 * n))
+        val_end = train_end + max(1, int(0.15 * n))
 
-        X_train, y_train = X[:train_size],                       y[:train_size]
-        X_val,   y_val   = X[train_size:train_size + val_size],  y[train_size:train_size + val_size]
-        X_test,  y_test  = X[train_size + val_size:],            y[train_size + val_size:]
+        X_train, y_train = X[:train_end], y[:train_end]
+        X_val, y_val = X[train_end:val_end], y[train_end:val_end]
+        X_test, y_test = X[val_end:], y[val_end:]
 
         self.logger.info(
-            f"Split → Train: {X_train.shape[0]}, Val: {X_val.shape[0]}, Test: {X_test.shape[0]}"
+            f"Split → Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}"
         )
 
-        # ── Normalization (FIT scaler trên train; transform hoặc để loader làm) ─
-        # Luôn fit scaler trên X_train và lưu mean/scale vào NPZ (để loader có thể
-        # normalize khi load nếu export raw, và để inverse-transform sau này).
-        n_tr, sl, nd, nf = X_train.shape
-        X_tr_2d = X_train.reshape(-1, nf)
-        scaler = StandardScaler()
-        scaler.fit(X_tr_2d)
-        scaler_mean  = scaler.mean_.astype(np.float32)
-        scaler_scale = scaler.scale_.astype(np.float32)
+        # ── Normalization ─────────────────────────────────────────────────────
+        scaler_params = self._fit_and_normalize(
+            X_train, X_val, X_test, y_train, y_val, y_test,
+            feature_cols, normalize
+        )
+        X_train, y_train = scaler_params.pop("X_train"), scaler_params.pop("y_train")
+        X_val, y_val = scaler_params.pop("X_val"), scaler_params.pop("y_val")
+        X_test, y_test = scaler_params.pop("X_test"), scaler_params.pop("y_test")
 
-        if normalize:
-            self.logger.info("Normalizing with StandardScaler (fit on train only)...")
-            def _apply(arr):
-                s0, s1, s2, s3 = arr.shape
-                return scaler.transform(arr.reshape(-1, s3)).reshape(s0, s1, s2, s3).astype(np.float32)
-            X_train = _apply(X_train)
-            X_val   = _apply(X_val)
-            X_test  = _apply(X_test)
-            y_train = _apply(y_train)
-            y_val   = _apply(y_val)
-            y_test  = _apply(y_test)
-            self.logger.info(
-                f"✓ Normalization done. "
-                f"Feature mean range: [{scaler_mean.min():.4f}, {scaler_mean.max():.4f}], "
-                f"scale range: [{scaler_scale.min():.4f}, {scaler_scale.max():.4f}]"
-            )
-        else:
-            self.logger.info(
-                "Exporting raw data (normalize=False). Scaler saved; loader will normalize when prepare_for_training(normalize=True)."
-            )
-
-        # ── Save ────────────────────────────────────────────────────────────────
+        # ── Save ──────────────────────────────────────────────────────────────
         if output_name is None:
             output_name = f"model_ready_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+        unique_dates = sorted(df["date"].unique()) if "date" in df.columns else []
+
         data_dict = {
-            'X_train': X_train, 'y_train': y_train,
-            'X_val':   X_val,   'y_val':   y_val,
-            'X_test':  X_test,  'y_test':  y_test,
-            'segment_ids':  np.array(segment_ids),
-            'feature_names': np.array(feature_cols),
+            "X_train": X_train, "y_train": y_train,
+            "X_val":   X_val,   "y_val":   y_val,
+            "X_test":  X_test,  "y_test":  y_test,
+            "segment_ids":   np.array(segment_ids),
+            "feature_names": np.array(feature_cols),
+            **scaler_params,
         }
 
-        # Luôn lưu scaler params (để loader normalize khi data gốc, và inverse-transform)
-        data_dict['scaler_mean']  = scaler_mean
-        data_dict['scaler_scale'] = scaler_scale
-
         metadata = {
-            'sequence_length':    sequence_length,
-            'prediction_horizon': prediction_horizon,
-            'num_features':       num_features,
-            'num_nodes':          num_nodes,
-            'num_timesteps':      num_timesteps,
-            'num_days':           num_days,
-            'expected_timesteps': expected_ts,
-            'train_size':         len(X_train),
-            'val_size':           len(X_val),
-            'test_size':          len(X_test),
-            'normalized':         normalize,
-            'date_range':         f"{unique_dates[0]} to {unique_dates[-1]}",
+            "sequence_length":    sequence_length,
+            "prediction_horizon": prediction_horizon,
+            "num_features":       num_features,
+            "num_nodes":          num_nodes,
+            "num_timesteps":      num_timesteps,
+            "train_size":         len(X_train),
+            "val_size":           len(X_val),
+            "test_size":          len(X_test),
+            "normalized":         normalize,
+            "date_range":         f"{unique_dates[0]} to {unique_dates[-1]}" if unique_dates else "",
+            "feature_cols":       feature_cols,
         }
 
         self.npz_writer.write_batch(data_dict, output_name, metadata)
 
-        self.logger.info(f"✅ Saved: {output_name}")
-        self.logger.info(f"   Train: {X_train.shape} | Val: {X_val.shape} | Test: {X_test.shape}")
-        self.logger.info(f"   Date range: {unique_dates[0]} → {unique_dates[-1]} ({num_days} days)")
-        self.logger.info("   Scaler params (mean, scale) saved for normalize/inverse_transform.")
-
-    @staticmethod
-    def _haversine_distance(lat1, lon1, lat2, lon2) -> float:
-        """Tính khoảng cách Haversine (km). Yêu cầu tọa độ thực (degrees)."""
-        R = 6371.0
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
-        return R * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
-
-    @staticmethod
-    def _bearing(lat1, lon1, lat2, lon2) -> float:
-        """
-        Tính bearing (góc hướng) từ điểm 1 → điểm 2, đơn vị độ [0, 360).
-        Dùng để kiểm tra 2 nodes có cùng hướng đường hay không.
-        """
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-        dlon = lon2 - lon1
-        x = np.sin(dlon) * np.cos(lat2)
-        y = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
-        return (np.degrees(np.arctan2(x, y)) + 360) % 360
-
-    @staticmethod
-    def _bearing_diff(b1: float, b2: float) -> float:
-        """
-        Góc lệch nhỏ nhất giữa 2 bearing, tính cả chiều ngược (0–90°).
-        Ví dụ: bearing 10° và 190° → diff = 0° (cùng trục đường, 2 chiều).
-        """
-        diff = abs(b1 - b2) % 360
-        if diff > 180:
-            diff = 360 - diff
-        # Đường 2 chiều: bearing ngược nhau (diff ≈ 180°) vẫn là cùng đường
-        return min(diff, 180 - diff) if diff > 90 else diff
-
-# =========================================================================
-    # STATIC HELPERS
-    # =========================================================================
-
-    @staticmethod
-    def _haversine_distance(lat1, lon1, lat2, lon2) -> float:
-        """Haversine distance in km."""
-        R = 6371.0
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-        dlat, dlon = lat2 - lat1, lon2 - lon1
-        a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-        return R * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
-
-    @staticmethod
-    def _bearing(lat1, lon1, lat2, lon2) -> float:
-        """Forward bearing from point-1 → point-2, degrees [0, 360)."""
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-        dlon = lon2 - lon1
-        x = np.sin(dlon) * np.cos(lat2)
-        y = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dlon)
-        return (np.degrees(np.arctan2(x, y)) + 360) % 360
-
-    @staticmethod
-    def _bearing_diff(b1: float, b2: float) -> float:
-        """
-        Smallest angular difference accounting for bidirectionality (0–90°).
-        e.g. 10° vs 190° → 0° (same road axis, opposite directions).
-        """
-        diff = abs(b1 - b2) % 360
-        if diff > 180:
-            diff = 360 - diff
-        return min(diff, abs(180 - diff))
-
-    @staticmethod
-    def _project_onto_axis(
-        lat_i, lon_i,   # reference node (origin of road axis)
-        lat_j, lon_j,   # candidate node
-        axis_bearing: float,  # road axis bearing in degrees
-    ) -> tuple[float, float]:
-        """
-        Project vector i→j onto the road axis and its perpendicular.
-        Returns (along_road_km, cross_road_km).
-
-        Uses a local flat-earth approximation (valid for < 1 km distances).
-        """
-        R = 6371.0
-        dlat = np.radians(lat_j - lat_i)
-        dlon = np.radians(lon_j - lon_i)
-        avg_lat = np.radians((lat_i + lat_j) / 2)
-
-        dy = R * dlat            # north component km
-        dx = R * dlon * np.cos(avg_lat)  # east component km
-
-        # Road unit vector (axis_bearing measured clockwise from north)
-        axis_rad = np.radians(axis_bearing)
-        ux = np.sin(axis_rad)   # east component of road unit vector
-        uy = np.cos(axis_rad)   # north component
-
-        along = dx * ux + dy * uy    # projection along road
-        cross = abs(dx * uy - dy * ux)  # perpendicular distance (always positive)
-        return along, cross
+        self.logger.info(f"✅ Stage 5 complete: {output_name}")
+        self.logger.info(
+            f"   X_train: {X_train.shape} | X_val: {X_val.shape} | X_test: {X_test.shape}"
+        )
 
     # =========================================================================
-    # MAIN METHOD
+    # STAGE 6 — Map Matching (MỚI — thay thế build_graph_structure)
     # =========================================================================
 
-    def build_graph_structure(
+    def build_graph_with_map_matching(
         self,
-        distance_threshold: float = 0.2,   # max straight-line dist km (~120 m)
-        min_distance: float = 0.01,         # min dist km (~8 m) — skip same-detector
-        max_neighbors: int = 6,              # only connect nearest 2 along-road neighbors
-        bearing_threshold: float = 20.0,     # max bearing deviation (degrees)
-        cross_road_max_km: float = 0.015,    # max perpendicular offset km (~15 m)
-        use_street_name: bool = True,        # enforce same street_name when available
-        output_name: str = 'graph_structure',
+        geometry: Dict,
+        osm_output_name: str = "osm_graph",
+        graph_output_name: str = "graph_structure",
+        match_threshold_m: float = 50.0,
+        force_rebuild_osm: bool = False,
     ):
         """
-        Stage 6 v3 — Chain-based sequential graph construction.
+        Stage 6: Map-match TomTom features → OSM graph → graph_structure.npz.
 
-        Key improvements over v2:
-        ─────────────────────────
-        1. **Cross-road filter**: After bearing check, compute the perpendicular
-           component of i→j. If it exceeds `cross_road_max_km` the nodes are on
-           parallel / adjacent roads and the edge is rejected.  This is the main
-           fix for roundabout cliques and diagonal cross-street edges.
+        Thay thế hoàn toàn build_graph_structure() cũ (dùng distance_threshold).
 
-        2. **Sequential chain (max_neighbors=2)**: Each node connects only to its
-           1 or 2 nearest neighbours along the road axis (not 4–8 arbitrary ones).
-           This naturally produces a chain topology along each road.
-
-        3. **Tighter defaults**: distance_threshold 0.15→0.12 km, bearing 25→20°.
-
-        Parameters
-        ----------
-        distance_threshold : float
-            Maximum straight-line distance (km) to consider an edge candidate.
-        min_distance : float
-            Minimum distance (km); closer nodes treated as duplicates.
-        max_neighbors : int
-            Maximum along-road neighbours per node (recommended: 2).
-        bearing_threshold : float
-            Maximum deviation (°) between candidate bearing and road axis.
-        cross_road_max_km : float
-            Maximum perpendicular offset (km) allowed before rejecting edge.
-        use_street_name : bool
-            When True, nodes with matching street_name skip bearing/cross checks
-            (they are definitely on the same road). Nodes with *different* names
-            are rejected outright (cross-road).
-        output_name : str
-            Output NPZ file name.
+        Args:
+            geometry           : GeoJSON Polygon (cùng geometry với TomTom).
+            osm_output_name    : Tên NPZ của OSM graph.
+            graph_output_name  : Tên NPZ của matched graph output.
+            match_threshold_m  : Ngưỡng khoảng cách match (m). Mặc định 50m.
+            force_rebuild_osm  : Rebuild OSM graph dù có cache.
         """
         self.logger.info("=" * 60)
-        self.logger.info("STAGE 6: BUILD GRAPH STRUCTURE v3 (chain + cross-road filter)")
+        self.logger.info("STAGE 6: MAP MATCHING — TomTom → OSM Graph")
         self.logger.info("=" * 60)
 
-        df = self.npz_reader.read_features()
-        if df is None or df.empty:
-            self.logger.error("No features found")
-            return
-
-        # ── Select coordinate columns ──────────────────────────────────────────
-        lat_col, lon_col = None, None
-        if 'raw_latitude' in df.columns and 'raw_longitude' in df.columns:
-            lat_col, lon_col = 'raw_latitude', 'raw_longitude'
-        elif 'latitude' in df.columns and 'longitude' in df.columns:
-            lat_col, lon_col = 'latitude', 'longitude'
-        else:
-            self.logger.error("Coordinates not found")
-            return
-
-        # ── Build per-segment lookup ───────────────────────────────────────────
-        extra_cols = [lat_col, lon_col, 'segment_id']
-        if use_street_name and 'street_name' in df.columns:
-            extra_cols.append('street_name')
-
-        coords_df = df[extra_cols].dropna(subset=[lat_col, lon_col, 'segment_id'])
-
-        # Drop normalized [0,1] coords from stale batches
-        norm_mask = (
-            coords_df[lat_col].between(-0.01, 1.01) &
-            coords_df[lon_col].between(-0.01, 1.01)
+        # 6.1 Load hoặc build OSM skeleton
+        osm_graph_data = self.build_osm_skeleton(
+            geometry=geometry,
+            output_name=osm_output_name,
+            force_rebuild=force_rebuild_osm,
         )
-        if norm_mask.any():
-            self.logger.warning(f"⚠️  {int(norm_mask.sum())} rows with normalized coords dropped")
-            coords_df = coords_df.loc[~norm_mask].copy()
 
-        if coords_df.empty:
-            self.logger.error("No valid degree-like coordinates after filtering")
+        if not osm_graph_data:
+            self.logger.error("OSM graph không có. Dừng Stage 6.")
             return
 
-        agg = {lat_col: 'first', lon_col: 'first'}
-        if 'street_name' in coords_df.columns:
-            agg['street_name'] = lambda x: x.dropna().iloc[0] if not x.dropna().empty else None
+        # 6.2 Load OSM NetworkX graph (để dùng ox.nearest_edges)
+        try:
+            import osmnx as ox
+            coords = osm_graph_data["coordinates"]
+            osm_node_ids = osm_graph_data["osm_node_ids"]
+            edge_index = osm_graph_data["edge_index"]
 
-        seg_info     = coords_df.groupby('segment_id').agg(agg).reset_index()
-        segment_ids  = seg_info['segment_id'].values
-        coords       = seg_info[[lat_col, lon_col]].values
-        street_names = (
-            seg_info['street_name'].values
-            if 'street_name' in seg_info.columns
-            else np.full(len(segment_ids), None)
-        )
-        num_nodes = len(segment_ids)
+            # Re-build NetworkX graph từ arrays (lightweight, không cần re-download OSM)
+            G_nx = self._rebuild_nx_graph(osm_graph_data)
 
-        # Sanity check
-        lat_min, lat_max = float(coords[:, 0].min()), float(coords[:, 0].max())
-        lon_min, lon_max = float(coords[:, 1].min()), float(coords[:, 1].max())
-        in_vietnam = (5.0 <= lat_min <= 25.0 and 90.0 <= lon_min <= 130.0)
-        if not in_vietnam:
-            self.logger.warning(
-                f"⚠️  Coords not degree-like: lat=[{lat_min:.4f},{lat_max:.4f}], "
-                f"lon=[{lon_min:.4f},{lon_max:.4f}]"
-            )
-        else:
-            self.logger.info(
-                f"Coord range: lat=[{lat_min:.4f},{lat_max:.4f}], "
-                f"lon=[{lon_min:.4f},{lon_max:.4f}] | nodes={num_nodes}"
-            )
+        except ImportError:
+            self.logger.error("osmnx chưa cài. Cài: pip install osmnx")
+            return
+
+        # 6.3 Load TomTom features
+        traffic_df = self.npz_reader.read_features()
+        if traffic_df is None or traffic_df.empty:
+            self.logger.error("No traffic features. Chạy Stage 4 trước.")
+            return
 
         self.logger.info(
-            f"Params: dist=[{min_distance},{distance_threshold}] km, "
-            f"max_neighbors={max_neighbors}, bearing≤{bearing_threshold}°, "
-            f"cross_road≤{cross_road_max_km*1000:.0f}m, street_name={use_street_name}"
+            f"Traffic data: {len(traffic_df)} records, "
+            f"{traffic_df['segment_id'].nunique()} segments"
         )
 
-        # ── Edge building ──────────────────────────────────────────────────────
-        #
-        # For each node i:
-        #   1. Collect candidates j within [min_distance, distance_threshold].
-        #   2. Determine road axis from 3 nearest candidates (circular mean bearing).
-        #   3. For each candidate j:
-        #        a. If use_street_name and BOTH names known:
-        #             - same name  → accept (skip bearing/cross checks)
-        #             - diff name  → reject
-        #        b. Bearing check: bearing(i→j) must be within bearing_threshold
-        #           of road axis (bidirectional).
-        #        c. Cross-road check: perpendicular offset of j from road axis
-        #           must be ≤ cross_road_max_km.
-        #   4. Sort surviving candidates by ALONG-ROAD distance; keep max_neighbors.
+        # 6.4 Map matching — tạo temporal features [N, T, F]
+        matcher = TomTomOSMMapMatcher(
+            osm_graph_data=osm_graph_data,
+            match_threshold_m=match_threshold_m,
+        )
 
-        neighbor_sets: list[set] = [set() for _ in range(num_nodes)]
-        cnt_name_rej    = 0
-        cnt_bearing_rej = 0
-        cnt_cross_rej   = 0
+        graph_output_dir = config.data.processed_dir / graph_output_name
 
-        for i in range(num_nodes):
-            lat_i, lon_i = coords[i, 0], coords[i, 1]
-            name_i       = street_names[i]
+        result = matcher.match_and_build_temporal_features(
+            traffic_df=traffic_df,
+            osm_networkx_graph=G_nx,
+            output_name=graph_output_name,
+            output_dir=graph_output_dir,
+        )
 
-            # Step 1 — distance filter
-            raw_candidates: list[tuple[float, int, float]] = []  # (dist, j, bearing)
-            for j in range(num_nodes):
-                if i == j:
-                    continue
-                dist = self._haversine_distance(lat_i, lon_i, coords[j, 0], coords[j, 1])
-                if min_distance <= dist <= distance_threshold:
-                    b = self._bearing(lat_i, lon_i, coords[j, 0], coords[j, 1])
-                    raw_candidates.append((dist, j, b))
+        if not result:
+            self.logger.error("Map matching failed.")
+            return
 
-            if not raw_candidates:
+        N = len(osm_graph_data["osm_node_ids"])
+        E = osm_graph_data["edge_index"].shape[1]
+        temporal_shape = result.get("node_features_temporal", np.array([])).shape
+
+        self.logger.info("✅ Stage 6 complete — Map-matched graph structure built")
+        self.logger.info(f"   OSM Nodes: {N} | Directed Edges: {E}")
+        self.logger.info(f"   Temporal features shape: {temporal_shape}")
+        self.logger.info(
+            f"   Topology: OSM road network (không còn distance_threshold hack)"
+        )
+
+    # INTERNAL HELPERS
+    def _parse_timestamps(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """
+        Parse date + time_set → global_timestamp.
+        """
+        if "time_set" not in df.columns:
+            self.logger.error("Missing 'time_set' column")
+            return None
+
+        date_col = "date_from" if "date_from" in df.columns else "date_range"
+        if date_col not in df.columns:
+            self.logger.error("Missing date column (date_from / date_range)")
+            return None
+
+        def extract_date(s):
+            s = str(s)
+            if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+                return s
+            m = re.search(r"\d{4}-\d{2}-\d{2}", s)
+            return m.group(0) if m else None
+
+        def extract_slot_info(ts):
+            """
+            Trả về (slot_index, block_id):
+                slot_index: 0-11 cho sáng (07:00-09:45), 12-23 cho chiều (15:00-17:45)
+                block_id  : 0 = sáng, 1 = chiều
+            """
+            m = re.search(r"Slot_(\d{4})", str(ts))
+            if m:
+                code = m.group(1)
+                h, mn = int(code[:2]), int(code[2:])
+                if 7 <= h < 10:
+                    return (h - 7) * 4 + mn // 15, 0   # block sáng
+                elif 15 <= h < 18:
+                    return 12 + (h - 15) * 4 + mn // 15, 1  # block chiều
+            return None, None
+
+        df["date"] = df[date_col].apply(extract_date)
+        slot_info = df["time_set"].apply(extract_slot_info)
+        df["slot_index"] = slot_info.apply(lambda x: x[0])
+        df["block_id"]   = slot_info.apply(lambda x: x[1])
+
+        df = df.dropna(subset=["date", "slot_index"])
+        df["slot_index"] = df["slot_index"].astype(int)
+        df["block_id"]   = df["block_id"].astype(int)
+
+        unique_dates = sorted(df["date"].unique())
+        if not unique_dates:
+            self.logger.error("No valid dates found.")
+            return None
+
+        date_to_idx = {d: i for i, d in enumerate(unique_dates)}
+        df["day_index"] = df["date"].map(date_to_idx)
+
+        # SLOTS_PER_DAY = 24 (12 sáng + 12 chiều)
+        SLOTS_PER_DAY = 24
+        df["global_timestamp"] = df["day_index"] * SLOTS_PER_DAY + df["slot_index"]
+
+        df = df.sort_values(["segment_id", "global_timestamp"]).reset_index(drop=True)
+
+        self.logger.info(
+            f"Timestamps: {len(unique_dates)} days, "
+            f"range {unique_dates[0]} → {unique_dates[-1]}, "
+            f"blocks: sáng (slot 0-11) / chiều (slot 12-23)"
+        )
+        return df
+
+    def _build_3d_tensor(
+        self,
+        df: pd.DataFrame,
+        feature_cols: List[str],
+        min_timesteps: int,
+    ):
+        """Build 3D tensor [T, N, F] từ DataFrame."""
+        all_segs = sorted(df["segment_id"].unique())
+        ts_counts = df.groupby("segment_id")["global_timestamp"].count()
+        num_days = df["date"].nunique()
+        expected_ts = num_days * 24
+
+        full_segs = [s for s in all_segs if ts_counts.get(s, 0) == expected_ts]
+        candidate_segs = (
+            full_segs
+            if full_segs
+            else [s for s in all_segs if ts_counts.get(s, 0) >= min_timesteps]
+        )
+
+        if not candidate_segs:
+            self.logger.error(
+                f"Không có segment nào có đủ {min_timesteps} timesteps. "
+                f"Max available: {ts_counts.max() if len(ts_counts) else 0}"
+            )
+            return None, None, None
+
+        num_timesteps = (
+            expected_ts
+            if full_segs
+            else min(ts_counts[s] for s in candidate_segs)
+        )
+
+        segment_ids = sorted(candidate_segs)
+        N = len(segment_ids)
+        F = len(feature_cols)
+
+        self.logger.info(
+            f"Building 3D tensor: T={num_timesteps}, N={N}, F={F}"
+        )
+
+        data_3d = np.zeros((num_timesteps, N, F), dtype=np.float32)
+
+        for node_idx, seg_id in enumerate(segment_ids):
+            seg_df = df[df["segment_id"] == seg_id].sort_values("global_timestamp")
+            vals = seg_df[feature_cols].values.astype(np.float32)
+
+            if len(vals) > num_timesteps:
+                vals = vals[:num_timesteps]
+            elif len(vals) < num_timesteps:
+                pad = np.tile(vals[-1:], (num_timesteps - len(vals), 1))
+                vals = np.vstack([vals, pad])
+
+            vals = np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)
+            data_3d[:, node_idx, :] = vals
+
+        return data_3d, segment_ids, num_timesteps
+
+    def _create_sliding_windows(
+        self,
+        data_3d: np.ndarray,
+        seq_len: int,
+        pred_len: int,
+    ):
+        """
+        Tạo sliding window dataset.
+        """
+        T = data_3d.shape[0]
+        max_start = T - seq_len - pred_len + 1
+
+        if max_start <= 0:
+            self.logger.error(
+                f"Không đủ timesteps ({T}) để tạo window "
+                f"(seq={seq_len} + pred={pred_len})."
+            )
+            return np.array([]), np.array([])
+
+        SLOTS_PER_DAY = 24
+        MORNING_LAST  = 11   # slot cuối block sáng (07:00-09:45)
+        EVENING_FIRST = 12   # slot đầu block chiều (15:00-17:45)
+
+        def _crosses_block_gap(start: int, length: int) -> bool:
+            """
+            Kiểm tra xem window [start, start+length) có cắt qua ranh giới
+            block sáng → chiều trong bất kỳ ngày nào không.
+            """
+            for t in range(start, start + length - 1):
+                slot_in_day_t   = t % SLOTS_PER_DAY
+                slot_in_day_t1  = (t + 1) % SLOTS_PER_DAY
+                # Chuyển từ slot cuối sáng (11) sang slot đầu chiều (12)
+                # trong CÙNG ngày → là gap thực
+                day_t  = t // SLOTS_PER_DAY
+                day_t1 = (t + 1) // SLOTS_PER_DAY
+                if (day_t == day_t1
+                        and slot_in_day_t == MORNING_LAST
+                        and slot_in_day_t1 == EVENING_FIRST):
+                    return True
+            return False
+
+        X_list, y_list = [], []
+        skipped = 0
+        window_len = seq_len + pred_len
+
+        for i in range(max_start):
+            if _crosses_block_gap(i, window_len):
+                skipped += 1
                 continue
+            X_list.append(data_3d[i: i + seq_len])
+            y_list.append(data_3d[i + seq_len: i + seq_len + pred_len])
 
-            # Step 2 — estimate road axis from 3 nearest candidates
-            raw_candidates.sort(key=lambda x: x[0])
-            ref_bearings = [b for _, _, b in raw_candidates[:3]]
-            sin_mean = np.mean([np.sin(np.radians(b)) for b in ref_bearings])
-            cos_mean = np.mean([np.cos(np.radians(b)) for b in ref_bearings])
-            road_axis = (np.degrees(np.arctan2(sin_mean, cos_mean)) + 360) % 360
-
-            # Step 3 — apply filters
-            accepted: list[tuple[float, int]] = []   # (along_road_km, j)
-
-            for dist, j, b in raw_candidates:
-                name_j = street_names[j]
-                lat_j, lon_j = coords[j, 0], coords[j, 1]
-
-                # (a) Street name gate
-                if use_street_name and name_i and name_j:
-                    if name_i != name_j:
-                        cnt_name_rej += 1
-                        continue
-                    # Same name → accept without further checks
-                    along, _ = self._project_onto_axis(lat_i, lon_i, lat_j, lon_j, road_axis)
-                    accepted.append((abs(along), j))
-                    continue
-
-                # (b) Bearing check
-                if self._bearing_diff(b, road_axis) > bearing_threshold:
-                    cnt_bearing_rej += 1
-                    continue
-
-                # (c) Cross-road check — reject nodes on parallel/adjacent roads
-                along, cross = self._project_onto_axis(lat_i, lon_i, lat_j, lon_j, road_axis)
-                if cross > cross_road_max_km:
-                    cnt_cross_rej += 1
-                    continue
-
-                accepted.append((abs(along), j))
-
-            # Step 4 — keep max_neighbors nearest along road axis
-            accepted.sort(key=lambda x: x[0])
-            for _, j in accepted[:max_neighbors]:
-                neighbor_sets[i].add(j)
-                neighbor_sets[j].add(i)
-
-        self.logger.info(
-            f"Rejected — name={cnt_name_rej}, bearing={cnt_bearing_rej}, "
-            f"cross_road={cnt_cross_rej}"
-        )
-
-        # ── Build directed edge list → undirected ─────────────────────────────
-        edge_set = set()
-        for i, nbrs in enumerate(neighbor_sets):
-            for j in nbrs:
-                edge_set.add((min(i, j), max(i, j)))
-
-        edge_list = [[i, j] for i, j in edge_set] + [[j, i] for i, j in edge_set]
-        self.logger.info(f"Edges after all filters: {len(edge_set)} undirected")
-
-        # ── Remove isolated nodes ──────────────────────────────────────────────
-        nodes_with_edges = set(e[0] for e in edge_list)
-        isolated_indices = [i for i in range(num_nodes) if i not in nodes_with_edges]
-        if isolated_indices:
-            self.logger.warning(f"{len(isolated_indices)} isolated nodes removed")
-
-        valid_indices = sorted(nodes_with_edges)
-        segment_ids   = segment_ids[valid_indices]
-        coords        = coords[valid_indices]
-        num_nodes     = len(segment_ids)
-
-        old_to_new = {old: new for new, old in enumerate(valid_indices)}
-        remapped_edges = [
-            [old_to_new[e[0]], old_to_new[e[1]]]
-            for e in edge_list
-            if e[0] in old_to_new and e[1] in old_to_new
-        ]
-
-        self.logger.info(f"Nodes (non-isolated): {num_nodes}")
-        self.logger.info(f"Final edges: {len(remapped_edges) // 2} undirected")
-
-        # ── Adjacency matrix ──────────────────────────────────────────────────
-        if remapped_edges:
-            edge_index = np.array(remapped_edges, dtype=np.int64).T
-        else:
-            edge_index = np.array([[], []], dtype=np.int64)
-            self.logger.warning("No edges! Consider relaxing distance_threshold or bearing_threshold.")
-
-        adj = np.zeros((num_nodes, num_nodes), dtype=np.float32)
-        if edge_index.shape[1] > 0:
-            adj[edge_index[0], edge_index[1]] = 1.0
-            degrees = (adj > 0).sum(axis=1).astype(int)
+        if skipped > 0:
             self.logger.info(
-                f"Degree — min={degrees.min()}, max={degrees.max()}, "
-                f"mean={degrees.mean():.2f}, median={np.median(degrees):.1f}"
+                f"Sliding windows: {skipped} windows bỏ qua (cắt qua block gap sáng/chiều)"
             )
 
-        # ── Node features ──────────────────────────────────────────────────────
-        exclude_cols = {
-            'segment_id', 'new_segment_id', 'street_name',
-            'latitude', 'longitude', 'raw_latitude', 'raw_longitude',
-            'date_range', 'time_set', 'date_from',
-        }
-        feature_cols = [
-            c for c in df.columns
-            if c not in exclude_cols and pd.api.types.is_numeric_dtype(df[c])
+        if not X_list:
+            self.logger.error("Không có window hợp lệ sau khi lọc block gap.")
+            return np.array([]), np.array([])
+
+        X = np.array(X_list, dtype=np.float32)  # [N_samples, seq_len, N_nodes, F]
+        y = np.array(y_list, dtype=np.float32)  # [N_samples, pred_len, N_nodes, F]
+
+        self.logger.info(f"Sliding windows: X={X.shape}, y={y.shape}")
+        return X, y
+
+    def _fit_and_normalize(
+        self,
+        X_train, X_val, X_test, y_train, y_val, y_test,
+        feature_cols: List[str],
+        normalize: bool,
+    ) -> Dict[str, Any]:
+        """
+        Fit scalers trên train set, transform tất cả splits.
+
+        Trả về dict gồm normalized arrays + scaler params.
+        """
+        n_features = X_train.shape[-1]
+
+        # Map feature name → scaler type
+        standard_idx = [
+            i for i, c in enumerate(feature_cols) if c in NORMALIZE_COLS
+        ]
+        minmax_idx = [
+            i for i, c in enumerate(feature_cols) if c in MINMAX_COLS
         ]
 
-        node_features = np.array(
-            [
-                np.nan_to_num(
-                    df[df['segment_id'] == sid][feature_cols]
-                    .select_dtypes(include=np.number)
-                    .mean()
-                    .values,
-                    nan=0.0, posinf=0.0, neginf=0.0,
-                )
-                for sid in segment_ids
-            ],
-            dtype=np.float32,
+        result = {
+            "X_train": X_train, "y_train": y_train,
+            "X_val": X_val, "y_val": y_val,
+            "X_test": X_test, "y_test": y_test,
+        }
+
+        if not normalize:
+            # Fit scaler nhưng không transform (lưu params để dùng sau)
+            X_tr_2d = X_train.reshape(-1, n_features)
+            ss = StandardScaler().fit(X_tr_2d[:, standard_idx] if standard_idx else X_tr_2d)
+            result["scaler_mean"] = ss.mean_.astype(np.float32) if standard_idx else np.zeros(n_features, dtype=np.float32)
+            result["scaler_scale"] = ss.scale_.astype(np.float32) if standard_idx else np.ones(n_features, dtype=np.float32)
+            result["standard_feature_idx"] = np.array(standard_idx, dtype=np.int32)
+            result["minmax_feature_idx"] = np.array(minmax_idx, dtype=np.int32)
+            self.logger.info("Scaler params saved (normalize=False, raw data exported).")
+            return result
+
+        X_tr_2d = X_train.reshape(-1, n_features)
+
+        # StandardScaler cho continuous speed/time features
+        ss_mean = np.zeros(n_features, dtype=np.float32)
+        ss_scale = np.ones(n_features, dtype=np.float32)
+
+        if standard_idx:
+            ss = StandardScaler()
+            ss.fit(X_tr_2d[:, standard_idx])
+            ss_mean[standard_idx] = ss.mean_.astype(np.float32)
+            ss_scale[standard_idx] = ss.scale_.astype(np.float32)
+
+        # MinMaxScaler cho distance, speed_limit, sample_size
+        mm_min = np.zeros(n_features, dtype=np.float32)
+        mm_scale = np.ones(n_features, dtype=np.float32)
+
+        if minmax_idx:
+            mm = MinMaxScaler()
+            mm.fit(X_tr_2d[:, minmax_idx])
+            mm_min[minmax_idx] = mm.data_min_.astype(np.float32)
+            mm_scale[minmax_idx] = (mm.data_max_ - mm.data_min_ + 1e-8).astype(np.float32)
+
+        def _transform(arr: np.ndarray) -> np.ndarray:
+            s0, s1, s2, s3 = arr.shape
+            a = arr.reshape(-1, s3).copy()
+            if standard_idx:
+                a[:, standard_idx] = (a[:, standard_idx] - ss_mean[standard_idx]) / ss_scale[standard_idx]
+            if minmax_idx:
+                a[:, minmax_idx] = (a[:, minmax_idx] - mm_min[minmax_idx]) / mm_scale[minmax_idx]
+            return a.reshape(s0, s1, s2, s3).astype(np.float32)
+
+        result["X_train"] = _transform(X_train)
+        result["X_val"]   = _transform(X_val)
+        result["X_test"]  = _transform(X_test)
+        result["y_train"] = _transform(y_train)
+        result["y_val"]   = _transform(y_val)
+        result["y_test"]  = _transform(y_test)
+        result["scaler_mean"]  = ss_mean
+        result["scaler_scale"] = ss_scale
+        result["mm_min"]       = mm_min
+        result["mm_scale"]     = mm_scale
+        result["standard_feature_idx"] = np.array(standard_idx, dtype=np.int32)
+        result["minmax_feature_idx"]   = np.array(minmax_idx, dtype=np.int32)
+
+        self.logger.info(
+            f"✅ Normalization done. "
+            f"StandardScaler: {len(standard_idx)} features. "
+            f"MinMaxScaler: {len(minmax_idx)} features."
         )
-
-        # ── Save ───────────────────────────────────────────────────────────────
-        num_edges  = edge_index.shape[1] if edge_index.ndim == 2 else 0
-        avg_degree = num_edges / num_nodes if num_nodes > 0 else 0.0
-
-        self.npz_writer.write_batch(
-            {
-                'node_features':    node_features,
-                'edge_index':       edge_index,
-                'adjacency_matrix': adj,
-                'segment_ids':      segment_ids,
-                'coordinates':      coords,
-                'feature_names':    np.array(feature_cols),
-            },
-            output_name,
-            {
-                'num_nodes':              num_nodes,
-                'num_edges':              num_edges,
-                'avg_degree':             avg_degree,
-                'distance_threshold_km':  distance_threshold,
-                'min_distance_km':        min_distance,
-                'max_neighbors':          max_neighbors,
-                'bearing_threshold_deg':  bearing_threshold,
-                'cross_road_max_km':      cross_road_max_km,
-                'use_street_name':        use_street_name,
-                'isolated_nodes_removed': len(isolated_indices),
-            },
-        )
-
-        self.logger.info(f"✅ Graph saved → '{output_name}'")
-        self.logger.info(f"   Nodes: {num_nodes}  |  Edges: {num_edges // 2}  |  Avg degree: {avg_degree:.2f}")
-        self.logger.info(f"   Isolated removed: {len(isolated_indices)}")
+        return result
 
     @staticmethod
-    def _haversine_distance(lat1, lon1, lat2, lon2) -> float:
-        """Tính khoảng cách Haversine (km). Yêu cầu tọa độ thực (degrees)."""
-        R = 6371.0
-        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
-        return R * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+    def _rebuild_nx_graph(osm_data: Dict[str, np.ndarray]) -> "nx.MultiDiGraph":
+        """
+        Tái tạo NetworkX graph từ OSM arrays để dùng ox.nearest_edges.
+        Nhẹ hơn nhiều so với re-download OSM.
+        """
+        import networkx as nx
+
+        G = nx.MultiDiGraph()
+        G.graph["crs"] = "epsg:4326"
+        node_ids = osm_data["osm_node_ids"]
+        coords = osm_data["coordinates"]
+        edge_index = osm_data["edge_index"]
+        edge_lengths = osm_data.get("edge_lengths", np.zeros(edge_index.shape[1]))
+
+        # Add nodes
+        for idx, nid in enumerate(node_ids):
+            G.add_node(int(nid), y=float(coords[idx, 0]), x=float(coords[idx, 1]))
+
+        # Add edges — giữ NGUYÊN chiều của từng cung trong edge_index.
+        # BUG CŨ: dùng key=(min,max) để dedup → mất cung ngược chiều trên đường 1 chiều.
+        # FIX: thêm tất cả cung, dùng e_idx làm key để tránh MultiDiGraph ghi đè.
+        for e_idx in range(edge_index.shape[1]):
+            u_idx = edge_index[0, e_idx]
+            v_idx = edge_index[1, e_idx]
+            u_nid = int(node_ids[u_idx])
+            v_nid = int(node_ids[v_idx])
+            length = float(edge_lengths[e_idx]) if e_idx < len(edge_lengths) else 0.0
+            G.add_edge(u_nid, v_nid, key=e_idx, length=length)
+
+        return G
+
+    # =========================================================================
+    # FULL PIPELINE ENTRY POINT
+    # =========================================================================
 
     def run_full_pipeline(
         self,
         geometry: Dict,
         start_date: str,
         use_31_days: bool = True,
-        date_from: Optional[str] = None,
-        date_to: Optional[str] = None,
         job_name: str = "Traffic Analysis",
+        match_threshold_m: float = 50.0,
     ):
-        """
-        Chạy toàn bộ pipeline từ collection đến export.
-        """
+        """Chạy toàn bộ pipeline từ collection đến graph building."""
         self.logger.info("=" * 60)
-        self.logger.info("STARTING FULL PIPELINE WITH NPZ STORAGE")
+        self.logger.info("STARTING FULL PIPELINE (OSM + TomTom Hybrid)")
         self.logger.info("=" * 60)
 
+        # Stage 2b có thể chạy trước hoặc song song với 2a
+        self.build_osm_skeleton(geometry=geometry)
+
         if use_31_days:
-            job_ids = self.run_31_days_collection(geometry=geometry, start_date=start_date)
+            job_ids = self.run_31_days_collection(
+                geometry=geometry, start_date=start_date
+            )
             if not job_ids:
-                self.logger.error("Pipeline failed at Stage 1 (31-day collection)")
+                self.logger.error("Pipeline failed at Stage 1")
                 return
             self.run_streaming_ingestion_from_jobs(job_ids)
         else:
-            date_f = date_from or start_date
-            date_t = date_to or start_date
-            job_id = self.run_batch_collection(geometry, date_f, date_t, job_name)
-            if not job_id:
-                self.logger.error("Pipeline failed at Stage 1")
-                return
-            self.run_streaming_ingestion(job_id)
+            self.logger.error("Chỉ hỗ trợ 31-day mode trong.")
+            return
 
         self.run_validation_processing()
         self.run_feature_extraction()
         self.export_for_model_training()
-        self.build_graph_structure()
+        self.build_graph_with_map_matching(
+            geometry=geometry,
+            match_threshold_m=match_threshold_m,
+        )
 
         self.logger.info("=" * 60)
         self.logger.info("✅ FULL PIPELINE COMPLETE")

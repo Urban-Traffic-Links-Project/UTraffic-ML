@@ -40,3 +40,6 @@ scikit-learn
 dotenv
 torch_directml
 statsmodels 
+osmnx
+networkx
+shapely
