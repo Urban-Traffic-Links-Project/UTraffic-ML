@@ -106,6 +106,9 @@ class FeatureExtractor(LoggerMixin):
         self.logger.info(f"Extracting features from {len(df)} rows...")
 
         df_out = df.copy()
+        
+        # 0. Trích xuất start/end coordinates từ shape (Fix Map Matching)
+        df_out = self._extract_start_end_coords(df_out)
 
         # 1. Base derived features (free_flow_speed, free_flow_travel_time)
         df_out = self._extract_base_features(df_out)
@@ -136,6 +139,47 @@ class FeatureExtractor(LoggerMixin):
     # =========================================================================
     # PRIVATE METHODS
     # =========================================================================
+
+    def _extract_start_end_coords(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Trích xuất tọa độ điểm đầu và cuối từ cột 'shape' để phục vụ map-matching."""
+        # Nếu dữ liệu đã có sẵn các cột này (từ bước DataLoader) thì bỏ qua
+        required_cols = ["raw_lat_start", "raw_lon_start", "raw_lat_end", "raw_lon_end"]
+        if all(c in df.columns for c in required_cols):
+            return df
+
+        if "shape" in df.columns:
+            def parse_shape(shape_data):
+                try:
+                    # Chuyển chuỗi thành list nếu bị parse nhầm thành string do lưu CSV
+                    if isinstance(shape_data, str):
+                        import ast
+                        shape_data = ast.literal_eval(shape_data)
+                    
+                    if isinstance(shape_data, list) and len(shape_data) >= 2:
+                        start_pt = shape_data[0]
+                        end_pt = shape_data[-1]
+                        
+                        # Hỗ trợ cả key là 'latitude' hoặc 'lat'
+                        return pd.Series({
+                            "raw_lat_start": float(start_pt.get("latitude", start_pt.get("lat"))),
+                            "raw_lon_start": float(start_pt.get("longitude", start_pt.get("lon"))),
+                            "raw_lat_end": float(end_pt.get("latitude", end_pt.get("lat"))),
+                            "raw_lon_end": float(end_pt.get("longitude", end_pt.get("lon")))
+                        })
+                except Exception:
+                    pass # Fallback về NaN nếu lỗi
+                
+                return pd.Series({
+                    "raw_lat_start": np.nan, "raw_lon_start": np.nan,
+                    "raw_lat_end": np.nan, "raw_lon_end": np.nan
+                })
+
+            # Apply hàm parse và gộp các cột mới vào DataFrame
+            extracted_coords = df["shape"].apply(parse_shape)
+            for col in required_cols:
+                df[col] = extracted_coords[col]
+                
+        return df
 
     def _extract_base_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Tính free_flow_speed và free_flow_travel_time."""
@@ -373,6 +417,9 @@ class FeatureExtractor(LoggerMixin):
             "time_set", "date_from", "date_range",
             "latitude", "longitude",
             "raw_latitude", "raw_longitude",
+            # Tọa độ đầu/cuối segment (dùng cho shortest-path map matching)
+            "raw_lat_start", "raw_lon_start",
+            "raw_lat_end",   "raw_lon_end",
         ]
 
         keep_cols = []

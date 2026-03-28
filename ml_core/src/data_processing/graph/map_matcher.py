@@ -1,21 +1,19 @@
 # src/data_processing/graph/map_matcher.py
 """
-Map Matcher — gán TomTom traffic features vào OSM edges.
+Map Matcher — gán TomTom traffic features vào OSM edges (Option B: subgraph).
 
-Đây là module cốt lõi thay thế hoàn toàn logic build_graph_structure()
-dùng distance_threshold.
+Design: chỉ giữ lại OSM edges nào có TomTom segment match vào.
+OSM edges không có TomTom data → bị loại bỏ hoàn toàn (không dùng default giả).
 
-Logic:
-    1. Với mỗi TomTom segment (có lat/lon trung điểm), tìm OSM edge gần nhất.
-    2. Nếu khoảng cách ≤ match_threshold_m, assign features TomTom vào OSM edge đó.
-    3. OSM edges không có TomTom data → dùng free_flow_speed (từ maxspeed OSM) và congestion=0.
-    4. Aggregate nhiều TomTom segments map tới cùng 1 OSM edge → mean.
-    5. Output: node_features [N, F] và edge_features [E, F] sẵn sàng cho T-GCN / DTC-STGCN.
-
-Tại sao không dùng GPS snap library phức tạp:
-    - Với dữ liệu Quận 1 (515 segments), nearest-edge search đủ nhanh (< 5 giây).
-    - OSMnx cung cấp ox.nearest_edges() dùng spatial index (STRtree), O(N log M).
-    - Không cần HMM map matching vì segments TomTom đã là đoạn đường, không phải GPS trace liên tục.
+Logic (shortest-path matching):
+    1. Với mỗi TomTom segment, snap điểm ĐẦU và CUỐI của shape lên OSM node gần nhất.
+    2. Tính shortest_path(start_node → end_node) trên OSM graph.
+    3. Tất cả OSM edges trên path đó đều nhận features của TomTom segment này.
+       → Giải quyết vấn đề 1 TomTom segment dài bị chia thành nhiều OSM edges nhỏ.
+    4. Aggregate nếu nhiều TomTom segments cover cùng 1 OSM edge → mean.
+    5. Build subgraph từ tập OSM edges đã được match.
+    6. Edge features = TomTom features thực (100% real, không có default).
+    7. Temporal: edge_features_temporal [E', T, F_edge].
 """
 
 from __future__ import annotations
@@ -37,7 +35,7 @@ from utils.config import config
 from utils.logger import LoggerMixin
 
 
-# Features TomTom sẽ được gán vào OSM nodes/edges
+# Features TomTom dùng để aggregate vào edges
 TOMTOM_FEATURE_COLS = [
     "average_speed",
     "harmonic_average_speed",
@@ -50,23 +48,30 @@ TOMTOM_FEATURE_COLS = [
     "sample_size",
 ]
 
-# Features sẽ giữ lại sau map matching (cho T-GCN node features)
-NODE_FEATURE_COLS = [
-    # TomTom dynamic features
+# Edge features = TomTom dynamic + OSM static
+# Mỗi edge trong output graph = 1 OSM road segment đã được TomTom match
+EDGE_FEATURE_COLS = [
+    # TomTom dynamic features (100% real data, không có default)
     "average_speed",
     "harmonic_average_speed",
     "std_speed",
     "travel_time_ratio",
     "congestion_index",
     "speed_limit_ratio",
+    "sample_size",
     # OSM static features
     "osm_length_m",
     "osm_maxspeed",
     "osm_lanes",
     "osm_highway_type",
-    # Graph topology features
-    "degree",
-    "betweenness_norm",
+]
+
+# Node features = topology của subgraph (ngã tư thuộc edges được match)
+NODE_FEATURE_COLS = [
+    "degree",           # số edges liền kề trong subgraph
+    "betweenness_norm", # betweenness centrality trong subgraph
+    "lat_norm",         # tọa độ đã chuẩn hóa
+    "lon_norm",
 ]
 
 
@@ -87,7 +92,7 @@ class TomTomOSMMapMatcher(LoggerMixin):
     def __init__(
         self,
         osm_graph_data: Dict[str, np.ndarray],
-        match_threshold_m: float = 50.0,
+        match_threshold_m: float = 100.0,
         aggregate_method: str = "mean",
     ):
         self.osm_data = osm_graph_data
@@ -165,16 +170,20 @@ class TomTomOSMMapMatcher(LoggerMixin):
 
         # ── Map matching ──────────────────────────────────────────────────────
         matched_df = self._map_match_segments(df, osm_networkx_graph)
+        n_unique = df['segment_id'].nunique()
+        n_matched = matched_df['segment_id'].nunique() if not matched_df.empty else 0
+        self._coverage_ratio = n_matched / max(n_unique, 1)
         self.logger.info(
-            f"Matched: {len(matched_df)} / {df['segment_id'].nunique()} segments "
-            f"(coverage = {len(matched_df) / max(df['segment_id'].nunique(), 1):.1%})"
+            f"Matched: {n_matched} / {n_unique} segments "
+            f"(coverage = {self._coverage_ratio:.1%})"
         )
 
-        # ── Aggregate TomTom features lên OSM nodes ───────────────────────────
-        node_features_df = self._aggregate_to_nodes(matched_df)
+        if matched_df.empty:
+            self.logger.error("Không có segment nào được match. Tăng match_threshold_m?")
+            return {}
 
-        # ── Build final feature matrix ────────────────────────────────────────
-        result = self._build_feature_arrays(node_features_df)
+        # ── Build matched subgraph (chỉ OSM edges có TomTom data) ────────────
+        result = self._build_matched_subgraph(matched_df)
 
         # ── Save ──────────────────────────────────────────────────────────────
         if output_dir:
@@ -190,26 +199,28 @@ class TomTomOSMMapMatcher(LoggerMixin):
         output_dir: Optional[Path] = None,
     ) -> Dict[str, np.ndarray]:
         """
-        Build temporal node features: [N, T, F] cho T-GCN / DTC-STGCN.
+        Build temporal edge features: [E', T, F_edge] cho T-GCN / DTC-STGCN.
 
-        Với mỗi time slot T, chạy map matching và aggregate features.
-        Output shape: node_features_temporal [N, T, F].
+        Design (Option B): chỉ giữ OSM edges có TomTom data.
+            1. Chạy map matching trên TOÀN BỘ data (tất cả time slots) để xác định
+               tập edges cố định E' = subgraph edges (stable across time).
+            2. Với mỗi time slot t, aggregate TomTom features → edge features [E', F_edge].
+            3. Output tensor: edge_features_temporal [E', T, F_edge].
+               Node features cũng được tính nhưng chỉ là topology (không đổi theo t).
 
         Args:
             traffic_df   : DataFrame đầy đủ 31 ngày × 24 time slots.
             output_name  : Tên NPZ output.
         """
         self.logger.info("=" * 60)
-        self.logger.info("MAP MATCHER — Temporal features [N, T, F]")
+        self.logger.info("MAP MATCHER — Temporal edge features [E', T, F]")
         self.logger.info("=" * 60)
 
-        # Xác định time slots và dates
         df = self._prepare_traffic_df(traffic_df, time_slot=None)
         if df.empty:
             self.logger.error("DataFrame rỗng sau khi prepare.")
             return {}
 
-        # BUG FIX: ưu tiên "date_from" rồi mới đến "date_range", "date"
         date_col = next(
             (c for c in ["date_from", "date_range", "date"] if c in df.columns),
             None,
@@ -218,20 +229,76 @@ class TomTomOSMMapMatcher(LoggerMixin):
             self.logger.error("Không tìm thấy cột ngày trong DataFrame.")
             return {}
 
+        # ── Bước 1: Xác định subgraph cố định từ toàn bộ data ────────────────
+        # Match tất cả segments (không filter time slot) để có tập edges ổn định.
+        self.logger.info("Bước 1: Xác định subgraph cố định từ toàn bộ data...")
+        all_matched_df = self._map_match_segments(df, osm_networkx_graph)
+
+        if all_matched_df.empty:
+            self.logger.error("Không match được segment nào. Tăng match_threshold_m?")
+            return {}
+
+        total_segments = df["segment_id"].nunique()
+        matched_segments = all_matched_df["segment_id"].nunique()
+        self._coverage_ratio = matched_segments / max(total_segments, 1)
+        self.logger.info(
+            f"Coverage: {matched_segments}/{total_segments} segments "
+            f"({self._coverage_ratio:.1%})"
+        )
+
+        # Lấy tập edge pairs cố định (u_old_idx, v_old_idx) đã được match ít nhất 1 lần
+        edge_pairs = (
+            all_matched_df
+            .groupby(["osm_u_idx", "osm_v_idx"])
+            .size()
+            .reset_index()[["osm_u_idx", "osm_v_idx"]]
+        )
+        edge_pairs["osm_u_idx"] = edge_pairs["osm_u_idx"].astype(int)
+        edge_pairs["osm_v_idx"] = edge_pairs["osm_v_idx"].astype(int)
+
+        # Re-index nodes của subgraph
+        old_node_idxs = np.unique(
+            np.concatenate([
+                edge_pairs["osm_u_idx"].values,
+                edge_pairs["osm_v_idx"].values,
+            ])
+        )
+        N_sub = len(old_node_idxs)
+        old_to_new: Dict[int, int] = {
+            int(old_idx): new_idx for new_idx, old_idx in enumerate(old_node_idxs)
+        }
+
+        sub_node_ids = self.osm_node_ids[old_node_idxs]
+        sub_coords   = self.coordinates[old_node_idxs]
+
+        new_u_arr = np.array([old_to_new[u] for u in edge_pairs["osm_u_idx"].values], dtype=np.int64)
+        new_v_arr = np.array([old_to_new[v] for v in edge_pairs["osm_v_idx"].values], dtype=np.int64)
+        sub_edge_index = np.stack([new_u_arr, new_v_arr], axis=0)  # [2, E_sub]
+        E_sub = sub_edge_index.shape[1]
+
+        sub_adj = np.zeros((N_sub, N_sub), dtype=np.float32)
+        sub_adj[new_u_arr, new_v_arr] = 1.0
+
+        self.logger.info(f"Subgraph cố định: {N_sub} nodes, {E_sub} edges")
+
+        # ── Bước 2: Build temporal edge feature tensor [E_sub, T, F_edge] ─────
         df["_ts_key"] = df[date_col].astype(str) + "__" + df["time_set"].astype(str)
         ts_keys = sorted(df["_ts_key"].unique())
         T = len(ts_keys)
-        N = len(self.osm_node_ids)
-        F = len(NODE_FEATURE_COLS)
+        F_edge = len(EDGE_FEATURE_COLS)
 
-        self.logger.info(f"Building temporal tensor: N={N}, T={T}, F={F}")
+        self.logger.info(f"Building temporal tensor: E={E_sub}, T={T}, F={F_edge}")
 
-        # [N, T, F] — khởi tạo với NaN, fill sau
-        temporal_tensor = np.full((N, T, F), np.nan, dtype=np.float32)
+        # edge key → index trong sub_edge_index
+        edge_key_to_idx: Dict[Tuple[int, int], int] = {
+            (int(edge_pairs.iloc[i]["osm_u_idx"]), int(edge_pairs.iloc[i]["osm_v_idx"])): i
+            for i in range(E_sub)
+        }
 
-        # BUG FIX: track coverage để set _coverage_ratio sau
-        total_segments = df["segment_id"].nunique()
-        matched_segments_set: set = set()
+        # Tensor [E_sub, T, F_edge] — khởi tạo NaN
+        edge_tensor = np.full((E_sub, T, F_edge), np.nan, dtype=np.float32)
+
+        tomtom_cols = [c for c in TOMTOM_FEATURE_COLS if c in df.columns]
 
         for t_idx, ts_key in enumerate(ts_keys):
             slot_df = df[df["_ts_key"] == ts_key].copy()
@@ -239,20 +306,47 @@ class TomTomOSMMapMatcher(LoggerMixin):
                 continue
 
             try:
-                matched_df = self._map_match_segments(slot_df, osm_networkx_graph)
-                if not matched_df.empty:
-                    matched_segments_set.update(matched_df["segment_id"].unique())
-                node_features_df = self._aggregate_to_nodes(matched_df)
-                result = self._build_feature_arrays(node_features_df)
-                node_feat = result["node_features"]  # [N, F]
-                if node_feat.shape == (N, F):
-                    temporal_tensor[:, t_idx, :] = node_feat
-            except KeyError as e:
-                self.logger.warning(
-                    f"Slot {ts_key} failed: cột {e} không tồn tại trong data. "
-                    f"Slot này sẽ được fill bằng forward-fill."
+                matched_slot = self._map_match_segments(slot_df, osm_networkx_graph)
+                if matched_slot.empty:
+                    continue
+
+                # Aggregate per (u_old, v_old) cho slot này
+                agg_funcs = {c: self.aggregate_method for c in tomtom_cols if c in matched_slot.columns}
+                slot_agg = (
+                    matched_slot
+                    .groupby(["osm_u_idx", "osm_v_idx"], sort=False)
+                    .agg(agg_funcs)
+                    .reset_index()
                 )
-                continue
+
+                # Thêm OSM static features
+                global_src = self.edge_index[0]
+                global_dst = self.edge_index[1]
+                for col_name, arr in [
+                    ("osm_length_m",    self.edge_lengths),
+                    ("osm_maxspeed",    self.edge_maxspeed),
+                    ("osm_lanes",       self.edge_lanes),
+                    ("osm_highway_type", self.edge_highway_type),
+                ]:
+                    vals = []
+                    for u_old, v_old in zip(
+                        slot_agg["osm_u_idx"].values, slot_agg["osm_v_idx"].values
+                    ):
+                        mask = (global_src == u_old) & (global_dst == v_old)
+                        vals.append(float(arr[mask][0]) if mask.any() else 0.0)
+                    slot_agg[col_name] = vals
+
+                # Điền vào tensor
+                for _, row in slot_agg.iterrows():
+                    key = (int(row["osm_u_idx"]), int(row["osm_v_idx"]))
+                    e_idx = edge_key_to_idx.get(key)
+                    if e_idx is None:
+                        continue
+                    for f_idx, col in enumerate(EDGE_FEATURE_COLS):
+                        val = row.get(col, np.nan)
+                        if pd.notna(val):
+                            edge_tensor[e_idx, t_idx, f_idx] = float(val)
+
             except Exception as e:
                 self.logger.warning(f"Slot {ts_key} failed: {e}")
                 continue
@@ -260,36 +354,51 @@ class TomTomOSMMapMatcher(LoggerMixin):
             if (t_idx + 1) % 50 == 0:
                 self.logger.info(f"Progress: {t_idx + 1}/{T} time slots")
 
-        # BUG FIX: set coverage ratio sau khi xử lý tất cả slots
-        self._coverage_ratio = (
-            len(matched_segments_set) / max(total_segments, 1)
-        )
-        self.logger.info(
-            f"Coverage: {len(matched_segments_set)}/{total_segments} unique segments "
-            f"({self._coverage_ratio:.1%})"
-        )
+        # Forward-fill NaN theo chiều thời gian cho mỗi edge
+        edge_tensor = self._fill_nan_temporal_edges(edge_tensor)
 
-        # Fill NaN bằng forward-fill theo thời gian (per node)
-        temporal_tensor = self._fill_nan_temporal(temporal_tensor)
+        # ── Bước 3: Node features (topology — không đổi theo thời gian) ───────
+        degrees = sub_adj.sum(axis=1).astype(np.float32)
+        betweenness = np.zeros(N_sub, dtype=np.float32)
+        try:
+            import networkx as nx
+            G_sub = nx.DiGraph()
+            G_sub.add_nodes_from(range(N_sub))
+            G_sub.add_edges_from(zip(new_u_arr.tolist(), new_v_arr.tolist()))
+            bt_dict = nx.betweenness_centrality(G_sub, normalized=True)
+            for nidx, bt_val in bt_dict.items():
+                betweenness[nidx] = float(bt_val)
+        except Exception as e:
+            self.logger.warning(f"Betweenness failed: {e}")
 
-        # Parse timestamps
+        lats = sub_coords[:, 0]
+        lons = sub_coords[:, 1]
+        lat_norm = ((lats - lats.min()) / (lats.max() - lats.min() + 1e-8)).astype(np.float32)
+        lon_norm = ((lons - lons.min()) / (lons.max() - lons.min() + 1e-8)).astype(np.float32)
+        deg_norm = (degrees / (degrees.max() + 1e-8)).astype(np.float32)
+
+        node_features = np.stack([deg_norm, betweenness, lat_norm, lon_norm], axis=1)  # [N_sub, 4]
+
         timestamps = np.array(ts_keys)
 
         output = {
-            "node_features_temporal": temporal_tensor,   # [N, T, F]
-            "timestamps":             timestamps,          # [T]
-            "osm_node_ids":           self.osm_node_ids,  # [N]
-            "coordinates":            self.coordinates,    # [N, 2]
-            "edge_index":             self.edge_index,     # [2, E]
-            "adjacency_matrix":       self.adjacency_matrix,
-            "feature_names":          np.array(NODE_FEATURE_COLS),
+            "edge_features_temporal": edge_tensor,      # [E_sub, T, F_edge]
+            "node_features":          node_features,     # [N_sub, F_node]
+            "timestamps":             timestamps,         # [T]
+            "osm_node_ids":           sub_node_ids,       # [N_sub]
+            "coordinates":            sub_coords,         # [N_sub, 2]
+            "edge_index":             sub_edge_index,     # [2, E_sub]
+            "adjacency_matrix":       sub_adj,            # [N_sub, N_sub]
+            "node_feature_names":     np.array(NODE_FEATURE_COLS),
+            "edge_feature_names":     np.array(EDGE_FEATURE_COLS),
         }
 
         if output_dir:
             self._save_npz(output, output_name, output_dir, time_slot=None)
 
         self.logger.info(
-            f"✅ Temporal features built: {temporal_tensor.shape}"
+            f"✅ Temporal edge features built: {edge_tensor.shape} "
+            f"(E={E_sub}, T={T}, F={F_edge})"
         )
         return output
 
@@ -302,6 +411,11 @@ class TomTomOSMMapMatcher(LoggerMixin):
     ) -> pd.DataFrame:
         """
         Chuẩn bị DataFrame: chọn đúng cột, dùng raw coordinates, filter time slot.
+
+        Giữ lại:
+            _lat/_lon       : centroid (mean) của segment — fallback nếu không có start/end
+            _lat_start/_lon_start : tọa độ điểm ĐẦU của TomTom segment shape
+            _lat_end/_lon_end     : tọa độ điểm CUỐI của TomTom segment shape
         """
         df = df.copy()
 
@@ -310,19 +424,28 @@ class TomTomOSMMapMatcher(LoggerMixin):
             df["_lat"] = df["raw_latitude"]
             df["_lon"] = df["raw_longitude"]
         elif "latitude" in df.columns and "longitude" in df.columns:
-            # Kiểm tra xem có phải normalized không
             lat_max = df["latitude"].max()
             if lat_max <= 1.0:
                 self.logger.warning(
                     "latitude có vẻ đã normalize ([0,1]). "
-                    "Cần raw coordinates để map match chính xác. "
-                    "Đảm bảo pipeline lưu raw_latitude/raw_longitude."
+                    "Cần raw coordinates để map match chính xác."
                 )
             df["_lat"] = df["latitude"]
             df["_lon"] = df["longitude"]
         else:
             self.logger.error("Không tìm thấy cột tọa độ.")
             return pd.DataFrame()
+
+        # Tọa độ start/end của segment (nếu pipeline lưu raw_lat_start/end)
+        has_endpoints = (
+            "raw_lat_start" in df.columns and "raw_lon_start" in df.columns
+            and "raw_lat_end" in df.columns and "raw_lon_end" in df.columns
+        )
+        if has_endpoints:
+            df["_lat_start"] = df["raw_lat_start"]
+            df["_lon_start"] = df["raw_lon_start"]
+            df["_lat_end"]   = df["raw_lat_end"]
+            df["_lon_end"]   = df["raw_lon_end"]
 
         # Filter time slot
         if time_slot and "time_set" in df.columns:
@@ -331,22 +454,20 @@ class TomTomOSMMapMatcher(LoggerMixin):
         # Drop rows thiếu tọa độ
         df = df.dropna(subset=["_lat", "_lon", "segment_id"])
 
-        # ── Ép kiểu tất cả TOMTOM_FEATURE_COLS về float64 TRƯỚC khi aggregate ──
-        # Lý do: khi đọc từ NPZ, các cột có NaN có thể bị lưu dưới dạng object dtype
-        # (ví dụ median_speed khi một số records TomTom không trả về medianSpeed).
-        # pandas groupby.agg() sẽ ném KeyError hoặc TypeError với cột object dtype.
+        # Ép kiểu TOMTOM_FEATURE_COLS về float64
         for col in TOMTOM_FEATURE_COLS:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float64)
 
-        # Tính trung điểm tọa độ per segment
-        agg_dict: Dict = {
-            "_lat": "mean",
-            "_lon": "mean",
-        }
+        # Aggregate per segment (+ time cols nếu temporal)
+        agg_dict: Dict = {"_lat": "mean", "_lon": "mean"}
 
-        # Chỉ aggregate các cột có ít nhất 1 giá trị không phải NaN
-        # (đã force-cast về float64 ở trên nên không cần check dtype nữa)
+        if has_endpoints:
+            agg_dict["_lat_start"] = "first"
+            agg_dict["_lon_start"] = "first"
+            agg_dict["_lat_end"]   = "last"
+            agg_dict["_lon_end"]   = "last"
+
         for col in TOMTOM_FEATURE_COLS:
             if col in df.columns and df[col].notna().any():
                 agg_dict[col] = self.aggregate_method
@@ -356,7 +477,6 @@ class TomTomOSMMapMatcher(LoggerMixin):
                 agg_dict[opt_col] = "first"
 
         group_cols = ["segment_id"]
-        # Nếu đang build Temporal (time_slot=None), BẮT BUỘC phải giữ lại các cột thời gian
         if time_slot is None:
             for t_col in ["date_from", "date_range", "date", "time_set"]:
                 if t_col in df.columns:
@@ -365,24 +485,26 @@ class TomTomOSMMapMatcher(LoggerMixin):
         try:
             df_seg = df.groupby(group_cols, dropna=False).agg(agg_dict).reset_index()
         except KeyError as e:
-            # Một số cột có thể biến mất sau khi normalize — loại bỏ và thử lại
             missing_col = str(e).strip("'")
-            self.logger.warning(
-                f"Cột '{missing_col}' không tìm thấy khi aggregate, bỏ qua cột này."
-            )
+            self.logger.warning(f"Cột '{missing_col}' không tìm thấy khi aggregate, bỏ qua.")
             agg_dict.pop(missing_col, None)
             df_seg = df.groupby(group_cols, dropna=False).agg(agg_dict).reset_index()
 
-        # Đảm bảo các cột TOMTOM_FEATURE_COLS bị thiếu được thêm vào với NaN
-        # để downstream code không bị KeyError
         for col in TOMTOM_FEATURE_COLS:
             if col not in df_seg.columns:
                 df_seg[col] = np.nan
 
+        # Nếu không có start/end riêng, dùng centroid làm cả hai
+        if not has_endpoints:
+            df_seg["_lat_start"] = df_seg["_lat"]
+            df_seg["_lon_start"] = df_seg["_lon"]
+            df_seg["_lat_end"]   = df_seg["_lat"]
+            df_seg["_lon_end"]   = df_seg["_lon"]
+
         return df_seg
 
     # =========================================================================
-    # INTERNAL — MAP MATCHING
+    # INTERNAL — MAP MATCHING (shortest-path approach)
     # =========================================================================
 
     def _map_match_segments(
@@ -391,206 +513,287 @@ class TomTomOSMMapMatcher(LoggerMixin):
         G: "nx.MultiDiGraph",
     ) -> pd.DataFrame:
         """
-        Với mỗi TomTom segment (lat/lon), tìm nearest OSM edge dùng ox.nearest_edges.
+        Với mỗi TomTom segment, snap 2 đầu mút lên OSM node gần nhất,
+        sau đó tính shortest_path → lấy TẤT CẢ OSM edges trên path.
+
+        Tại sao:
+            TomTom segment = đoạn đường dài (ví dụ 500m Nguyễn Huệ).
+            OSM chia đoạn đó thành nhiều edges nhỏ (~50-100m mỗi cái).
+            nearest_edge chỉ lấy 1 edge → bỏ sót phần còn lại.
+            shortest_path lấy toàn bộ → graph đầy đủ như hình màu tím.
 
         Returns:
-            DataFrame với cột bổ sung:
-                osm_u, osm_v    — OSM node IDs của edge được match
-                osm_u_idx, osm_v_idx — index trong node array
-                match_dist_m    — khoảng cách match (m)
+            DataFrame với 1 row per (segment_id, osm_u_idx, osm_v_idx) —
+            mỗi OSM edge trên path đều có features của TomTom segment đó.
         """
-        # BUG FIX: reset_index để đảm bảo positional index (iloc) khớp với
-        # thứ tự của lats/lons array được truyền vào ox.nearest_edges.
         seg_df = seg_df.reset_index(drop=True)
-        lats = seg_df["_lat"].values
-        lons = seg_df["_lon"].values
 
-        # ox.nearest_edges nhận (X=lon, Y=lat)
+        # Snap start/end points lên OSM nodes gần nhất
+        start_lons = seg_df["_lon_start"].values
+        start_lats = seg_df["_lat_start"].values
+        end_lons   = seg_df["_lon_end"].values
+        end_lats   = seg_df["_lat_end"].values
+
         try:
-            if len(lats) == 1:
-                # BUG FIX: ox.nearest_edges với single point trả về (u, v, k), dist
-                # (không phải list), cần wrap vào list để xử lý thống nhất.
-                result = ox.nearest_edges(G, X=float(lons[0]), Y=float(lats[0]), return_dist=True)
-                # result là ((u, v, k), dist) cho single point
-                nearest_edges = [result[0]]
-                distances = [float(result[1])]
-            else:
-                # Multi-point: trả về (list_of_(u,v,k), list_of_dist)
-                nearest_edges, distances = ox.nearest_edges(G, X=lons, Y=lats, return_dist=True)
+            start_osm_nodes = ox.distance.nearest_nodes(G, X=start_lons, Y=start_lats)
+            end_osm_nodes   = ox.distance.nearest_nodes(G, X=end_lons,   Y=end_lats)
         except Exception as e:
-            self.logger.error(f"ox.nearest_edges failed: {e}")
+            self.logger.error(f"ox.distance.nearest_nodes failed: {e}")
             return pd.DataFrame()
 
         results = []
-        for idx, (u, v, k) in enumerate(nearest_edges):
-            u_idx = self.node_id_to_idx.get(int(u))
-            v_idx = self.node_id_to_idx.get(int(v))
+        n_no_path = 0
 
-            if u_idx is None or v_idx is None:
+        for idx in range(len(seg_df)):
+            osm_start = start_osm_nodes[idx] if hasattr(start_osm_nodes, '__len__') else start_osm_nodes
+            osm_end   = end_osm_nodes[idx]   if hasattr(end_osm_nodes,   '__len__') else end_osm_nodes
+
+            # Nếu start == end (segment quá ngắn), snap vào 1 node
+            if osm_start == osm_end:
+                u_idx = self.node_id_to_idx.get(int(osm_start))
+                if u_idx is None:
+                    continue
+                # Lấy edges liền kề node đó thay vì bỏ qua
+                edge_mask = self.edge_index[0] == u_idx
+                for e_pos in np.where(edge_mask)[0]:
+                    v_idx = int(self.edge_index[1, e_pos])
+                    row = seg_df.iloc[idx].to_dict()
+                    row["osm_u"]      = int(self.osm_node_ids[u_idx])
+                    row["osm_v"]      = int(self.osm_node_ids[v_idx])
+                    row["osm_u_idx"]  = u_idx
+                    row["osm_v_idx"]  = v_idx
+                    row["match_dist_m"] = 0.0
+                    results.append(row)
                 continue
 
-            # Lấy khoảng cách chuẩn từ OSMnx (mét)
-            dist_m = float(distances[idx])
+            # Tìm shortest path giữa 2 đầu mút
+            try:
+                path = nx.shortest_path(G, osm_start, osm_end, weight="length")
+            except nx.NetworkXNoPath:
+                # Thử chiều ngược lại (đường 1 chiều)
+                try:
+                    path = nx.shortest_path(G, osm_end, osm_start, weight="length")
+                except nx.NetworkXNoPath:
+                    n_no_path += 1
+                    continue
+            except nx.NodeNotFound:
+                n_no_path += 1
+                continue
 
-            # Dùng khoảng cách chuẩn này để filter
-            if dist_m > self.match_threshold_m:
-                continue  # Bỏ qua nếu điểm centroid nằm quá xa bất kỳ con đường nào
+            # Mỗi cặp node liên tiếp trên path = 1 OSM edge
+            for u_osm, v_osm in zip(path[:-1], path[1:]):
+                u_idx = self.node_id_to_idx.get(int(u_osm))
+                v_idx = self.node_id_to_idx.get(int(v_osm))
 
-            # BUG FIX: dùng iloc[idx] trên DataFrame đã reset_index (đồng bộ với lats/lons)
-            row = seg_df.iloc[idx].to_dict()
-            row["osm_u"] = int(u)
-            row["osm_v"] = int(v)
-            row["osm_u_idx"] = u_idx
-            row["osm_v_idx"] = v_idx
-            row["match_dist_m"] = dist_m
-            results.append(row)
+                if u_idx is None or v_idx is None:
+                    continue
+
+                # Tính khoảng cách snap (centroid TomTom → edge trung điểm)
+                u_coord = self.coordinates[u_idx]
+                v_coord = self.coordinates[v_idx]
+                mid_lat = (u_coord[0] + v_coord[0]) / 2
+                mid_lon = (u_coord[1] + v_coord[1]) / 2
+                dist_m = self._haversine_m(
+                    seg_df.iloc[idx]["_lat"], seg_df.iloc[idx]["_lon"],
+                    mid_lat, mid_lon
+                )
+
+                row = seg_df.iloc[idx].to_dict()
+                row["osm_u"]       = int(u_osm)
+                row["osm_v"]       = int(v_osm)
+                row["osm_u_idx"]   = u_idx
+                row["osm_v_idx"]   = v_idx
+                row["match_dist_m"] = dist_m
+                results.append(row)
+
+        if n_no_path > 0:
+            self.logger.info(
+                f"  {n_no_path}/{len(seg_df)} segments không tìm được path "
+                f"(có thể do đường 1 chiều hoặc segment nằm ngoài OSM graph)"
+            )
 
         if not results:
             return pd.DataFrame()
 
         matched_df = pd.DataFrame(results)
         self.logger.debug(
-            f"Matched {len(matched_df)}/{len(seg_df)} segments "
-            f"within {self.match_threshold_m}m"
+            f"Matched {seg_df['segment_id'].nunique()} segments "
+            f"→ {matched_df.groupby(['osm_u_idx','osm_v_idx']).ngroups} unique OSM edges"
         )
         return matched_df
 
     # =========================================================================
-    # INTERNAL — AGGREGATION
+    # INTERNAL — SUBGRAPH BUILDING (Option B: chỉ giữ edges có TomTom data)
     # =========================================================================
 
-    def _aggregate_to_nodes(self, matched_df: pd.DataFrame) -> pd.DataFrame:
+    def _build_matched_subgraph(
+        self, matched_df: pd.DataFrame
+    ) -> Dict[str, np.ndarray]:
         """
-        Aggregate TomTom features từ matched edges lên OSM nodes.
+        Xây dựng subgraph CHỈ gồm các OSM edges đã được match với TomTom data.
 
         Strategy:
-            - Mỗi OSM node nhận features trung bình của tất cả edges liền kề
-              đã được match với TomTom data.
-            - Nodes không có TomTom data → dùng free_flow defaults.
+            1. Lấy tập các (osm_u_idx, osm_v_idx) từ matched_df.
+            2. Aggregate nhiều TomTom segments → 1 OSM edge (mean/median).
+            3. Lấy tập nodes = union của tất cả u_idx, v_idx.
+            4. Re-index nodes 0..N'-1, rebuild edge_index, adjacency_matrix.
+            5. Node features = topology (degree, betweenness, lat/lon) trong subgraph.
+            6. Edge features = TomTom features thực (không có default giả).
+
+        Returns:
+            Dict với node_features [N', F_node], edge_features [E', F_edge],
+            edge_index [2, E'], adjacency_matrix [N', N'], coordinates [N', 2],
+            osm_node_ids [N'], v.v.
         """
-        N = len(self.osm_node_ids)
+        if matched_df.empty:
+            self.logger.warning("matched_df rỗng — subgraph trống.")
+            return {}
 
-        # Khởi tạo node feature dict với defaults
-        node_features_dict: Dict[str, List] = {col: [np.nan] * N for col in NODE_FEATURE_COLS}
+        # ── 1. Aggregate TomTom features per OSM edge ─────────────────────────
+        # Mỗi OSM edge (u_idx, v_idx) có thể được map bởi nhiều TomTom segments
+        # → lấy mean của tất cả.
+        tomtom_cols = [
+            c for c in TOMTOM_FEATURE_COLS if c in matched_df.columns
+        ]
 
-        # Điền OSM static features vào tất cả nodes
-        for node_idx in range(N):
-            node_id = int(self.osm_node_ids[node_idx])
-            degree = int(self.adjacency_matrix[node_idx].sum())
+        agg_funcs = {c: self.aggregate_method for c in tomtom_cols}
+        # OSM edge attrs lấy từ arrays gốc (không aggregate TomTom)
+        # → thêm vào sau khi groupby
 
-            # Tìm edges liền kề node này
-            edge_mask_u = self.edge_index[0] == node_idx
-            edge_mask_v = self.edge_index[1] == node_idx
-            adj_edge_mask = edge_mask_u | edge_mask_v
+        edge_df = (
+            matched_df
+            .groupby(["osm_u_idx", "osm_v_idx"], sort=False)
+            .agg({**agg_funcs, "match_dist_m": "mean"})
+            .reset_index()
+        )
 
-            if adj_edge_mask.any():
-                mean_length = float(self.edge_lengths[adj_edge_mask].mean())
-                mean_maxspeed = float(self.edge_maxspeed[adj_edge_mask].mean())
-                mean_lanes = float(self.edge_lanes[adj_edge_mask].mean())
-                mean_highway = float(self.edge_highway_type[adj_edge_mask].mean())
+        # ── 2. Lấy tập nodes trong subgraph, re-index ─────────────────────────
+        u_idxs = edge_df["osm_u_idx"].values.astype(int)
+        v_idxs = edge_df["osm_v_idx"].values.astype(int)
+
+        # Unique node indices từ OSM global index (đã được lưu trong osm_node_ids)
+        old_node_idxs = np.unique(np.concatenate([u_idxs, v_idxs]))
+        N_sub = len(old_node_idxs)
+
+        # Map: old_global_idx → new_subgraph_idx (0..N_sub-1)
+        old_to_new: Dict[int, int] = {
+            int(old_idx): new_idx
+            for new_idx, old_idx in enumerate(old_node_idxs)
+        }
+
+        # ── 3. Subgraph node arrays ────────────────────────────────────────────
+        sub_node_ids  = self.osm_node_ids[old_node_idxs]      # [N_sub]
+        sub_coords    = self.coordinates[old_node_idxs]        # [N_sub, 2]
+
+        # ── 4. Rebuild edge_index với new indices ─────────────────────────────
+        new_u = np.array([old_to_new[u] for u in u_idxs], dtype=np.int64)
+        new_v = np.array([old_to_new[v] for v in v_idxs], dtype=np.int64)
+        sub_edge_index = np.stack([new_u, new_v], axis=0)      # [2, E_sub]
+        E_sub = sub_edge_index.shape[1]
+
+        # ── 5. Subgraph adjacency matrix ──────────────────────────────────────
+        sub_adj = np.zeros((N_sub, N_sub), dtype=np.float32)
+        sub_adj[new_u, new_v] = 1.0
+
+        # ── 6. OSM static edge features (từ arrays gốc theo old_edge_idx) ─────
+        # Tìm vị trí của mỗi (u_old, v_old) trong edge_index gốc
+        # để lấy length, maxspeed, lanes, highway_type.
+        osm_length_list    = []
+        osm_maxspeed_list  = []
+        osm_lanes_list     = []
+        osm_highway_list   = []
+
+        global_edge_src = self.edge_index[0]
+        global_edge_dst = self.edge_index[1]
+
+        for u_old, v_old in zip(u_idxs, v_idxs):
+            # Tìm edge (u_old→v_old) trong global edge_index
+            mask = (global_edge_src == u_old) & (global_edge_dst == v_old)
+            if mask.any():
+                e_pos = np.where(mask)[0][0]
+                osm_length_list.append(float(self.edge_lengths[e_pos]))
+                osm_maxspeed_list.append(float(self.edge_maxspeed[e_pos]))
+                osm_lanes_list.append(float(self.edge_lanes[e_pos]))
+                osm_highway_list.append(float(self.edge_highway_type[e_pos]))
             else:
-                mean_length = 0.0
-                mean_maxspeed = 0.0
-                mean_lanes = 1.0
-                mean_highway = 14.0
+                # Edge reverse hoặc không tìm thấy → fallback
+                osm_length_list.append(0.0)
+                osm_maxspeed_list.append(0.0)
+                osm_lanes_list.append(1.0)
+                osm_highway_list.append(14.0)  # "other"
 
-            node_features_dict["osm_length_m"][node_idx] = mean_length
-            node_features_dict["osm_maxspeed"][node_idx] = mean_maxspeed
-            node_features_dict["osm_lanes"][node_idx] = mean_lanes
-            node_features_dict["osm_highway_type"][node_idx] = mean_highway
-            node_features_dict["degree"][node_idx] = float(degree)
+        edge_df["osm_length_m"]    = osm_length_list
+        edge_df["osm_maxspeed"]    = osm_maxspeed_list
+        edge_df["osm_lanes"]       = osm_lanes_list
+        edge_df["osm_highway_type"] = osm_highway_list
 
-        # Betweenness (từ osm_data node_features nếu có)
-        if "node_features" in self.osm_data:
-            # FIX: tra cứu index qua feature_names thay vì hardcode bt_idx = 3.
-            # Nếu OSMGraphBuilder thay đổi thứ tự feature, code này vẫn đúng.
-            feature_names_arr = self.osm_data.get("feature_names", np.array([]))
-            feature_names_list = list(feature_names_arr.astype(str))
-            if "betweenness_norm" in feature_names_list:
-                bt_idx = feature_names_list.index("betweenness_norm")
-                bt_col = self.osm_data["node_features"][:, bt_idx]
-                node_features_dict["betweenness_norm"] = bt_col.tolist()
-            else:
-                self.logger.warning(
-                    "'betweenness_norm' không tìm thấy trong feature_names. "
-                    "Sẽ dùng zeros. Kiểm tra OSMGraphBuilder.feature_names."
+        # ── 7. Build edge feature matrix [E_sub, F_edge] ──────────────────────
+        F_edge = len(EDGE_FEATURE_COLS)
+        edge_features = np.zeros((E_sub, F_edge), dtype=np.float32)
+        for f_idx, col in enumerate(EDGE_FEATURE_COLS):
+            if col in edge_df.columns:
+                vals = pd.to_numeric(edge_df[col], errors="coerce").values
+                edge_features[:, f_idx] = np.nan_to_num(
+                    vals.astype(np.float32), nan=0.0
                 )
-                node_features_dict["betweenness_norm"] = [0.0] * N
-        else:
-            node_features_dict["betweenness_norm"] = [0.0] * N
 
-        # Điền TomTom dynamic features nếu có match
-        if not matched_df.empty:
-            # Chỉ lấy các cột có trong CẢ HAI: matched_df VÀ node_features_dict
-            # (TOMTOM_FEATURE_COLS có thể chứa cột như median_speed không có trong NODE_FEATURE_COLS)
-            tomtom_cols_present = [
-                c for c in TOMTOM_FEATURE_COLS
-                if c in matched_df.columns and c in node_features_dict
-            ]
+        # ── 8. Node features: degree + betweenness + lat/lon trong subgraph ───
+        degrees = sub_adj.sum(axis=1).astype(np.float32)  # [N_sub]
 
-            # Aggregate per (osm_u_idx, osm_v_idx)
-            for _, row in matched_df.iterrows():
-                u_idx = int(row["osm_u_idx"])
-                v_idx = int(row["osm_v_idx"])
+        # Betweenness trong subgraph (tính nhanh bằng networkx)
+        betweenness = np.zeros(N_sub, dtype=np.float32)
+        try:
+            import networkx as nx
+            G_sub = nx.DiGraph()
+            G_sub.add_nodes_from(range(N_sub))
+            G_sub.add_edges_from(zip(new_u.tolist(), new_v.tolist()))
+            bt_dict = nx.betweenness_centrality(G_sub, normalized=True)
+            for nidx, bt_val in bt_dict.items():
+                betweenness[nidx] = float(bt_val)
+        except Exception as e:
+            self.logger.warning(f"Betweenness failed for subgraph: {e}")
 
-                for node_idx in [u_idx, v_idx]:
-                    if node_idx >= N:
-                        continue
-                    for col in tomtom_cols_present:
-                        val = row.get(col, np.nan)
-                        if pd.notna(val):
-                            current = node_features_dict[col][node_idx]
-                            if np.isnan(current):
-                                node_features_dict[col][node_idx] = float(val)
-                            else:
-                                # Running mean (simple 2-way merge)
-                                node_features_dict[col][node_idx] = (
-                                    current + float(val)
-                                ) / 2
+        # Normalize lat/lon trong subgraph
+        lats = sub_coords[:, 0]
+        lons = sub_coords[:, 1]
+        lat_norm = (lats - lats.min()) / (lats.max() - lats.min() + 1e-8)
+        lon_norm = (lons - lons.min()) / (lons.max() - lons.min() + 1e-8)
+        deg_norm = degrees / (degrees.max() + 1e-8)
 
-        # Fill NaN TomTom features với free-flow defaults
-        # (speed = maxspeed OSM, congestion = 0)
-        for node_idx in range(N):
-            free_flow_speed = node_features_dict["osm_maxspeed"][node_idx] or 40.0
+        node_features = np.stack(
+            [deg_norm, betweenness, lat_norm.astype(np.float32), lon_norm.astype(np.float32)],
+            axis=1,
+        ).astype(np.float32)   # [N_sub, 4]
 
-            if np.isnan(node_features_dict["average_speed"][node_idx]):
-                node_features_dict["average_speed"][node_idx] = free_flow_speed
-                node_features_dict["harmonic_average_speed"][node_idx] = free_flow_speed
-                node_features_dict["std_speed"][node_idx] = 0.0
-                node_features_dict["travel_time_ratio"][node_idx] = 1.0
-                node_features_dict["congestion_index"][node_idx] = 0.0
-                node_features_dict["speed_limit_ratio"][node_idx] = 1.0
-
-        # Convert → DataFrame
-        node_df = pd.DataFrame(node_features_dict)
-        node_df["osm_node_id"] = self.osm_node_ids
-        return node_df
-
-    def _build_feature_arrays(
-        self, node_df: pd.DataFrame
-    ) -> Dict[str, np.ndarray]:
-        """Convert node DataFrame → numpy arrays."""
-        N = len(self.osm_node_ids)
-        F = len(NODE_FEATURE_COLS)
-
-        node_features = np.zeros((N, F), dtype=np.float32)
-        for f_idx, col in enumerate(NODE_FEATURE_COLS):
-            if col in node_df.columns:
-                vals = node_df[col].values.astype(np.float32)
-                node_features[:, f_idx] = np.nan_to_num(vals, nan=0.0)
+        self.logger.info(
+            f"Subgraph built: {N_sub} nodes, {E_sub} directed edges "
+            f"(từ {len(self.osm_node_ids)} OSM nodes gốc)"
+        )
 
         return {
-            "node_features":    node_features,        # [N, F]
-            "edge_index":       self.edge_index,       # [2, E]
-            "adjacency_matrix": self.adjacency_matrix, # [N, N]
-            "osm_node_ids":     self.osm_node_ids,     # [N]
-            "coordinates":      self.coordinates,      # [N, 2]
-            "feature_names":    np.array(NODE_FEATURE_COLS),
-            "edge_lengths":     self.edge_lengths,
-            "edge_maxspeed":    self.edge_maxspeed,
-            "edge_lanes":       self.edge_lanes,
-            "edge_highway_type": self.edge_highway_type,
+            "node_features":     node_features,        # [N_sub, F_node]
+            "edge_features":     edge_features,         # [E_sub, F_edge]
+            "edge_index":        sub_edge_index,        # [2, E_sub]
+            "adjacency_matrix":  sub_adj,               # [N_sub, N_sub]
+            "osm_node_ids":      sub_node_ids,          # [N_sub]
+            "coordinates":       sub_coords,            # [N_sub, 2]
+            "node_feature_names": np.array(NODE_FEATURE_COLS),
+            "edge_feature_names": np.array(EDGE_FEATURE_COLS),
+            # Giữ lại arrays OSM chi tiết để debug/viz
+            "edge_lengths":      np.array(osm_length_list,   dtype=np.float32),
+            "edge_maxspeed":     np.array(osm_maxspeed_list,  dtype=np.float32),
+            "edge_lanes":        np.array(osm_lanes_list,     dtype=np.float32),
+            "edge_highway_type": np.array(osm_highway_list,   dtype=np.int32),
         }
+
+    def _build_feature_arrays(
+        self, matched_df: pd.DataFrame
+    ) -> Dict[str, np.ndarray]:
+        """
+        Wrapper gọi _build_matched_subgraph.
+        Giữ lại tên method này để tương thích với match_and_build_temporal_features.
+        """
+        return self._build_matched_subgraph(matched_df)
 
     # =========================================================================
     # INTERNAL — UTILITIES
@@ -609,14 +812,12 @@ class TomTomOSMMapMatcher(LoggerMixin):
                 mask = np.isnan(series)
                 if not mask.any():
                     continue
-                # Forward fill
                 last_valid = None
                 for t in range(T):
                     if not mask[t]:
                         last_valid = series[t]
                     elif last_valid is not None:
                         series[t] = last_valid
-                # Backward fill
                 first_valid = None
                 for t in range(T - 1, -1, -1):
                     if not np.isnan(series[t]):
@@ -624,7 +825,34 @@ class TomTomOSMMapMatcher(LoggerMixin):
                     elif first_valid is not None:
                         series[t] = first_valid
                 tensor[n, :, f] = series
-        # Zero-fill remaining NaN
+        tensor = np.nan_to_num(tensor, nan=0.0)
+        return tensor
+
+    def _fill_nan_temporal_edges(self, tensor: np.ndarray) -> np.ndarray:
+        """
+        Forward-fill NaN trong edge temporal tensor [E, T, F].
+        Cùng logic với _fill_nan_temporal nhưng chiều đầu là số edges.
+        """
+        E, T, F = tensor.shape
+        for e in range(E):
+            for f in range(F):
+                series = tensor[e, :, f]
+                mask = np.isnan(series)
+                if not mask.any():
+                    continue
+                last_valid = None
+                for t in range(T):
+                    if not mask[t]:
+                        last_valid = series[t]
+                    elif last_valid is not None:
+                        series[t] = last_valid
+                first_valid = None
+                for t in range(T - 1, -1, -1):
+                    if not np.isnan(series[t]):
+                        first_valid = series[t]
+                    elif first_valid is not None:
+                        series[t] = first_valid
+                tensor[e, :, f] = series
         tensor = np.nan_to_num(tensor, nan=0.0)
         return tensor
 
@@ -640,9 +868,15 @@ class TomTomOSMMapMatcher(LoggerMixin):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_path = output_dir / f"{output_name}_{timestamp}.npz"
 
-        N = len(self.osm_node_ids)
-        E = self.edge_index.shape[1]
-        tomtom_matched = data.get("node_features", np.array([])).shape
+        # Support cả static (node_features) và temporal (edge_features_temporal)
+        N = len(data.get("osm_node_ids", []))
+        E = data.get("edge_index", np.zeros((2, 0))).shape[1]
+
+        temporal_shape = None
+        if "edge_features_temporal" in data:
+            temporal_shape = list(data["edge_features_temporal"].shape)
+        elif "node_features_temporal" in data:
+            temporal_shape = list(data["node_features_temporal"].shape)
 
         metadata = {
             "num_nodes":          N,
@@ -650,9 +884,12 @@ class TomTomOSMMapMatcher(LoggerMixin):
             "match_threshold_m":  self.match_threshold_m,
             "aggregate_method":   self.aggregate_method,
             "time_slot":          time_slot or "all",
-            "feature_cols":       NODE_FEATURE_COLS,
-            "topology_source":    "OpenStreetMap",
-            "feature_source":     "TomTom + OSM hybrid",
+            "edge_feature_cols":  EDGE_FEATURE_COLS,
+            "node_feature_cols":  NODE_FEATURE_COLS,
+            "topology_source":    "OpenStreetMap (matched subgraph only)",
+            "feature_source":     "TomTom real data only (no defaults)",
+            "design":             "Option B: only OSM edges with TomTom match",
+            "temporal_shape":     temporal_shape,
             "created_at":         timestamp,
             "coverage_ratio":     self._coverage_ratio,
         }
@@ -663,7 +900,7 @@ class TomTomOSMMapMatcher(LoggerMixin):
 
         size_mb = file_path.stat().st_size / (1024 * 1024)
         self.logger.info(
-            f"✅ Map-matched graph saved: {file_path.name} ({size_mb:.2f} MB)"
+            f"✅ Map-matched subgraph saved: {file_path.name} ({size_mb:.2f} MB)"
         )
 
     @staticmethod

@@ -283,9 +283,13 @@ class TrafficDataPipelineNPZ:
                 shape = segment.get("shape", [])
                 lats = [p.get("latitude", 0) for p in shape]
                 lons = [p.get("longitude", 0) for p in shape]
-                mid_idx = len(shape) // 2
-                mid_lat = shape[mid_idx]["latitude"]
-                mid_lon = shape[mid_idx]["longitude"]
+                mean_lat = float(np.mean(lats)) if lats else None
+                mean_lon = float(np.mean(lons)) if lons else None
+                # Start/end của shape để dùng trong shortest-path map matching
+                start_lat = float(lats[0])  if lats else None
+                start_lon = float(lons[0])  if lons else None
+                end_lat   = float(lats[-1]) if lats else None
+                end_lon   = float(lons[-1]) if lons else None
 
                 for tr in time_results:
                     record = {
@@ -306,9 +310,14 @@ class TrafficDataPipelineNPZ:
                         "travel_time_std":          tr.get("travelTimeStandardDeviation"),
                         "travel_time_ratio":        tr.get("travelTimeRatio"),
                         "sample_size":              tr.get("sampleSize"),
-                        # Raw coordinates (KHÔNG normalize ở đây)
-                        "raw_latitude":             mid_lat,
-                        "raw_longitude":            mid_lon,
+                        # Raw coordinates — KHÔNG normalize ở đây
+                        "raw_latitude":             mean_lat,
+                        "raw_longitude":            mean_lon,
+                        # Tọa độ đầu/cuối segment để dùng shortest-path map matching
+                        "raw_lat_start":            start_lat,
+                        "raw_lon_start":            start_lon,
+                        "raw_lat_end":              end_lat,
+                        "raw_lon_end":              end_lon,
                     }
                     self.accumulated_data.append(record)
 
@@ -493,7 +502,7 @@ class TrafficDataPipelineNPZ:
         geometry: Dict,
         osm_output_name: str = "osm_graph",
         graph_output_name: str = "graph_structure",
-        match_threshold_m: float = 100.0,
+        match_threshold_m: float = 50.0,
         force_rebuild_osm: bool = False,
     ):
         """
@@ -567,15 +576,21 @@ class TrafficDataPipelineNPZ:
             self.logger.error("Map matching failed.")
             return
 
-        N = len(osm_graph_data["osm_node_ids"])
-        E = osm_graph_data["edge_index"].shape[1]
-        temporal_shape = result.get("node_features_temporal", np.array([])).shape
+        N = len(result.get("osm_node_ids", []))
+        E = result.get("edge_index", np.zeros((2, 0))).shape[1]
+        temporal_shape = result.get(
+            "edge_features_temporal",
+            result.get("node_features_temporal", np.array([]))
+        ).shape
 
-        self.logger.info("✅ Stage 6 complete — Map-matched graph structure built")
-        self.logger.info(f"   OSM Nodes: {N} | Directed Edges: {E}")
+        self.logger.info("✅ Stage 6 complete — Matched subgraph built (Option B)")
+        self.logger.info(f"   Subgraph nodes: {N} | Matched edges: {E}")
         self.logger.info(f"   Temporal features shape: {temporal_shape}")
         self.logger.info(
-            f"   Topology: OSM road network (không còn distance_threshold hack)"
+            f"   Coverage: {matcher._coverage_ratio:.1%} TomTom segments matched"
+        )
+        self.logger.info(
+            "   Design: chỉ OSM edges có TomTom data — không có default giả"
         )
 
     # INTERNAL HELPERS
@@ -860,49 +875,57 @@ class TrafficDataPipelineNPZ:
 
     @staticmethod
     def _rebuild_nx_graph(osm_data: Dict[str, np.ndarray]) -> "nx.MultiDiGraph":
+        """
+        Tái tạo NetworkX graph từ OSM arrays để dùng ox.nearest_edges.
+        Nhẹ hơn nhiều so với re-download OSM.
+
+        BUG FIX: thêm geometry (LineString) vào mỗi edge để ox.nearest_edges
+        tính khoảng cách chính xác đến đoạn thẳng thay vì chỉ đến node gần nhất.
+        Nếu không có geometry, nearest_edges dùng khoảng cách tới node trung điểm
+        → sai lệch lớn với segments dài, gây coverage = 0.
+        """
         import networkx as nx
-        from shapely.geometry import LineString
+        try:
+            from shapely.geometry import LineString
+            _has_shapely = True
+        except ImportError:
+            _has_shapely = False
 
         G = nx.MultiDiGraph()
-        G.graph["crs"] = "EPSG:4326"  # viết hoa để chắc chắn
-
+        G.graph["crs"] = "epsg:4326"
         node_ids = osm_data["osm_node_ids"]
-        coords = osm_data["coordinates"]
+        coords = osm_data["coordinates"]          # [N, 2] (lat, lon)
         edge_index = osm_data["edge_index"]
         edge_lengths = osm_data.get("edge_lengths", np.zeros(edge_index.shape[1]))
 
-        # ── Add nodes ─────────────────────────────────────────────
+        # Add nodes — x=lon, y=lat (OSMnx convention)
         for idx, nid in enumerate(node_ids):
-            lat = float(coords[idx, 0])
-            lon = float(coords[idx, 1])
-            G.add_node(int(nid), y=lat, x=lon)
+            G.add_node(int(nid), y=float(coords[idx, 0]), x=float(coords[idx, 1]))
 
-        # ── Add edges WITH GEOMETRY ───────────────────────────────
+        # Add edges với geometry để ox.nearest_edges tính dist đúng.
+        # BUG FIX (cũ): dùng key=(min,max) để dedup → mất cung ngược chiều.
+        # FIX: thêm tất cả cung, dùng e_idx làm key.
         for e_idx in range(edge_index.shape[1]):
             u_idx = edge_index[0, e_idx]
             v_idx = edge_index[1, e_idx]
-
             u_nid = int(node_ids[u_idx])
             v_nid = int(node_ids[v_idx])
-
-            lat_u, lon_u = coords[u_idx]
-            lat_v, lon_v = coords[v_idx]
-
             length = float(edge_lengths[e_idx]) if e_idx < len(edge_lengths) else 0.0
 
-            # ✅ FIX QUAN TRỌNG: tạo LineString
-            geom = LineString([
-                (lon_u, lat_u),  # (x, y)
-                (lon_v, lat_v)
-            ])
+            edge_attrs: Dict = {"key": e_idx, "length": length}
 
-            G.add_edge(
-                u_nid,
-                v_nid,
-                key=e_idx,
-                length=length,
-                geometry=geom
-            )
+            # Tạo LineString từ tọa độ u→v để nearest_edges dùng projected distance.
+            # OSMnx dùng geometry.coords cho khoảng cách đến đường thẳng.
+            if _has_shapely:
+                u_lon = float(coords[u_idx, 1])
+                u_lat = float(coords[u_idx, 0])
+                v_lon = float(coords[v_idx, 1])
+                v_lat = float(coords[v_idx, 0])
+                edge_attrs["geometry"] = LineString(
+                    [(u_lon, u_lat), (v_lon, v_lat)]
+                )
+
+            G.add_edge(u_nid, v_nid, **edge_attrs)
 
         return G
 

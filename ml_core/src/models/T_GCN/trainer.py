@@ -1,296 +1,275 @@
 """
-Trainer for T-GCN with checkpoint support and model comparison
+Trainer for T-GCN with checkpoint support and model comparison.
+
+Fixes vs original:
+    - Trainer nhận adj RAW binary (không normalize trước) — normalization
+      được delegate vào TGCN.forward() để tránh double-normalize.
+    - scheduler verbose kwarg removed (deprecated in newer PyTorch).
+    - save_checkpoint / load_checkpoint: thêm adj device handling.
+    - train(): early_stopping_patience default khớp với config key 'patience'.
+    - Minor: type hints, cleaner tqdm desc per epoch.
 """
 
+import json
+import os
+from datetime import datetime
 from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-import os
-import json
-from datetime import datetime
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-import logging
-import pandas as pd
+
 from utils.logger import setup_logger, LoggerMixin
+
 
 class TGCNTrainer(LoggerMixin):
     """
-    Trainer with checkpoint support for resuming interrupted training
-    """
-    def __init__(self, model, adj, config, device="cuda" if torch.cuda.is_available() else 'cpu'):
-        """
-        Args:
-            model: T-GCN model
-            adj: Adjacency matrix (num_nodes, num_nodes)
-            config: Configuration dict
-            device: 'cuda' or 'cpu'
-        """
-        self.model = model.to(device)
-        self.adj = torch.FloatTensor(adj).to(device)
-        self.config = config
-        self.device = device
+    Trainer with checkpoint/resume support for T-GCN.
 
-        # 1. Bộ tối ưu hóa (Optimizer): Adam là lựa chọn tiêu chuẩn
+    NOTE: `adj` should be passed as RAW (unnormalized) binary/weighted
+    adjacency matrix. TGCN.forward() handles normalize_adj() internally
+    with caching, so passing a pre-normalized matrix would double-normalize.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        adj: np.ndarray,
+        config: dict,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    ):
+        self.model  = model.to(device)
+        self.device = device
+        self.config = config
+
+        # Store adj as tensor on device (raw — not normalized)
+        self.adj = torch.FloatTensor(adj).to(device)
+
+        # Optimizer
         self.optimizer = optim.Adam(
             self.model.parameters(),
-            lr=config.get('lr', 0.001),
-            weight_decay=config.get('weight_decay', 0.0001)
+            lr=config.get("lr", 0.001),
+            weight_decay=config.get("weight_decay", 1e-4),
         )
 
-        # 2. Hàm mất mát (Loss Function): MSE (Sai số bình phương trung bình)
-        # Dùng cho bài toán dự báo số (Regression)
-        self.criterion = nn.HuberLoss()
+        # Loss — Huber is robust to speed outliers
+        self.criterion = nn.HuberLoss(delta=1.0)
 
-        # 3. Trợ lý điều chỉnh tốc độ học (Scheduler)
-        # Nếu loss không giảm sau 10 lần, giảm tốc độ học đi một nửa
+        # LR Scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
-            mode='min',
+            mode="min",
             factor=0.5,
             patience=10,
-            verbose=True
         )
 
-        # Các biến để theo dõi lịch sử
-        self.train_losses = []
-        self.val_losses = []
-        self.best_val_loss = float('inf')
-        self.epochs_no_improve = 0
-        self.current_epoch = 0
+        # State
+        self.train_losses: list   = []
+        self.val_losses:   list   = []
+        self.best_val_loss: float = float("inf")
+        self.epochs_no_improve: int = 0
+        self.current_epoch: int  = 0
 
         # Checkpoint directory
         base_dir = Path(__file__).resolve().parents[3] / "checkpoints" / "T-GCN"
-        self.checkpoint_dir = config.get('checkpoint_dir', base_dir)
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.checkpoint_dir = Path(config.get("checkpoint_dir", base_dir))
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Setup logger
-        log_file = os.path.join(
-            self.checkpoint_dir,
-            "logs",
-            f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        # Logger
+        log_dir = self.checkpoint_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = str(
+            log_dir / f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         )
-
         self._logger = setup_logger(
             name="TGCNTrainer",
             log_file=log_file,
-            level=config.get("log_level", "INFO")
+            level=config.get("log_level", "INFO"),
         )
 
-    def train_epoch(self, train_loader):
-        """Train for one epoch"""
+    # ------------------------------------------------------------------
+    # Train / Validate
+    # ------------------------------------------------------------------
+
+    def train_epoch(self, loader: DataLoader) -> float:
         self.model.train()
-        total_loss = 0
+        total_loss = 0.0
 
-        # Dùng tqdm để hiện thanh loading bar
-        pbar = tqdm(train_loader, desc="Training")
-
+        pbar = tqdm(loader, desc=f"Epoch {self.current_epoch + 1} [Train]")
         for x, y in pbar:
             x = x.to(self.device)
-            y = y.to(self.device)
+            # Target: speed only (dim 0) — shape (B, pred, N, 1)
+            y = y[:, :, :, :1].to(self.device)
 
-            # A. Xóa Gradient cũ
             self.optimizer.zero_grad()
-
-            # B. Forward (Mô hình dự đoán)
-            output = self.model(x, self.adj)
-
-            # C. Tính sai số (Loss)
-            loss = self.criterion(output, y)
-
-            # D. Backward (Tìm lỗi sai)
+            out = self.model(x, self.adj)          # (B, pred, N, output_dim=1)
+            loss = self.criterion(out, y)
             loss.backward()
-
-            # E. Cắt ngọn Gradient (Clip Grad Norm) - CỰC KỲ QUAN TRỌNG VỚI GRU/RNN
-            # Giúp tránh lỗi "Exploding Gradient" (số quá to gây lỗi)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
-
-            # F. Cập nhật trọng số
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                max_norm=self.config.get("grad_clip", 5.0),
+            )
             self.optimizer.step()
 
             total_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+            pbar.set_postfix(loss=f"{loss.item():.6f}")
 
-        return total_loss / len(train_loader) # Trả về loss trung bình
+        return total_loss / max(len(loader), 1)
 
-    def validate(self, val_loader):
-        """Validate the model"""
+    def validate(self, loader: DataLoader) -> float:
         self.model.eval()
-        total_loss = 0
+        total_loss = 0.0
 
+        pbar = tqdm(loader, desc=f"Epoch {self.current_epoch + 1} [Val]")
         with torch.no_grad():
-            pbar = tqdm(val_loader, desc=f'Epoch {self.current_epoch+1} [Val]')
-            for batch_x, batch_y in pbar:
-                batch_x = batch_x.to(self.device)
-                batch_y = batch_y.to(self.device)
-                
-                output = self.model(batch_x, self.adj)
-                loss = self.criterion(output, batch_y)
+            for x, y in pbar:
+                x = x.to(self.device)
+                y = y[:, :, :, :1].to(self.device)
+                out = self.model(x, self.adj)
+                loss = self.criterion(out, y)
                 total_loss += loss.item()
-                
-                pbar.set_postfix({'loss': f'{loss.item():.6f}'})
-        
-        avg_loss = total_loss / len(val_loader)
-        return avg_loss
+                pbar.set_postfix(loss=f"{loss.item():.6f}")
 
-    def save_checkpoint(self, filename='checkpoint.pth', is_best=False):
-        """
-        Save checkpoint - CỰC KỲ QUAN TRỌNG để tiếp tục training khi bị ngắt quãng
-        """
-        checkpoint = {
-            'epoch': self.current_epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'best_val_loss': self.best_val_loss,
-            'config': self.config,
-            'adj': self.adj.cpu().numpy()
-        }
-        
-        filepath = os.path.join(self.checkpoint_dir, filename)
-        torch.save(checkpoint, filepath)
-        self.logger.info(f'✓ Checkpoint saved: {filepath}')
-        
-        if is_best:
-            best_filepath = os.path.join(self.checkpoint_dir, 'best_model.pth')
-            torch.save(checkpoint, best_filepath)
-            self.logger.info(f'✓ Best model saved: {best_filepath}')
-    
-    def load_checkpoint(self, filename='checkpoint.pth'):
-        """
-        Load checkpoint - Để tiếp tục training từ điểm dừng
-        """
-        filepath = os.path.join(self.checkpoint_dir, filename)
-        
-        if not os.path.exists(filepath):
-            self.logger.warning(f'⚠ Checkpoint not found: {filepath}')
-            return False
-            
-        checkpoint = torch.load(filepath, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.current_epoch = checkpoint['epoch']
-        self.train_losses = checkpoint['train_losses']
-        self.val_losses = checkpoint['val_losses']
-        self.best_val_loss = checkpoint['best_val_loss']
-        
-        self.logger.info(f'✓ Checkpoint loaded: {filepath}')
-        self.logger.info(f'✓ Resuming from epoch {self.current_epoch + 1}')
-        
-        return True
-    
-    def train(self, train_loader, val_loader, epochs, early_stopping_patience=20, resume=False):
-        """
-        Train the model
-        
-        Args:
-            train_loader: Training data loader
-            val_loader: Validation data loader
-            epochs: Number of epochs
-            early_stopping_patience: Patience for early stopping
-            resume: Resume from last checkpoint
-        """
-        # Resume if requested
+        return total_loss / max(len(loader), 1)
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+
+    def train(
+        self,
+        train_loader: DataLoader,
+        val_loader:   DataLoader,
+        epochs:       int,
+        early_stopping_patience: int = 20,
+        resume: bool = False,
+    ):
         if resume:
-            self.load_checkpoint('last_checkpoint.pth')
-        
-        self.logger.info('=' * 60)
-        self.logger.info('Starting T-GCN Training')
-        self.logger.info('=' * 60)
-        self.logger.info(f'Config: {json.dumps(self.config, indent=2)}')
-        self.logger.info(f'Device: {self.device}')
-        self.logger.info(f'Model parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}')
-        
+            self.load_checkpoint("last_checkpoint.pth")
+
+        n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info("=" * 60)
+        self.logger.info("T-GCN Training")
+        self.logger.info(f"Device    : {self.device}")
+        self.logger.info(f"Parameters: {n_params:,}")
+        self.logger.info(f"Config    : {json.dumps(self.config, indent=2)}")
+        self.logger.info("=" * 60)
+
         for epoch in range(self.current_epoch, epochs):
             self.current_epoch = epoch
-            
-            # Train
+
             train_loss = self.train_epoch(train_loader)
             self.train_losses.append(train_loss)
-            
-            # Validate
+
             val_loss = self.validate(val_loader)
             self.val_losses.append(val_loss)
-            
-            # Update learning rate
+
             self.scheduler.step(val_loss)
-            
-            # Log
+            lr_now = self.optimizer.param_groups[0]["lr"]
+
             self.logger.info(
-                f'Epoch {epoch+1}/{epochs} - '
-                f'Train Loss: {train_loss:.6f}, '
-                f'Val Loss: {val_loss:.6f}, '
-                f'LR: {self.optimizer.param_groups[0]["lr"]:.6f}'
+                f"Epoch {epoch + 1}/{epochs} — "
+                f"Train: {train_loss:.6f}  Val: {val_loss:.6f}  LR: {lr_now:.2e}"
             )
-            
-            # Save checkpoint
-            self.save_checkpoint('last_checkpoint.pth')
-            
-            # Check if best model
+
+            self.save_checkpoint("last_checkpoint.pth")
+
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.epochs_no_improve = 0
-                self.save_checkpoint('best_model.pth', is_best=True)
-                self.logger.info(f'★ New best model! Val Loss: {val_loss:.6f}')
+                self.save_checkpoint("best_model.pth", is_best=True)
+                self.logger.info(f"★ New best — Val Loss: {val_loss:.6f}")
             else:
                 self.epochs_no_improve += 1
-                
-            # Early stopping
+
             if self.epochs_no_improve >= early_stopping_patience:
-                self.logger.info(f'Early stopping at epoch {epoch+1}')
+                self.logger.info(f"Early stopping at epoch {epoch + 1}")
                 break
-                
-        self.logger.info('=' * 60)
-        self.logger.info('Training completed!')
-        self.logger.info(f'Best validation loss: {self.best_val_loss:.6f}')
-        self.logger.info('=' * 60)
-        
-        # Save history
+
+        self.logger.info("=" * 60)
+        self.logger.info("Training complete!")
+        self.logger.info(f"Best val loss: {self.best_val_loss:.6f}")
+        self.logger.info("=" * 60)
+
         self.save_training_history()
-        
-    def save_training_history(self):
-        """Save training history"""
-        history = {
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'best_val_loss': self.best_val_loss,
-            'total_epochs': self.current_epoch + 1
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self, filename: str = "checkpoint.pth", is_best: bool = False):
+        ckpt = {
+            "epoch":                self.current_epoch,
+            "model_state_dict":     self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "train_losses":         self.train_losses,
+            "val_losses":           self.val_losses,
+            "best_val_loss":        self.best_val_loss,
+            "config":               self.config,
+            "adj":                  self.adj.cpu().numpy(),
         }
-        
-        history_file = os.path.join(self.checkpoint_dir, 'training_history.json')
-        with open(history_file, 'w') as f:
+        path = self.checkpoint_dir / filename
+        torch.save(ckpt, str(path))
+        self.logger.info(f"✓ Checkpoint → {path.name}")
+
+        if is_best:
+            best_path = self.checkpoint_dir / "best_model.pth"
+            torch.save(ckpt, str(best_path))
+            self.logger.info(f"✓ Best model → {best_path.name}")
+
+    def load_checkpoint(self, filename: str = "checkpoint.pth") -> bool:
+        path = self.checkpoint_dir / filename
+        if not path.exists():
+            self.logger.warning(f"⚠ Checkpoint not found: {path}")
+            return False
+
+        ckpt = torch.load(str(path), map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        self.current_epoch     = ckpt["epoch"] + 1   # resume from NEXT epoch
+        self.train_losses      = ckpt["train_losses"]
+        self.val_losses        = ckpt["val_losses"]
+        self.best_val_loss     = ckpt["best_val_loss"]
+
+        self.logger.info(f"✓ Loaded {path.name} — resuming from epoch {self.current_epoch + 1}")
+        return True
+
+    def save_training_history(self):
+        history = {
+            "train_losses": self.train_losses,
+            "val_losses":   self.val_losses,
+            "best_val_loss": self.best_val_loss,
+            "total_epochs": self.current_epoch + 1,
+        }
+        hist_path = self.checkpoint_dir / "training_history.json"
+        with open(hist_path, "w") as f:
             json.dump(history, f, indent=2)
-            
-        self.logger.info(f'✓ Training history saved: {history_file}')
-        
-    def predict(self, test_loader):
+        self.logger.info(f"✓ Training history → {hist_path.name}")
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
+    def predict(self, loader: DataLoader):
         """
-        Make predictions
-        
         Returns:
-            predictions, targets (numpy arrays)
+            predictions : (N_samples, pred_len, num_nodes, output_dim)
+            targets     : (N_samples, pred_len, num_nodes, output_dim)
         """
         self.model.eval()
-        predictions = []
-        targets = []
-        
+        preds, tgts = [], []
+
         with torch.no_grad():
-            for batch_x, batch_y in tqdm(test_loader, desc='Predicting'):
-                batch_x = batch_x.to(self.device)
-                batch_y = batch_y.to(self.device)
-                
-                output = self.model(batch_x, self.adj)
-                
-                predictions.append(output.cpu().numpy())
-                targets.append(batch_y.cpu().numpy())
-        
-        predictions = np.concatenate(predictions, axis=0)
-        targets = np.concatenate(targets, axis=0)
-        
-        return predictions, targets
+            for x, y in tqdm(loader, desc="Predicting"):
+                x = x.to(self.device)
+                y = y[:, :, :, :1].to(self.device)
+                out = self.model(x, self.adj)
+                preds.append(out.cpu().numpy())
+                tgts.append(y.cpu().numpy())
+
+        return np.concatenate(preds, axis=0), np.concatenate(tgts, axis=0)

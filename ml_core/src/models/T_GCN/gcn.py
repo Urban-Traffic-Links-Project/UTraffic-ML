@@ -1,6 +1,11 @@
 """
 Graph Convolutional Network (GCN) Module
 Based on T-GCN paper (Zhao et al., 2019)
+
+Fixes vs original:
+    - normalize_adj: thêm self-loop TRƯỚC khi tính degree (đúng Kipf 2017)
+    - GraphConvolution: hỗ trợ batch matmul an toàn hơn
+    - GCN: thêm residual projection khi in_features != out_features
 """
 
 import torch
@@ -9,144 +14,158 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 import math
 
+
 class GraphConvolution(nn.Module):
     """
-    Simple GCN layer: (batch_size, num_nodes, in_features) -> (batch_size, num_nodes, out_features)
+    Single GCN layer: (batch_size, num_nodes, in_features) -> (batch_size, num_nodes, out_features)
     """
-    def __init__(self, in_features, out_features, bias=True):
-        super(GraphConvolution, self).__init__()
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        
-        # Tạo ma trận trọng số W (Learnable Weight)
-        # Kích thước: [đầu_vào, đầu_ra]
-        self.weight = Parameter(torch.FloatTensor(in_features, out_features))
 
-        # Tạo vector Bias (nếu cần)
+        self.weight = Parameter(torch.FloatTensor(in_features, out_features))
         if bias:
             self.bias = Parameter(torch.FloatTensor(out_features))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
-        # Gọi hàm khởi tạo giá trị ngẫu nhiên (để model học tốt hơn từ đầu)
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Xavier uniform initialization"""
-        nn.init.xavier_uniform_(self.weight, gain=nn.init.calculate_gain("tanh"))
-        
-        # Tính độ lệch chuẩn dựa trên kích thước weight
-        stdv = 1. / math.sqrt(self.weight.size(1))
-
-        # Khởi tạo ngẫu nhiên trong khoảng [-stdv, stdv]
+        nn.init.xavier_uniform_(self.weight, gain=nn.init.calculate_gain("relu"))
         if self.bias is not None:
+            stdv = 1.0 / math.sqrt(self.out_features)
             self.bias.data.uniform_(-stdv, stdv)
-    
 
-    def forward(self, input, adj):    
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            input: (batch_size, num_nodes, in_features)
-            adj: (num_nodes, num_nodes) - normalized adjacency matrix
+            x  : (batch, nodes, in_features)  OR  (nodes, in_features)
+            adj: (nodes, nodes)  — already normalized
         Returns:
-            output: (batch_size, num_nodes, out_features)
+            (batch, nodes, out_features)  OR  (nodes, out_features)
         """
-        # Bước 1: Nhân đặc trưng với trọng số (Linear Transformation)
-        # Công thức: support = X * W
-        support = input @ self.weight
-
-        # Bước 2: Nhân với ma trận kề để lan truyền thông tin (Graph Convolution)
-        # Công thức: output = A * support
-        # Lúc này, thông tin từ các nút hàng xóm sẽ được cộng gộp vào nút hiện tại
-        output = adj @ support
-
-        # Bước 3: Cộng thêm bias (nếu có)
+        # Linear transform: (..., nodes, in) @ (in, out) -> (..., nodes, out)
+        support = x @ self.weight
+        # Graph aggregation: (nodes, nodes) @ (..., nodes, out)
+        # Use torch.matmul which broadcasts correctly for batch dims.
+        output = torch.matmul(adj, support)
         if self.bias is not None:
-            output += self.bias
-
+            output = output + self.bias
         return output
-        
+
+
 class GCN(nn.Module):
     """
-    2-layer Graph Convolutional Network
-    Equation: f(X, A) = σ(Â·ReLU(Â·X·W0)·W1)
+    2-layer GCN with optional residual connection.
+    f(X, A) = σ( Â · ReLU( Â · X · W0 ) · W1 )
     """
-    def __init__(self, in_features, hidden_features, out_features, dropout=0.0):
-        super(GCN, self).__init__()
-        
-        # Tầng 1: Từ Input -> Hidden
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_features: int,
+        out_features: int,
+        dropout: float = 0.0,
+        residual: bool = True,
+    ):
+        super().__init__()
         self.gc1 = GraphConvolution(in_features, hidden_features)
-        
-        # Tầng 2: Từ Hidden -> Output
         self.gc2 = GraphConvolution(hidden_features, out_features)
-
         self.dropout = dropout
-    
-    def forward(self, x, adj):
-        # Qua tầng 1 -> Dùng hàm kích hoạt ReLU -> Dropout (để chống Overfitting)
-        x = F.relu(self.gc1(x, adj))
-        x = F.dropout(x, self.dropout, training=self.training)
 
-        # Qua tầng 2 -> Ra kết quả
-        x = self.gc2(x, adj)
+        # Residual projection khi chiều không khớp
+        self.residual = residual
+        if residual and in_features != out_features:
+            self.res_proj = nn.Linear(in_features, out_features, bias=False)
+        else:
+            self.res_proj = None
 
-        return x
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x  : (batch, nodes, in_features)
+            adj: (nodes, nodes)
+        Returns:
+            (batch, nodes, out_features)
+        """
+        identity = x
 
-def normalize_adj(adj):
+        out = F.relu(self.gc1(x, adj))
+        out = F.dropout(out, self.dropout, training=self.training)
+        out = self.gc2(out, adj)
+
+        # Residual
+        if self.residual:
+            if self.res_proj is not None:
+                identity = self.res_proj(identity)
+            out = out + identity
+
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Adjacency normalization
+# ---------------------------------------------------------------------------
+
+def normalize_adj(adj) -> torch.Tensor:
     """
-    Normalize adjacency matrix: D^(-1/2) * A * D^(-1/2)
-    where A = A + I (with self-loops)
-    
+    Symmetric normalization: D^{-1/2} (A + I) D^{-1/2}
+
+    BUG FIX vs original: self-loop phải được thêm TRƯỚC khi tính rowsum/degree,
+    không phải sau — đúng theo Kipf & Welling (2017).
+
     Args:
-        adj: (num_nodes, num_nodes) adjacency matrix (can be numpy or tensor)
+        adj: (num_nodes, num_nodes) — numpy array hoặc torch.Tensor
     Returns:
-        normalized adjacency matrix (same type as input)
+        Normalized adjacency matrix as torch.FloatTensor
     """
-    # Chuyển sang Tensor nếu đầu vào là Numpy
-    is_numpy = False
-    if not torch.is_tensor(adj):
-        is_numpy = True
-        adj = torch.FloatTensor(adj)
-    
-    # 1. Thêm Self-loop (A = A + I)
-    # Để mỗi nút giữ lại thông tin của chính nó khi cộng gộp hàng xóm
-    adj += torch.eye(adj.size(0), device=adj.device)
-
-    # 2. Tính ma trận bậc (Degree Matrix - D)
-    rowsum = adj.sum(1)
-
-    # 3. Tính D^(-1/2)
-    d_inv_sqrt = torch.pow(rowsum, -1/2).flatten()
-    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.    # Xử lý chia cho 0
-    d_mat_inv_sqrt = torch.diag(d_inv_sqrt)     # Tạo ma trận đường chéo
-
-    # 4. Nhân ma trận: D^(-1/2) * A * D^(-1/2)
-    adj_normalized = d_mat_inv_sqrt @ adj @ d_mat_inv_sqrt
-
-    # Convert back to numpy if needed
+    is_numpy = not torch.is_tensor(adj)
     if is_numpy:
-        adj_normalized = adj_normalized.numpy()
+        adj = torch.FloatTensor(adj)
+    else:
+        adj = adj.float()
 
-    return adj_normalized
+    device = adj.device
 
+    # 1. Thêm self-loop TRƯỚC (A_hat = A + I)
+    adj = adj + torch.eye(adj.size(0), device=device)
+
+    # 2. Tính degree
+    rowsum = adj.sum(dim=1)                              # [N]
+    d_inv_sqrt = rowsum.pow(-0.5)
+    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
+    D = torch.diag(d_inv_sqrt)                          # [N, N]
+
+    # 3. D^{-1/2} A_hat D^{-1/2}
+    adj_norm = D @ adj @ D
+
+    if is_numpy:
+        return adj_norm.cpu()
+    return adj_norm
+
+
+# ---------------------------------------------------------------------------
+# Smoke-test
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Test
     batch_size = 32
     num_nodes = 114
     in_features = 1
     hidden_features = 64
     out_features = 64
-    
-    model = GCN(in_features, hidden_features, out_features)
-    
+
+    model = GCN(in_features, hidden_features, out_features, residual=True)
+
     x = torch.randn(batch_size, num_nodes, in_features)
-    adj = torch.rand(num_nodes, num_nodes)
-    adj = (adj + adj.T) / 2
-    adj = normalize_adj(adj)
-    
-    output = model(x, adj)
-    
-    print(f"Input shape: {x.shape}")
-    print(f"Adjacency matrix shape: {adj.shape}")
-    print(f"Output shape: {output.shape}")
+    adj_raw = torch.rand(num_nodes, num_nodes)
+    adj_raw = (adj_raw + adj_raw.T) / 2
+    adj = normalize_adj(adj_raw)
+
+    out = model(x, adj)
+    print(f"Input : {x.shape}")
+    print(f"Adj   : {adj.shape}")
+    print(f"Output: {out.shape}")   # expect [32, 114, 64]

@@ -1,653 +1,509 @@
 """
-Data Loader for Urban Traffic Links Dataset
-Load and prepare data from .npz files
+Data Loader for DTC-STGCN
+Load and prepare data from .npz files produced by the pipeline.
+
+Normalize contract (single source of truth):
+    - NPZ từ export_for_model_training(normalize=True) → data ĐÃ normalize + có scaler_mean/scale
+    - NPZ từ export_for_model_training(normalize=False) → data CHƯA normalize, không có scaler
+    - prepare_for_training(normalize=False) → KHÔNG scale thêm, dùng dữ liệu nguyên bản
+    - prepare_for_training(normalize=True)  → chỉ scale khi NPZ chưa normalize (fallback)
+    => Không bao giờ normalize 2 lần.
 """
 
+import os
+import sys
+import json
+import glob
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
-import os
-import sys
 
-
+# Dataset
 class TrafficDataset(Dataset):
-    """PyTorch Dataset for traffic data"""
-    
-    def __init__(self, X, y):
+    """PyTorch Dataset for traffic data."""
+
+    def __init__(self, X: np.ndarray, y: np.ndarray):
         """
         Args:
-            X: Input sequences (samples, seq_len, nodes, features)
-            y: Target sequences (samples, pred_len, nodes, features)
+            X: (samples, seq_len, nodes, features)
+            y: (samples, pred_len, nodes, features)
         """
         self.X = torch.FloatTensor(X)
         self.y = torch.FloatTensor(y)
-        
+
     def __len__(self):
         return len(self.X)
-    
+
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-
-def load_graph_structure(filepath):
+# Low-level loaders
+def load_graph_structure(filepath: str):
     """
-    Load graph structure from .npz file
+    Load graph structure from .npz (graph_structure_*.npz từ map_matcher).
+
+    Returns:
+        adj            : (N, N) binary adjacency — raw, chưa normalize
+        node_features  : (N, F) hoặc None
+        coordinates    : (N, 2) hoặc None
+        segment_ids    : (N,) hoặc None
     """
     data = np.load(filepath, allow_pickle=True)
-    
-    print("\n=== Loading Graph Structure ===")
-    print(f"File: {filepath}")
-    
+    print(f"\n=== Loading Graph Structure: {os.path.basename(filepath)} ===")
+
+    # ── Adjacency matrix ──
     if 'adjacency_matrix' in data:
-        adj = data['adjacency_matrix']
-        print(f"Loaded adjacency matrix: {adj.shape}")
+        adj = data['adjacency_matrix'].astype(np.float32)
+        print(f"Adjacency matrix: {adj.shape}")
     elif 'edge_index' in data:
         edge_index = data['edge_index']
-
         if 'num_nodes' in data:
             num_nodes = int(data['num_nodes'])
         elif 'node_features' in data:
-            num_nodes = data['node_features'].shape[0]
+            num_nodes = int(data['node_features'].shape[0])
+        elif 'coordinates' in data:
+            num_nodes = int(data['coordinates'].shape[0])
         else:
             num_nodes = int(edge_index.max()) + 1
-
-        # Create adjacency matrix from edge_index
-        adj = np.zeros((num_nodes, num_nodes))
-        if edge_index.shape[1] > 0:
-            adj[edge_index[0], edge_index[1]] = 1
-        
-        print(f"Created adjacency from edge_index: {adj.shape}")
-        print(f"Number of edges: {edge_index.shape[1]}")
+        adj = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+        if edge_index.ndim == 2 and edge_index.shape[1] > 0:
+            adj[edge_index[0], edge_index[1]] = 1.0
+        print(f"Built adjacency from edge_index: {adj.shape}, edges={int(adj.sum())}")
     else:
         adj = None
-        print("No adjacency data found")
-    
-    # Get other data
+        print("Warning: No adjacency data found in graph file")
+
     node_features = data['node_features'] if 'node_features' in data else None
-    coordinates = data['coordinates'] if 'coordinates' in data else None
-    segment_ids = data['segment_ids'] if 'segment_ids' in data else None
-    
+    coordinates   = data['coordinates']   if 'coordinates'   in data else None
+    segment_ids   = data['osm_node_ids']  if 'osm_node_ids'  in data else (
+                    data['segment_ids']   if 'segment_ids'   in data else None)
+
     if node_features is not None:
-        print(f"Node features shape: {node_features.shape}")
+        print(f"Node features: {node_features.shape}")
     if coordinates is not None:
-        print(f"Coordinates shape: {coordinates.shape}")
-    
-    # ===== THÊM: In graph statistics =====
+        print(f"Coordinates: {coordinates.shape}")
     if adj is not None:
-        num_edges = np.count_nonzero(adj)
-        avg_degree = num_edges / adj.shape[0] if adj.shape[0] > 0 else 0
-        print(f"Graph stats: {num_edges} edges, avg degree: {avg_degree:.2f}")
-    
+        n_edges = int(adj.sum())
+        avg_deg = n_edges / adj.shape[0] if adj.shape[0] > 0 else 0
+        print(f"Graph stats: {n_edges} edges, avg degree={avg_deg:.2f}")
+
     return adj, node_features, coordinates, segment_ids
 
 
-def load_model_ready_data(filepath):
+def _coerce_to_float32(arr: np.ndarray, key: str) -> np.ndarray:
     """
-    Load preprocessed model-ready data
-    
-    Args:
-        filepath: Path to model_ready_data_*.npz
-    
-    Returns:
-        Dictionary with train/val/test splits
+    Chuyển array (kể cả object dtype) về float32 một cách an toàn.
+    Raise ValueError nếu không thể.
     """
-    data = np.load(filepath, allow_pickle=True)
-    print("Available keys in npz:", data.files)
-    
-    print("\n=== Loading Model Ready Data ===")
-    print(f"File: {filepath}")
-    
-    # Extract data
-    result = {}
-    for key in ['X_train', 'y_train', 'X_val', 'y_val', 'X_test', 'y_test']:
-        if key in data:
-            arr = data[key]
-            
-            # Convert object array to float
-            if arr.dtype == object:
-                # Try to convert object array containing nested arrays
-                try:
-                    # First, check if it's an array of arrays
-                    if len(arr) > 0:
-                        first_elem = arr[0]
-                        if isinstance(first_elem, np.ndarray):
-                            # It's an array of numpy arrays - check if they contain strings
-                            if first_elem.dtype == object:
-                                # Nested object arrays - likely contains strings
-                                print(f"Warning: {key} contains nested object arrays (likely string values)")
-                                print(f"  Attempting to filter numeric values only...")
-                                
-                                # Try to convert each sample, filtering out non-numeric values
-                                arr_list = []
-                                for i, sample in enumerate(arr):
-                                    if isinstance(sample, np.ndarray) and sample.dtype == object:
-                                        # Filter numeric values from each sample
-                                        sample_flat = sample.flatten()
-                                        numeric_values = []
-                                        for val in sample_flat:
-                                            try:
-                                                numeric_values.append(float(val))
-                                            except (ValueError, TypeError):
-                                                # Skip non-numeric values
-                                                continue
-                                        
-                                        if len(numeric_values) > 0:
-                                            # Reshape to original shape if possible, otherwise use flat
-                                            try:
-                                                sample_numeric = np.array(numeric_values, dtype=np.float32).reshape(sample.shape)
-                                            except ValueError:
-                                                # If reshape fails, pad or truncate
-                                                target_size = np.prod(sample.shape)
-                                                if len(numeric_values) >= target_size:
-                                                    sample_numeric = np.array(numeric_values[:target_size], dtype=np.float32).reshape(sample.shape)
-                                                else:
-                                                    # Pad with zeros or repeat last value
-                                                    padded = list(numeric_values) + [numeric_values[-1]] * (target_size - len(numeric_values))
-                                                    sample_numeric = np.array(padded[:target_size], dtype=np.float32).reshape(sample.shape)
-                                            arr_list.append(sample_numeric)
-                                        else:
-                                            raise ValueError(f"Sample {i} contains no numeric values")
-                                    elif isinstance(sample, np.ndarray):
-                                        # Already numeric array
-                                        arr_list.append(sample.astype(np.float32))
-                                    else:
-                                        raise ValueError(f"Unexpected element type in sample {i}: {type(sample)}")
-                                
-                                if arr_list:
-                                    arr = np.array(arr_list, dtype=np.float32)
-                                else:
-                                    raise ValueError("No valid numeric arrays found")
-                            else:
-                                # Arrays are numeric, just convert dtype
-                                arr_list = [sample.astype(np.float32) if isinstance(sample, np.ndarray) else np.array(sample, dtype=np.float32) 
-                                           for sample in arr]
-                                arr = np.array(arr_list, dtype=np.float32)
-                        else:
-                            # Try direct conversion
-                            arr = np.array(arr, dtype=np.float32)
-                    else:
-                        raise ValueError("Empty array")
-                except Exception as e:
-                    print(f"Error converting {key} from object to float: {e}")
-                    print(f"  Array shape: {arr.shape}, dtype: {arr.dtype}")
-                    if len(arr) > 0:
-                        print(f"  First element type: {type(arr[0])}")
-                        if isinstance(arr[0], np.ndarray):
-                            print(f"  First element shape: {arr[0].shape}, dtype: {arr[0].dtype}")
-                            if arr[0].dtype == object and len(arr[0]) > 0:
-                                print(f"  First element of first array: {arr[0].flat[0]} (type: {type(arr[0].flat[0])})")
-                    raise ValueError(f"Failed to load {key}: {e}")
-            
-            # Ensure numeric dtype
-            if arr.dtype not in [np.float32, np.float64, np.int32, np.int64]:
-                try:
-                    arr = arr.astype(np.float32)
-                except (ValueError, TypeError) as e:
-                    print(f"Warning: Could not convert {key} to float32: {e}")
-                    raise ValueError(f"Data in {key} is not numeric")
-            
-            result[key] = arr
-            print(f"{key}: {arr.shape}, dtype={arr.dtype}")
-        else:
-            print(f"Warning: {key} not found in npz file")
-    
-    # Optional metadata: segment_ids, feature_names, scaler params
-    if 'segment_ids' in data:
-        result['segment_ids'] = data['segment_ids']
-    if 'feature_names' in data:
-        result['feature_names'] = data['feature_names']
+    if arr.dtype in (np.float32, np.float64, np.int32, np.int64):
+        return arr.astype(np.float32)
 
-    # Scaler params lưu bởi export_for_model_training (để normalize khi load hoặc inverse-transform)
-    if 'scaler_mean' in data:
-        result['scaler_mean'] = data['scaler_mean']
-    if 'scaler_scale' in data:
-        result['scaler_scale'] = data['scaler_scale']
+    # object array — thử cast trực tiếp trước
+    try:
+        return arr.astype(np.float32)
+    except (ValueError, TypeError):
+        pass
 
-    # Đọc _metadata để biết dữ liệu trong NPZ đã được normalize hay chưa (dữ liệu gốc)
-    if '_metadata' in data:
+    # fallback: chuyển từng phần tử, bỏ qua non-numeric
+    flat = arr.flatten()
+    numeric = []
+    for v in flat:
         try:
-            import json
-            meta = json.loads(str(data['_metadata'].flat[0]))
-            result['data_normalized'] = bool(meta.get('normalized', True))
-        except Exception:
-            result['data_normalized'] = True
-    else:
-        result['data_normalized'] = True  # NPZ cũ không có metadata → mặc định coi là đã normalize
+            numeric.append(float(v))
+        except (ValueError, TypeError):
+            numeric.append(np.nan)
 
-    # Check if all required keys are present
-    required_keys = ['X_train', 'y_train', 'X_val', 'y_val', 'X_test', 'y_test']
-    missing_keys = [key for key in required_keys if key not in result]
-    if missing_keys:
-        raise ValueError(f"Missing required keys in data: {missing_keys}")
-    
+    result = np.array(numeric, dtype=np.float32).reshape(arr.shape)
+    n_nan = np.isnan(result).sum()
+    if n_nan > 0:
+        print(f"  Warning: {key} had {n_nan} non-numeric values replaced with NaN")
     return result
 
 
-def load_traffic_features(filepath, segment_ids=None, max_samples=None):
+def load_model_ready_data(filepath: str) -> dict:
     """
-    Load traffic features from .npz file
-    
-    Args:
-        filepath: Path to traffic_features_*.npz
-        segment_ids: List of segment IDs to filter (optional)
-        max_samples: Maximum number of samples to load
-    
+    Load model_ready_data_*.npz được tạo bởi pipeline.
+
     Returns:
-        features: Traffic features array
-        metadata: Metadata dictionary
+        dict với keys: X_train, y_train, X_val, y_val, X_test, y_test
+                       (optional) segment_ids, feature_names, scaler_mean, scaler_scale
+                       data_normalized: bool — True nếu data trong file đã scale
     """
     data = np.load(filepath, allow_pickle=True)
-    
-    print("\n=== Loading Traffic Features ===")
-    print(f"File: {filepath}")
-    
-    # Get numeric features
-    numeric_features = []
-    feature_names = []
-    
-    for key in data.files:
-        if key.startswith('_') or key in ['segment_id', 'new_segment_id', 'street_name', 
-                                           'congestion_level', 'distance_category']:
+    print(f"\n=== Loading Model Ready Data: {os.path.basename(filepath)} ===")
+    print(f"Keys in file: {data.files}")
+
+    result = {}
+
+    # ── Load X/y splits ──
+    for key in ['X_train', 'y_train', 'X_val', 'y_val', 'X_test', 'y_test']:
+        if key not in data:
+            print(f"Warning: '{key}' not found in npz")
             continue
-        
-        arr = data[key]
-        if arr.dtype in [np.float64, np.float32, np.int64, np.int32]:
-            numeric_features.append(arr)
-            feature_names.append(key)
-    
-    # Stack features
-    if numeric_features:
-        features = np.column_stack(numeric_features)
-        print(f"Features shape: {features.shape}")
-        print(f"Number of features: {len(feature_names)}")
-        
-        if max_samples:
-            features = features[:max_samples]
-            print(f"Limited to {max_samples} samples")
-    else:
-        features = None
-    
-    metadata = {
-        'feature_names': feature_names,
-        'segment_ids': data['segment_id'] if 'segment_id' in data else None
-    }
-    
-    return features, metadata
+        arr = _coerce_to_float32(data[key], key)
+        result[key] = arr
+        print(f"{key}: {arr.shape}  dtype={arr.dtype}")
 
+    # ── Optional arrays ──
+    for key in ('segment_ids', 'feature_names', 'scaler_mean', 'scaler_scale'):
+        if key in data:
+            result[key] = data[key]
 
-def create_sequences(data, seq_len=12, pred_len=12, stride=1):
+    # ── Metadata: biết data đã normalize chưa ──
+    data_normalized = True  # mặc định an toàn: coi là đã normalize
+    if '_metadata' in data:
+        try:
+            meta = json.loads(str(data['_metadata'].flat[0]))
+            data_normalized = bool(meta.get('normalized', True))
+        except Exception:
+            pass
+    result['data_normalized'] = data_normalized
+    print(f"data_normalized (from metadata): {data_normalized}")
+
+    # Kiểm tra đủ keys
+    missing = [k for k in ('X_train', 'y_train', 'X_val', 'y_val', 'X_test', 'y_test')
+               if k not in result]
+    if missing:
+        raise ValueError(f"Missing required keys in NPZ: {missing}")
+
+    return result
+
+# Helpers
+def create_sequences(data: np.ndarray, seq_len: int = 12,
+                     pred_len: int = 12, stride: int = 1):
     """
-    Create sequences from time series data
-    
+    Sliding-window sequences từ time series.
+
     Args:
-        data: Time series data (timesteps, nodes, features)
-        seq_len: Input sequence length
-        pred_len: Prediction sequence length
-        stride: Stride for sliding window
-    
+        data: (timesteps, nodes, features)
     Returns:
-        X: Input sequences (samples, seq_len, nodes, features)
-        y: Target sequences (samples, pred_len, nodes, features)
+        X: (samples, seq_len, nodes, features)
+        y: (samples, pred_len, nodes, features)
     """
     X, y = [], []
-    
     for i in range(0, len(data) - seq_len - pred_len + 1, stride):
-        X.append(data[i:i+seq_len])
-        y.append(data[i+seq_len:i+seq_len+pred_len])
-    
-    return np.array(X), np.array(y)
+        X.append(data[i:i + seq_len])
+        y.append(data[i + seq_len:i + seq_len + pred_len])
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
 
-def prepare_data_loaders(X_train, y_train, X_val, y_val, X_test, y_test, batch_size=32):
-    """
-    Create PyTorch DataLoaders
-    
-    Args:
-        X_train, y_train: Training data
-        X_val, y_val: Validation data
-        X_test, y_test: Test data
-        batch_size: Batch size
-    
-    Returns:
-        train_loader, val_loader, test_loader
-    """
-    train_dataset = TrafficDataset(X_train, y_train)
-    val_dataset = TrafficDataset(X_val, y_val)
-    test_dataset = TrafficDataset(X_test, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
+def prepare_data_loaders(X_train, y_train, X_val, y_val,
+                         X_test, y_test, batch_size: int = 32):
+    """Tạo PyTorch DataLoaders."""
+    train_loader = DataLoader(TrafficDataset(X_train, y_train),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=0, pin_memory=False)
+    val_loader   = DataLoader(TrafficDataset(X_val,   y_val),
+                              batch_size=batch_size, shuffle=False,
+                              num_workers=0, pin_memory=False)
+    test_loader  = DataLoader(TrafficDataset(X_test,  y_test),
+                              batch_size=batch_size, shuffle=False,
+                              num_workers=0, pin_memory=False)
     return train_loader, val_loader, test_loader
 
 
-def normalize_adj(adj):
+def normalize_adj(adj: np.ndarray) -> np.ndarray:
     """
-    Normalize adjacency matrix: D^(-1/2) * A * D^(-1/2)
-    where A = A + I (with self-loops)
-    
-    Args:
-        adj: (num_nodes, num_nodes) adjacency matrix (numpy array)
-    Returns:
-        normalized adjacency matrix (numpy array)
+    Symmetric normalization: D^(-1/2) * (A + I) * D^(-1/2)
+
+    Dùng nội bộ trong các model. DataManager KHÔNG gọi hàm này —
+    adj raw binary được trả về để model tự normalize một lần duy nhất.
     """
-    # Convert to Tensor
-    is_numpy = False
-    if not torch.is_tensor(adj):
-        is_numpy = True
-        adj_tensor = torch.FloatTensor(adj)
-    else:
-        adj_tensor = adj
-    
-    # 1. Add self-loops (A = A + I)
-    adj_tensor += torch.eye(adj_tensor.size(0))
-    
-    # 2. Calculate degree matrix (D)
-    rowsum = adj_tensor.sum(1)
-    
-    # 3. Calculate D^(-1/2)
-    d_inv_sqrt = torch.pow(rowsum, -1/2).flatten()
-    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.  # Handle division by zero
-    d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
-    
-    # 4. Multiply: D^(-1/2) * A * D^(-1/2)
-    adj_normalized = d_mat_inv_sqrt @ adj_tensor @ d_mat_inv_sqrt
-    
-    # Convert back to numpy if input was numpy
-    if is_numpy:
-        return adj_normalized.numpy()
-    return adj_normalized
+    A = adj + np.eye(adj.shape[0], dtype=np.float32)
+    rowsum = A.sum(axis=1)
+    d_inv_sqrt = np.where(rowsum > 0, rowsum ** -0.5, 0.0)
+    D = np.diag(d_inv_sqrt)
+    return (D @ A @ D).astype(np.float32)
 
 
 def normalize_data(X_train, X_val, X_test):
     """
-    Normalize data using StandardScaler
-    
-    Args:
-        X_train, X_val, X_test: Data arrays
-    
-    Returns:
-        Normalized arrays and scaler
+    StandardScaler fit trên train, transform val/test.
+    Chỉ gọi khi NPZ không có scaler và normalize=True.
     """
-    # Reshape to 2D for scaling
-    original_shape_train = X_train.shape
-    original_shape_val = X_val.shape
-    original_shape_test = X_test.shape
-    
-    X_train_2d = X_train.reshape(-1, X_train.shape[-1])
-    X_val_2d = X_val.reshape(-1, X_val.shape[-1])
-    X_test_2d = X_test.reshape(-1, X_test.shape[-1])
-    
-    # Fit scaler on training data
+    sh_train, sh_val, sh_test = X_train.shape, X_val.shape, X_test.shape
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_2d)
-    X_val_scaled = scaler.transform(X_val_2d)
-    X_test_scaled = scaler.transform(X_test_2d)
-    
-    # Reshape back
-    X_train_scaled = X_train_scaled.reshape(original_shape_train)
-    X_val_scaled = X_val_scaled.reshape(original_shape_val)
-    X_test_scaled = X_test_scaled.reshape(original_shape_test)
-    
-    return X_train_scaled, X_val_scaled, X_test_scaled, scaler
+    Xtr = scaler.fit_transform(X_train.reshape(-1, sh_train[-1])).reshape(sh_train).astype(np.float32)
+    Xva = scaler.transform(X_val.reshape(-1, sh_val[-1])).reshape(sh_val).astype(np.float32)
+    Xte = scaler.transform(X_test.reshape(-1, sh_test[-1])).reshape(sh_test).astype(np.float32)
+    return Xtr, Xva, Xte, scaler
 
-
+# DataManager
 class DataManager:
     """
-    Manager class to handle all data loading and preparation
+    Quản lý toàn bộ vòng đời data: load → align → (optional scale) → DataLoader.
+
+    Normalize contract — không bao giờ scale 2 lần:
+        prepare_for_training(normalize=False)  → dùng nguyên data từ NPZ (recommended)
+        prepare_for_training(normalize=True)   → chỉ scale khi NPZ chưa normalize
     """
-    def __init__(self, data_dir=None):
+
+    def __init__(self, data_dir: str = None):
         if data_dir is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))
             data_dir = os.path.join(base_dir, 'data', 'processed')
-            
         self.data_dir = data_dir
-        self.adj = None
-        self.scaler = None
-        
+        self.adj: np.ndarray = None
+        self.node_features = None
+        self.coordinates   = None
+        self.graph_segment_ids = None
+        self.data: dict    = {}
+        self.scaler        = None
+        self.scaler_mean   = None
+        self.scaler_scale  = None
+
+    # ── Load ──────────────────────────────────────────────────────────────────
+
     def load_all(self):
-        """Load all data files"""
-        # Find files
-        import glob
-        
+        """Load graph_structure và model_ready_data (file mới nhất của mỗi loại)."""
         graph_dir = os.path.join(self.data_dir, 'graph_structure')
         model_dir = os.path.join(self.data_dir, 'model_ready_data')
 
-        graph_files = glob.glob(os.path.join(graph_dir, 'graph_structure_*.npz'))
-        model_files = glob.glob(os.path.join(model_dir, 'model_ready_data_*.npz'))
-        
+        graph_files = sorted(glob.glob(os.path.join(graph_dir, 'graph_structure_*.npz')))
+        model_files = sorted(glob.glob(os.path.join(model_dir, 'model_ready_data_*.npz')))
+
         if not graph_files:
-            print("Warning: No graph structure file found")
+            print("Warning: No graph_structure_*.npz found")
         if not model_files:
-            print("Warning: No model ready data file found")
-        
-        # Load graph (lấy file mới nhất)
+            raise FileNotFoundError(
+                f"No model_ready_data_*.npz found in {model_dir}")
+
         if graph_files:
-            graph_files = sorted(graph_files)
-            graph_path = graph_files[-1]
-            self.adj, self.node_features, self.coordinates, self.graph_segment_ids = load_graph_structure(graph_path)
-        
-        # Load model data (lấy file mới nhất)
-        if model_files:
-            model_files = sorted(model_files)
-            model_path = model_files[-1]
-            self.data = load_model_ready_data(model_path)
-        
+            self.adj, self.node_features, self.coordinates, self.graph_segment_ids = \
+                load_graph_structure(graph_files[-1])
+
+        self.data = load_model_ready_data(model_files[-1])
         return self
-    
-    def prepare_for_training(self, batch_size=32, normalize=False):
-        """
-        Prepare data for training
-        
-        Returns:
-            train_loader, val_loader, test_loader, adj_tensor
-        """
-        if not hasattr(self, 'data'):
-            raise ValueError("Data not loaded. Call load_all() first.")
-        
-        # Check for required keys
-        required_keys = ['X_train', 'y_train', 'X_val', 'y_val', 'X_test', 'y_test']
-        missing_keys = [key for key in required_keys if key not in self.data]
-        if missing_keys:
-            raise ValueError(
-                f"Missing required data keys: {missing_keys}. "
-                f"Available keys: {list(self.data.keys())}. "
-                f"This might be due to data conversion errors during loading."
-            )
-        
-        X_train = self.data['X_train']
-        y_train = self.data['y_train']
-        X_val = self.data['X_val']
-        y_val = self.data['y_val']
-        X_test = self.data['X_test']
-        y_test = self.data['y_test']
-        
-        # Nếu có segment_ids từ cả graph và model, đồng bộ node dimension giữa X/y và adjacency.
-        # NOTE: Trước đây chỉ cắt adjacency nên dễ bị lệch N (vd: data N=497 nhưng adj N=496) → runtime error.
-        if self.adj is not None and hasattr(self, "graph_segment_ids") and "segment_ids" in self.data and self.data["segment_ids"] is not None:
-            graph_ids = np.array(self.graph_segment_ids).reshape(-1)
-            model_ids = np.array(self.data["segment_ids"]).reshape(-1)
 
-            # Map graph segment_id → index in graph adjacency
-            id_to_idx = {int(sid): idx for idx, sid in enumerate(graph_ids)}
+    # ── Align nodes ───────────────────────────────────────────────────────────
 
-            keep_model_pos = []
-            graph_pos_for_kept = []
-            missing = []
-            for pos, sid in enumerate(model_ids):
-                sid_int = int(sid)
-                gi = id_to_idx.get(sid_int, None)
-                if gi is None:
-                    missing.append(sid_int)
-                    continue
+    def _align_nodes(self):
+        """
+        Đồng bộ node dimension giữa X/y (từ model_ready_data) và adj (từ graph_structure).
+
+        Trường hợp thường gặp: map_matcher trả về N_graph nodes, nhưng
+        model_ready_data chỉ có N_model nodes (một subset đã được match).
+        Hàm này lọc adj theo đúng tập nodes có trong X/y.
+        """
+        if self.adj is None:
+            return
+        if not (hasattr(self, 'graph_segment_ids') and self.graph_segment_ids is not None):
+            return
+        if 'segment_ids' not in self.data or self.data['segment_ids'] is None:
+            return
+
+        graph_ids = np.array(self.graph_segment_ids).reshape(-1).astype(int)
+        model_ids = np.array(self.data['segment_ids']).reshape(-1).astype(int)
+
+        id_to_graph_idx = {int(sid): i for i, sid in enumerate(graph_ids)}
+
+        keep_model_pos, graph_pos_for_kept, missing = [], [], []
+        for pos, sid in enumerate(model_ids):
+            gi = id_to_graph_idx.get(int(sid))
+            if gi is None:
+                missing.append(int(sid))
+            else:
                 keep_model_pos.append(pos)
                 graph_pos_for_kept.append(gi)
 
-            if missing:
-                print(
-                    f"Warning: {len(missing)} model segment_ids not found in graph; "
-                    f"dropping them from X/y and aligning adjacency accordingly."
-                )
+        if missing:
+            print(f"Warning: {len(missing)} segment_ids in model data not found in graph; "
+                  f"dropping them from X/y.")
 
-            if keep_model_pos:
-                keep_model_pos = np.array(keep_model_pos, dtype=int)
-                graph_pos_for_kept = np.array(graph_pos_for_kept, dtype=int)
+        if not keep_model_pos:
+            print("Warning: No overlapping segment_ids — using original data without alignment.")
+            return
 
-                # 1) Filter X/y along node dimension to match kept segment_ids
-                X_train = X_train[:, :, keep_model_pos, :]
-                y_train = y_train[:, :, keep_model_pos, :]
-                X_val = X_val[:, :, keep_model_pos, :]
-                y_val = y_val[:, :, keep_model_pos, :]
-                X_test = X_test[:, :, keep_model_pos, :]
-                y_test = y_test[:, :, keep_model_pos, :]
+        kp = np.array(keep_model_pos,   dtype=int)
+        gp = np.array(graph_pos_for_kept, dtype=int)
 
-                # Persist filtered arrays + ids back to self.data so downstream code stays consistent
-                self.data["X_train"] = X_train
-                self.data["y_train"] = y_train
-                self.data["X_val"] = X_val
-                self.data["y_val"] = y_val
-                self.data["X_test"] = X_test
-                self.data["y_test"] = y_test
-                self.data["segment_ids"] = model_ids[keep_model_pos]
+        # Slice node dimension (dim 2) of X/y
+        for key in ('X_train', 'y_train', 'X_val', 'y_val', 'X_test', 'y_test'):
+            if key in self.data:
+                self.data[key] = self.data[key][:, :, kp, :]
 
-                # 2) Cut adjacency in the same order as filtered model segment_ids
-                self.adj = self.adj[graph_pos_for_kept[:, None], graph_pos_for_kept]
-                print(f"Aligned adjacency matrix to model data: {self.adj.shape}")
+        self.data['segment_ids'] = model_ids[kp]
 
-                # 3) Optionally align coordinates/node_features (if present from graph file)
-                if hasattr(self, "coordinates") and self.coordinates is not None and len(self.coordinates) == len(graph_ids):
-                    self.coordinates = self.coordinates[graph_pos_for_kept]
-                if hasattr(self, "node_features") and self.node_features is not None and len(self.node_features) == len(graph_ids):
-                    self.node_features = self.node_features[graph_pos_for_kept]
-            else:
-                print("Warning: No overlapping segment_ids between graph and model data; using original adjacency and data.")
-        
-        # ── Normalization ──────────────────────────────────────────────────────
-        # NPZ có thể chứa: (1) dữ liệu đã normalize + scaler, hoặc (2) dữ liệu gốc + scaler.
-        # Metadata 'normalized' trong NPZ cho biết dữ liệu đã được scale khi export hay chưa.
+        # Slice adjacency consistently
+        self.adj = self.adj[np.ix_(gp, gp)]
+        print(f"Aligned: {len(kp)} nodes kept, adjacency → {self.adj.shape}")
+
+        if self.coordinates is not None and len(self.coordinates) == len(graph_ids):
+            self.coordinates = self.coordinates[gp]
+        if self.node_features is not None and len(self.node_features) == len(graph_ids):
+            self.node_features = self.node_features[gp]
+
+    # ── Prepare ───────────────────────────────────────────────────────────────
+
+    def prepare_for_training(self, batch_size: int = 32, normalize: bool = False):
+        """
+        Chuẩn bị DataLoaders và adjacency tensor cho training.
+
+        Args:
+            batch_size: Kích thước batch.
+            normalize : False (default & recommended) — dùng dữ liệu nguyên bản từ NPZ.
+                        True — chỉ scale nếu NPZ chưa normalize; không scale lại nếu đã có.
+
+        Returns:
+            train_loader, val_loader, test_loader, adj_tensor (raw binary, float32)
+
+        Lưu ý về adj_tensor:
+            Trả về adjacency RAW BINARY (0/1). Normalize D^-1/2·A·D^-1/2 được thực hiện
+            MỘT LẦN duy nhất BÊN TRONG mỗi model (DTCSTGCN._normalize_adj, v.v.).
+            Không normalize ở đây để tránh double-normalize.
+        """
+        if not self.data:
+            raise RuntimeError("Data not loaded. Call load_all() first.")
+
+        required = ['X_train', 'y_train', 'X_val', 'y_val', 'X_test', 'y_test']
+        missing  = [k for k in required if k not in self.data]
+        if missing:
+            raise ValueError(f"Missing data keys after loading: {missing}")
+
+        # Align graph nodes với model data (an toàn nếu graph_segment_ids là None)
+        self._align_nodes()
+
+        X_train = self.data['X_train']
+        y_train = self.data['y_train']
+        X_val   = self.data['X_val']
+        y_val   = self.data['y_val']
+        X_test  = self.data['X_test']
+        y_test  = self.data['y_test']
+
+        print(f"\nData shapes after alignment:")
+        print(f"  X_train: {X_train.shape}  y_train: {y_train.shape}")
+        print(f"  X_val:   {X_val.shape}    y_val:   {y_val.shape}")
+        print(f"  X_test:  {X_test.shape}   y_test:  {y_test.shape}")
+
+        # ── Normalize contract ────────────────────────────────────────────────
         data_already_normalized = self.data.get('data_normalized', True)
-        has_scaler = 'scaler_mean' in self.data and 'scaler_scale' in self.data
+        has_saved_scaler = ('scaler_mean' in self.data and 'scaler_scale' in self.data)
 
         if normalize:
-            if has_scaler and data_already_normalized:
-                # Dữ liệu trong file đã được normalize khi export → không scale lại
-                print("Data in NPZ is already normalized; no extra scaling applied.")
-                y_train_scaled = y_train
-                y_val_scaled   = y_val
-                y_test_scaled  = y_test
-            elif has_scaler and not data_already_normalized:
-                # Dữ liệu gốc trong NPZ, có scaler → áp dụng transform (mean/scale) khi load
-                mean = np.asarray(self.data['scaler_mean'], dtype=np.float32)
+            if data_already_normalized:
+                # NPZ đã normalize → không làm gì thêm
+                print("Data already normalized in NPZ — skipping extra scaling.")
+                y_train_out = y_train
+                y_val_out   = y_val
+                y_test_out  = y_test
+
+            elif has_saved_scaler:
+                # NPZ chưa normalize nhưng có scaler → dùng scaler từ file
+                mean  = np.asarray(self.data['scaler_mean'],  dtype=np.float32)
                 scale = np.asarray(self.data['scaler_scale'], dtype=np.float32)
                 scale_safe = np.where(scale != 0, scale, 1.0)
 
-                def _apply_scaler(arr):
-                    sh = arr.shape
-                    flat = arr.reshape(-1, sh[-1])
-                    out = (flat - mean) / scale_safe
+                def _apply(arr):
+                    sh  = arr.shape
+                    out = (arr.reshape(-1, sh[-1]) - mean) / scale_safe
                     return out.reshape(sh).astype(np.float32)
 
-                X_train = _apply_scaler(X_train)
-                X_val = _apply_scaler(X_val)
-                X_test = _apply_scaler(X_test)
-                y_train_scaled = _apply_scaler(y_train)
-                y_val_scaled = _apply_scaler(y_val)
-                y_test_scaled = _apply_scaler(y_test)
-                print("Applied saved scaler to raw data (normalize=True).")
-            else:
-                # Không có scaler trong NPZ → fit trên train rồi transform
-                X_train, X_val, X_test, self.scaler = normalize_data(X_train, X_val, X_test)
-                y_train_scaled = self.scaler.transform(
-                    y_train.reshape(-1, y_train.shape[-1])
-                ).reshape(y_train.shape)
-                y_val_scaled = self.scaler.transform(
-                    y_val.reshape(-1, y_val.shape[-1])
-                ).reshape(y_val.shape)
-                y_test_scaled = self.scaler.transform(
-                    y_test.reshape(-1, y_test.shape[-1])
-                ).reshape(y_test.shape)
-        else:
-            y_train_scaled = y_train
-            y_val_scaled   = y_val
-            y_test_scaled  = y_test
+                X_train, X_val, X_test = _apply(X_train), _apply(X_val), _apply(X_test)
+                y_train_out = _apply(y_train)
+                y_val_out   = _apply(y_val)
+                y_test_out  = _apply(y_test)
+                print("Applied saved scaler to raw NPZ data.")
 
-        # Expose scaler params từ NPZ để trainer có thể inverse-transform predictions
-        if 'scaler_mean' in self.data:
+            else:
+                # Không có scaler → fit trên train (fallback, thường không xảy ra)
+                print("No saved scaler found — fitting StandardScaler on X_train.")
+                X_train, X_val, X_test, self.scaler = normalize_data(X_train, X_val, X_test)
+                sh_y = y_train.shape
+                y_train_out = self.scaler.transform(
+                    y_train.reshape(-1, sh_y[-1])).reshape(sh_y).astype(np.float32)
+                y_val_out   = self.scaler.transform(
+                    y_val.reshape(-1, sh_y[-1])).reshape(sh_y).astype(np.float32)
+                y_test_out  = self.scaler.transform(
+                    y_test.reshape(-1, sh_y[-1])).reshape(sh_y).astype(np.float32)
+        else:
+            # normalize=False: dùng nguyên data từ NPZ
+            y_train_out = y_train
+            y_val_out   = y_val
+            y_test_out  = y_test
+
+        # Expose scaler params để inverse_transform hoạt động sau training
+        if has_saved_scaler:
             self.scaler_mean  = self.data['scaler_mean']
             self.scaler_scale = self.data['scaler_scale']
 
-        # Create loaders
+        # ── DataLoaders ───────────────────────────────────────────────────────
         train_loader, val_loader, test_loader = prepare_data_loaders(
-            X_train, y_train_scaled,
-            X_val,   y_val_scaled,
-            X_test,  y_test_scaled,
+            X_train, y_train_out,
+            X_val,   y_val_out,
+            X_test,  y_test_out,
             batch_size=batch_size,
         )
-        
-        # Prepare adjacency matrix
-        # NOTE: Raw binary adjacency is returned here intentionally.
-        # Normalization (D^-1/2 * A * D^-1/2) is performed ONCE inside each model
-        # (DTCSTGCN._normalize_adj, TGCNTrainer, etc.).  Normalizing here AND inside
-        # the model would apply the transform twice, corrupting graph propagation.
+
+        # ── Adjacency tensor — RAW BINARY ─────────────────────────────────────
         if self.adj is not None:
-            adj_tensor = torch.FloatTensor(self.adj)
+            # Sanity check: N_adj == N_data
+            N_data = X_train.shape[2]
+            N_adj  = self.adj.shape[0]
+            if N_adj != N_data:
+                print(f"Warning: adj N={N_adj} != data N={N_data}. "
+                      f"Creating identity adjacency as fallback.")
+                adj_tensor = torch.eye(N_data, dtype=torch.float32)
+            else:
+                adj_tensor = torch.FloatTensor(self.adj)
         else:
-            # Create fully connected graph if no adjacency matrix
-            num_nodes = X_train.shape[2]
-            adj_tensor = torch.ones(num_nodes, num_nodes)
-            print(f"Warning: Creating fully connected graph with {num_nodes} nodes")
-        
+            N_data = X_train.shape[2]
+            print(f"Warning: No adjacency — creating fully-connected graph ({N_data} nodes).")
+            adj_tensor = torch.ones(N_data, N_data, dtype=torch.float32)
+            adj_tensor.fill_diagonal_(0.0)
+
+        print(f"\nAdjacency tensor: {adj_tensor.shape}  "
+              f"(raw binary, normalize=False here — model normalizes internally)")
+
         return train_loader, val_loader, test_loader, adj_tensor
 
-    def inverse_transform(self, arr):
-        """
-        Inverse-transform predictions/targets từ normalized space về đơn vị gốc.
+    # ── Inverse transform ─────────────────────────────────────────────────────
 
-        Dùng scaler_mean và scaler_scale được lưu trong NPZ bởi
-        export_for_model_training(). Cần gọi prepare_for_training() trước.
+    def inverse_transform(self, arr: np.ndarray) -> np.ndarray:
+        """
+        Đưa predictions / targets từ normalized space về đơn vị gốc.
+
+        Dùng scaler lưu trong NPZ. Cần gọi prepare_for_training() trước.
 
         Args:
             arr: numpy array bất kỳ shape, dimension cuối = num_features
         Returns:
             arr_orig: cùng shape, đã inverse-transform
         """
-        if not hasattr(self, 'scaler_mean') or self.scaler_mean is None:
+        if self.scaler_mean is None or self.scaler_scale is None:
+            # Thử dùng sklearn scaler nếu đã fit ở bước normalize fallback
+            if self.scaler is not None:
+                sh = arr.shape
+                return self.scaler.inverse_transform(
+                    arr.reshape(-1, sh[-1])).reshape(sh).astype(np.float32)
             raise RuntimeError(
-                "Không tìm thấy scaler_mean/scaler_scale. "
-                "Đảm bảo NPZ được tạo với normalize=True trong export_for_model_training(), "
-                "và đã gọi prepare_for_training() trước."
-            )
-        mean  = self.scaler_mean   # (num_features,)
-        scale = self.scaler_scale  # (num_features,)
-        original_shape = arr.shape
-        arr_2d = arr.reshape(-1, original_shape[-1])
-        arr_orig = arr_2d * scale + mean
-        return arr_orig.reshape(original_shape).astype(np.float32)
+                "Không có scaler để inverse transform. "
+                "Đảm bảo NPZ được tạo với normalize=True hoặc đã gọi "
+                "prepare_for_training(normalize=True).")
 
+        mean  = np.asarray(self.scaler_mean,  dtype=np.float32)
+        scale = np.asarray(self.scaler_scale, dtype=np.float32)
+        sh    = arr.shape
+        out   = arr.reshape(-1, sh[-1]) * scale + mean
+        return out.reshape(sh).astype(np.float32)
 
+# Quick smoke-test
 if __name__ == "__main__":
-    # Test data loading
-    print("Testing Data Manager...")
-    
+    print("Testing DataManager...")
     dm = DataManager()
     dm.load_all()
-    
-    if hasattr(dm, 'data'):
-        train_loader, val_loader, test_loader, adj = dm.prepare_for_training(batch_size=4, normalize=False)
-        
-        print("\n=== Data Loaders Ready ===")
-        print(f"Train batches: {len(train_loader)}")
-        print(f"Val batches: {len(val_loader)}")
-        print(f"Test batches: {len(test_loader)}")
-        print(f"Adjacency matrix: {adj.shape}")
-        
-        # Test one batch
-        for X, y in train_loader:
-            print(f"\nBatch shapes:")
-            print(f"X: {X.shape}")
-            print(f"y: {y.shape}")
-            break
-        
-        print("\n✓ Data loading successful!")
+
+    train_loader, val_loader, test_loader, adj = dm.prepare_for_training(
+        batch_size=4, normalize=False)
+
+    print(f"\nTrain batches : {len(train_loader)}")
+    print(f"Val batches   : {len(val_loader)}")
+    print(f"Test batches  : {len(test_loader)}")
+    print(f"Adjacency     : {adj.shape}")
+
+    for X, y in train_loader:
+        print(f"X batch: {X.shape}  y batch: {y.shape}")
+        break
+
+    print("\n✓ DataManager OK")

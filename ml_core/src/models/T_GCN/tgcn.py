@@ -1,166 +1,228 @@
 """
 T-GCN: Temporal Graph Convolutional Network
-Based on: Zhao et al. "T-GCN: A Temporal Graph Convolutional Network for Traffic Prediction" (2019)
+Based on: Zhao et al. "T-GCN: A Temporal Graph Convolutional Network
+          for Traffic Prediction" (2019)
+
+Fixes & improvements vs original:
+    1. TGCNCell: thêm LayerNorm sau GRU để ổn định training
+    2. TGCN decoder: dùng input projection thay vì truyền output (output_dim=1)
+       thẳng vào TGCNCell nhận input_dim features — tránh shape mismatch khi
+       input_dim > 1
+    3. TGCN: lưu adj_norm một lần (lazy) để tránh re-normalize mỗi forward
+    4. TGCN: hỗ trợ multi-feature input đúng chiều
+    5. count_parameters helper giữ nguyên
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from .gcn import GCN, GraphConvolution
+from .gcn import GCN, normalize_adj
 from .gru import GRUCell
+
 
 class TGCNCell(nn.Module):
     """
-    T-GCN Cell: combines GCN and GRU
-    
-    Process:
-        1. GCN extracts spatial features from current input
-        2. GRU captures temporal dependencies with previous hidden state
+    T-GCN Cell = GCN (spatial) + GRU (temporal) + LayerNorm.
+
+    Bước A: x_gcn  = GCN(x, adj)            — tổng hợp thông tin hàng xóm
+    Bước B: h_new  = GRU(x_gcn, h_prev)     — cập nhật ký ức
+    Bước C: h_norm = LayerNorm(h_new)        — ổn định gradient
     """
-    def __init__(self, num_nodes, input_dim, hidden_dim, gcn_hidden_dim=64):
-        super(TGCNCell, self).__init__()
-        self.num_nodes = num_nodes
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        
-        # 1. Bộ phận Không gian (GCN)
-        # GCN for spatial features
-        # Nhiệm vụ: Biến đổi input ban đầu thành đặc trưng có thông tin hàng xóm
-        self.gcn = GCN(input_dim, gcn_hidden_dim, hidden_dim)
-        
-        # 2. Bộ phận Thời gian (GRU Cell)
-        # Nhiệm vụ: Nhớ và cập nhật trạng thái
-        # Input size của GRU bây giờ chính là output của GCN (hidden_dim)
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        gcn_hidden_dim: int = 64,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.gcn = GCN(
+            in_features=input_dim,
+            hidden_features=gcn_hidden_dim,
+            out_features=hidden_dim,
+            dropout=dropout,
+            residual=(input_dim == hidden_dim),  # residual chỉ khi chiều khớp
+        )
         self.gru_cell = GRUCell(hidden_dim, hidden_dim)
-    
-    
-    def forward(self, x, h, adj):
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        h: torch.Tensor,
+        adj: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Args:
-            x: (batch_size, num_nodes, input_dim)
-            h: (batch_size, num_nodes, hidden_dim) - hidden state
-            adj: (num_nodes, num_nodes) - adjacency matrix
+            x  : (batch, nodes, input_dim)
+            h  : (batch, nodes, hidden_dim)
+            adj: (nodes, nodes) — normalized
         Returns:
-            new_h: (batch_size, num_nodes, hidden_dim)
+            h_new: (batch, nodes, hidden_dim)
         """
-        # Bước A: Nhìn sang hàng xóm (GCN)
-        # x shape: (Batch, Nodes, Input_Dim)
-        # adj shape: (Nodes, Nodes)
-        x_gcn = self.gcn(x, adj)
+        x_gcn = self.gcn(x, adj)           # (batch, nodes, hidden_dim)
+        h_new = self.gru_cell(x_gcn, h)    # (batch, nodes, hidden_dim)
+        h_new = self.layer_norm(h_new)      # stabilise
+        return h_new
 
-        # Bước B: Nhớ lại quá khứ (GRU)
-        # x_gcn shape: (Batch, Nodes, Hidden_Dim)
-        # h (ký ức cũ): (Batch, Nodes, Hidden_Dim)
-        new_h = self.gru_cell(x_gcn, h)
-        
-        return new_h
 
 class TGCN(nn.Module):
     """
-    T-GCN Model for Traffic Prediction
-    
+    T-GCN Model for Traffic Prediction.
+
     Architecture:
-        Input -> [T-GCN Cell x seq_len] -> FC Layer -> Output
+        Encoder : TGCNCell × seq_len   (encodes history into hidden state)
+        Decoder : TGCNCell × pred_len  (auto-regressive multi-step prediction)
+        Head    : Linear(hidden_dim → output_dim)
+
+    BUG FIX (decoder input shape):
+        Original code passed fc output (shape [B, N, output_dim=1]) directly
+        back into TGCNCell which expects input_dim features.  When input_dim > 1
+        this causes a matmul shape error.
+
+        Fix: a separate `dec_proj` Linear maps output_dim → input_dim before
+        feeding back into the cell, keeping enc_cell and dec_cell weight-tied
+        on the same TGCNCell instance.
     """
-    def __init__(self, num_nodes, input_dim, hidden_dim, output_dim, 
-                 seq_len, pred_len, gcn_hidden_dim=64):
+
+    def __init__(
+        self,
+        num_nodes: int,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        seq_len: int,
+        pred_len: int,
+        gcn_hidden_dim: int = 64,
+        dropout: float = 0.0,
+    ):
         """
         Args:
-            num_nodes: Number of nodes in graph Sẽ cập nhật khi chạy
-            input_dim: Input feature dimension (usually 1)
-            hidden_dim: Hidden dimension of GRU
-            output_dim: Output dimension (usually 1)
-            seq_len: Độ dài lịch sử (ví dụ: 12 bước)
-            pred_len: Độ dài muốn dự báo (ví dụ: 3 bước)
-            gcn_hidden_dim: Hidden dimension of GCN
+            num_nodes    : Number of graph nodes (updated dynamically on forward)
+            input_dim    : Feature dimension per node per timestep
+            hidden_dim   : GRU hidden size
+            output_dim   : Prediction target dimension (1 for speed)
+            seq_len      : Input sequence length (history)
+            pred_len     : Prediction horizon (multi-step)
+            gcn_hidden_dim: GCN intermediate dimension
+            dropout      : Dropout rate inside GCN layers
         """
-        super(TGCN, self).__init__()
-        self.num_nodes = num_nodes
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
-        self.seq_len = seq_len
-        self.pred_len = pred_len
-        
-        # Khởi tạo Cell lai ghép
-        self.tgcn_cell = TGCNCell(num_nodes, input_dim, hidden_dim, gcn_hidden_dim)
-        
-        # Lớp cuối cùng để đưa ra con số dự báo (ví dụ: vận tốc km/h)
-        # Từ bộ nhớ 64 chiều -> nén xuống 1 con số (output_dim)
+        super().__init__()
+        self.num_nodes   = num_nodes
+        self.input_dim   = input_dim
+        self.hidden_dim  = hidden_dim
+        self.output_dim  = output_dim
+        self.seq_len     = seq_len
+        self.pred_len    = pred_len
+
+        # Shared encoder/decoder cell
+        self.tgcn_cell = TGCNCell(input_dim, hidden_dim, gcn_hidden_dim, dropout)
+
+        # Prediction head: hidden → output
         self.fc = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, x, adj):
+        # BUG FIX: project decoder output back to input_dim so TGCNCell
+        # receives the correct number of features at each decoder step.
+        # When output_dim == input_dim this is just identity (no param overhead).
+        if output_dim != input_dim:
+            self.dec_proj = nn.Linear(output_dim, input_dim, bias=False)
+        else:
+            self.dec_proj = None
+
+        # Cache for normalized adj (avoid recompute every forward pass)
+        self._adj_norm: torch.Tensor | None = None
+        self._adj_raw_ptr: int | None = None   # id() of last seen raw adj
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_adj_norm(self, adj: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize adj lazily and cache.  Re-normalizes if adj object changes.
+        """
+        ptr = id(adj)
+        if self._adj_raw_ptr != ptr or self._adj_norm is None:
+            self._adj_norm = normalize_adj(adj).to(adj.device)
+            self._adj_raw_ptr = ptr
+        return self._adj_norm
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(self, x: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch_size, seq_len, num_nodes, input_dim)
-            adj: (num_nodes, num_nodes)
+            x  : (batch, seq_len, num_nodes, input_dim)
+            adj: (num_nodes, num_nodes) — raw binary / weighted adjacency
         Returns:
-            output: (batch_size, pred_len, num_nodes, output_dim)
+            output: (batch, pred_len, num_nodes, output_dim)
         """
-        # x shape: (Batch, Seq_len, Nodes, Features)
-        batch_size, seq_len, num_nodes, _ = x.size()
-        self.num_nodes = num_nodes
-        
-        # 1. Khởi tạo ký ức rỗng (h0)
-        h = torch.zeros(batch_size, num_nodes, self.hidden_dim, device=x.device)
-        
-        # 2. GIAI ĐOẠN ĐỌC HIỂU (Encoder)
-        # Lặp qua từng thời điểm trong quá khứ
+        batch, seq_len, num_nodes, _ = x.size()
+
+        # Normalize adjacency once per call (cached by ptr)
+        adj_norm = self._get_adj_norm(adj)
+
+        # ── Encoder ──────────────────────────────────────────────────
+        h = torch.zeros(batch, num_nodes, self.hidden_dim, device=x.device)
         for t in range(seq_len):
-            # Lấy dữ liệu tại thời điểm t
-            x_t = x[:, t, :, :] 
-            # Cập nhật ký ức
-            # Passing (x, adj, h) will swap adjacency and hidden state, causing matmul shape errors.
-            h = self.tgcn_cell(x_t, h, adj)
-        
-        # Lúc này, 'h' chứa đựng toàn bộ tinh hoa của 12 bước quá khứ
-        
-        # 3. GIAI ĐOẠN DỰ BÁO (Decoder / Prediction)
-        # Chúng ta sẽ dự báo từng bước một
-        # Generate predictions
+            h = self.tgcn_cell(x[:, t], h, adj_norm)   # (B, N, hidden)
+
+        # ── Decoder (auto-regressive) ─────────────────────────────────
+        # Seed decoder với giá trị cuối của chuỗi đầu vào.
+        dec_input = x[:, -1, :, :self.output_dim]       # (B, N, output_dim)
+
         predictions = []
-        for t in range(self.pred_len):
-            # Predict next step
-            output = self.fc(h)
-            predictions.append(output)
-            
-            # Use prediction as input for next step (auto-regressive)
-            h = self.tgcn_cell(output, h, adj)
-        
+        for _ in range(self.pred_len):
+            # Project decoder token back to input_dim
+            if self.dec_proj is not None:
+                dec_feat = self.dec_proj(dec_input)     # (B, N, input_dim)
+            else:
+                dec_feat = dec_input                    # (B, N, input_dim)
+
+            h = self.tgcn_cell(dec_feat, h, adj_norm)
+            pred = self.fc(h)                           # (B, N, output_dim)
+            predictions.append(pred)
+            dec_input = pred                            # feed prediction forward
+
         # Stack: (batch, pred_len, nodes, output_dim)
-        outputs = torch.stack(predictions, dim=1)
-        
-        return outputs
-        
-    def init_hidden(self, batch_size, device):
-        """Initialize hidden state"""
+        return torch.stack(predictions, dim=1)
+
+    def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Convenience: zero hidden state."""
         return torch.zeros(batch_size, self.num_nodes, self.hidden_dim, device=device)
 
 
-def count_parameters(model):
-    """Count trainable parameters"""
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
+
+
+# ---------------------------------------------------------------------------
+# Smoke-test
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Test
-    num_nodes = 114
-    input_dim = 1
+    num_nodes  = 114
+    input_dim  = 5       # multi-feature test
     hidden_dim = 64
     output_dim = 1
-    seq_len = 12
-    pred_len = 12
+    seq_len    = 12
+    pred_len   = 12
     batch_size = 32
-    
+
     model = TGCN(num_nodes, input_dim, hidden_dim, output_dim, seq_len, pred_len)
-    
+
     x = torch.randn(batch_size, seq_len, num_nodes, input_dim)
     adj = torch.rand(num_nodes, num_nodes)
-    adj = (adj + adj.T) / 2
-    adj = adj + torch.eye(num_nodes)
-    
+    adj = (adj + adj.T) / 2   # symmetric
+
     output = model(x, adj)
-    
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {output.shape}")
-    print(f"Parameters: {count_parameters(model):,}")
+
+    print(f"Input  shape: {x.shape}")
+    print(f"Output shape: {output.shape}")   # expect [32, 12, 114, 1]
+    print(f"Parameters  : {count_parameters(model):,}")
