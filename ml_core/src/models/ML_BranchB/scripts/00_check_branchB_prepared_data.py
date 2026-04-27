@@ -1,6 +1,5 @@
 # ml_core/src/models/ML_BranchB/scripts/00_check_branchB_prepared_data.py
 from pathlib import Path
-import json
 import numpy as np
 import pandas as pd
 

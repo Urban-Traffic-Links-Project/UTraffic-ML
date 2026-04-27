@@ -1,13 +1,4 @@
 # ml_core/src/models/ML_BranchB/scripts/run_all_branchB.py
-"""
-Run Branch B methods sequentially.
-
-Run from project root:
-    cd C:/AI/Thesis/UTraffic-ML
-    python ml_core/src/models/ML_BranchB/scripts/run_all_branchB.py
-
-This script first checks that prepare_branchB_osm_edge_gt_like_branchA.py has been run.
-"""
 from __future__ import annotations
 
 import subprocess
@@ -39,10 +30,8 @@ def run_script(name: str):
 
 def main():
     run_script("00_check_branchB_prepared_data.py")
-
     for name in METHOD_SCRIPTS:
         run_script(name)
-
     run_script("07_branchB_plot_xt_forecast_results.py")
 
 if __name__ == "__main__":

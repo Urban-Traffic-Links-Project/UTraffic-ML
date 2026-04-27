@@ -1,4 +1,5 @@
 # Auto-converted from notebook for Branch B OSM-edge workflow.
+# Fixed syntax version.
 # Method: true_gt
 # Reads prepared GT from:
 #   ml_core/src/data_processing/outputs/branchB/osm_edge_gt_like_branchA
@@ -688,9 +689,7 @@ def fit_direct_xt_model(X_train: np.ndarray, Y_train: np.ndarray) -> MultiTaskEl
     return model
 
 
-def check_branchB_common_dir_ready(COMMON_DIR)
-
-run_branchB_xt_forecast(method_name: str, common_dir: Path, out_dir: Path, use_gt: bool):
+def run_branchB_xt_forecast(method_name: str, common_dir: Path, out_dir: Path, use_gt: bool):
     out_dir.mkdir(parents=True, exist_ok=True)
     train = load_gt_split(common_dir, 'train')
     val = load_gt_split(common_dir, 'val')
@@ -759,6 +758,8 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 print('PROJECT_ROOT:', PROJECT_ROOT)
 print('COMMON_DIR  :', COMMON_DIR)
 print('OUT_DIR     :', OUT_DIR)
+
+check_branchB_common_dir_ready(COMMON_DIR)
 
 run_branchB_xt_forecast(
     method_name=METHOD_NAME,
