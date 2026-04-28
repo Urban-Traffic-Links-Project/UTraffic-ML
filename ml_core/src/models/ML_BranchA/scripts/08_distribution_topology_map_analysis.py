@@ -4,14 +4,11 @@ Branch A advanced analysis:
 1) So sánh phân phối giữa R_true và R_pred.
 2) Đánh giá khả năng giữ cấu trúc tương quan mạnh.
 3) Đánh giá lỗi theo topology OSM.
-4) Chỉ xuất các biểu đồ cần dùng:
-   - dist_metric
-   - dist_overlay
-   - topk_overlap
-   - topology_mae
-   - topology_rmse
-
-Không xuất map HTML trong phiên bản rút gọn này.
+4) Vẽ map OSM thật:
+   - Chọn 5 đoạn đường nguồn.
+   - Với mỗi source, vẽ top 30 đoạn tương quan mạnh nhất.
+   - Rank 1-10: đỏ, rank 11-20: vàng, rank 21-30: xanh.
+   - Vẽ map sai số DMFM theo từng đoạn đường.
 
 Input chính:
     ml_core/src/models/ML_BranchA/data/05_branchA_prepare_segment_segment_rt/
@@ -37,7 +34,6 @@ import argparse
 import json
 import math
 import time
-import shutil
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1037,38 +1033,429 @@ def make_error_by_edge_map(edge_meta: Optional[pd.DataFrame], edge_error: np.nda
     print("Saved map:", out_path)
 
 
+
 # ============================================================
-# Main
+# Top-k error distribution + fixed-source method map MAIN
 # ============================================================
+
+METHOD_LABELS = {
+    "true_rt": "True R",
+    "persistence": "Persistence",
+    "ewma": "EWMA",
+    "dcc": "DCC",
+    "dmfm": "DMFM",
+    "factorized_uut": "Factorized UUT",
+}
+
+
+def method_order(existing: List[str], preferred: List[str]) -> List[str]:
+    ordered = [m for m in preferred if m in existing]
+    ordered += [m for m in sorted(existing) if m not in ordered]
+    return ordered
+
+
+def collect_topk_errors_for_split_lag(
+    train_data: Dict[str, Any],
+    split_data: Dict[str, Any],
+    methods: List[str],
+    topk_values: List[int],
+    lag: int,
+    sample_pairs: List[Tuple[int, int]],
+    models: Dict[str, Any],
+    args,
+    split_name: str = "",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Collect:
+    1) signed/absolute error on top-k pairs selected by |R_true|;
+    2) top-k overlap between TopK(|R_true|) and TopK(|R_pred|).
+
+    No CSV is saved. DataFrames are only used to create plots.
+    """
+    error_rows = []
+    overlap_rows = []
+
+    for sample_id, (origin_idx, target_idx) in enumerate(sample_pairs):
+        R_true = get_R(split_data, target_idx)
+        pred_cache: Dict[str, np.ndarray] = {}
+
+        for method in methods:
+            pred_cache[method] = predict_R(
+                method=method,
+                train_data=train_data,
+                split_data=split_data,
+                origin_idx=origin_idx,
+                target_idx=target_idx,
+                lag=lag,
+                models=models,
+                args=args,
+            )
+
+        # A) Error distribution on true top-k pairs
+        for topk in topk_values:
+            ti, tj = topk_indices_abs_upper(R_true, topk)
+            true_vals = R_true[ti, tj].astype(np.float32)
+
+            for method in methods:
+                R_pred = pred_cache[method]
+                pred_vals = R_pred[ti, tj].astype(np.float32)
+                signed_err = pred_vals - true_vals
+                abs_err = np.abs(signed_err)
+
+                for idx in range(len(ti)):
+                    error_rows.append({
+                        "sample_id": int(sample_id),
+                        "origin_idx": int(origin_idx),
+                        "target_idx": int(target_idx),
+                        "topk": int(topk),
+                        "method": method,
+                        "i": int(ti[idx]),
+                        "j": int(tj[idx]),
+                        "r_true": float(true_vals[idx]),
+                        "r_pred": float(pred_vals[idx]),
+                        "signed_error": float(signed_err[idx]),
+                        "abs_error": float(abs_err[idx]),
+                    })
+
+        # B) Top-k overlap: TopK(|R_true|) vs TopK(|R_pred|)
+        for method in methods:
+            R_pred = pred_cache[method]
+            for row in topk_overlap_metrics(R_true, R_pred, topk_values):
+                row.update({
+                    "sample_id": int(sample_id),
+                    "origin_idx": int(origin_idx),
+                    "target_idx": int(target_idx),
+                    "split": split_name,
+                    "lag": int(lag),
+                    "method": method,
+                })
+                overlap_rows.append(row)
+
+        print(f"  sample {sample_id + 1}/{len(sample_pairs)} done: origin={origin_idx}, target={target_idx}")
+
+    return pd.DataFrame(error_rows), pd.DataFrame(overlap_rows)
+
+
+def plot_topk_overlap_summary(overlap_df: pd.DataFrame, out_dir: Path, split: str, topk: int):
+    """
+    Plot average top-k overlap ratio by lag for each method.
+    This keeps only image output, no CSV/table.
+    """
+    if overlap_df.empty:
+        return
+
+    summary = (
+        overlap_df
+        .groupby(["method", "split", "lag", "topk"], as_index=False)
+        .agg(overlap_ratio=("overlap_ratio", "mean"))
+    )
+
+    sub = summary[(summary["split"] == split) & (summary["topk"] == topk)].copy()
+    if sub.empty:
+        return
+
+    plt.figure(figsize=(10, 5))
+    ordered = method_order(list(sub["method"].unique()), DEFAULT_METHODS)
+
+    for method in ordered:
+        g = sub[sub["method"] == method].sort_values("lag")
+        if g.empty:
+            continue
+        plt.plot(
+            g["lag"],
+            g["overlap_ratio"],
+            marker="o",
+            linewidth=2,
+            label=METHOD_LABELS.get(method, method),
+        )
+
+    plt.title(f"Top-{topk} strong-correlation overlap by lag | {split.upper()}")
+    plt.xlabel("Lag")
+    plt.ylabel("Overlap ratio")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+
+    path = out_dir / f"topk_overlap_top{topk}_{split}.png"
+    plt.savefig(path, dpi=180)
+    plt.close()
+    print("Saved:", path)
+
+
+def plot_abs_error_boxplot(df: pd.DataFrame, out_dir: Path, split: str, lag: int, topk: int, methods: List[str]):
+    sub = df[df["topk"] == topk].copy()
+    if sub.empty:
+        return
+
+    ordered = method_order(list(sub["method"].unique()), methods)
+    data = [sub[sub["method"] == m]["abs_error"].to_numpy(dtype=float) for m in ordered]
+    labels = [METHOD_LABELS.get(m, m) for m in ordered]
+
+    plt.figure(figsize=(11, 6))
+    bp = plt.boxplot(
+        data,
+        labels=labels,
+        showmeans=True,
+        patch_artist=True,
+        medianprops={"linewidth": 2},
+        meanprops={"marker": "o", "markerfacecolor": "black", "markeredgecolor": "black", "markersize": 5},
+    )
+    for patch in bp["boxes"]:
+        patch.set_alpha(0.45)
+
+    plt.title(f"Top-{topk} | Absolute error distribution | {split.upper()} | lag={lag}")
+    plt.xlabel("Method")
+    plt.ylabel("|R_pred - R_true|")
+    plt.xticks(rotation=25, ha="right")
+    plt.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+
+    path = out_dir / f"topk_abs_error_boxplot_{split}_lag{lag}_top{topk}.png"
+    plt.savefig(path, dpi=180)
+    plt.close()
+    print("Saved:", path)
+
+
+def plot_abs_error_hist(df: pd.DataFrame, out_dir: Path, split: str, lag: int, topk: int, methods: List[str]):
+    sub = df[df["topk"] == topk].copy()
+    if sub.empty:
+        return
+
+    plt.figure(figsize=(11, 6))
+    ordered = method_order(list(sub["method"].unique()), methods)
+
+    for method in ordered:
+        vals = sub[sub["method"] == method]["abs_error"].to_numpy(dtype=float)
+        if len(vals) == 0:
+            continue
+        plt.hist(vals, bins=40, density=True, alpha=0.35, label=METHOD_LABELS.get(method, method))
+
+    plt.title(f"Top-{topk} | Absolute error histogram | {split.upper()} | lag={lag}")
+    plt.xlabel("|R_pred - R_true|")
+    plt.ylabel("Density")
+    plt.grid(True, alpha=0.25)
+    plt.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+
+    path = out_dir / f"topk_abs_error_hist_{split}_lag{lag}_top{topk}.png"
+    plt.savefig(path, dpi=180)
+    plt.close()
+    print("Saved:", path)
+
+
+def plot_signed_error_hist(df: pd.DataFrame, out_dir: Path, split: str, lag: int, topk: int, methods: List[str]):
+    sub = df[df["topk"] == topk].copy()
+    if sub.empty:
+        return
+
+    plt.figure(figsize=(11, 6))
+    ordered = method_order(list(sub["method"].unique()), methods)
+
+    for method in ordered:
+        vals = sub[sub["method"] == method]["signed_error"].to_numpy(dtype=float)
+        if len(vals) == 0:
+            continue
+        plt.hist(vals, bins=50, density=True, alpha=0.35, label=METHOD_LABELS.get(method, method))
+
+    plt.axvline(0.0, color="black", linewidth=1.2)
+    plt.title(f"Top-{topk} | Signed error distribution | {split.upper()} | lag={lag}")
+    plt.xlabel("R_pred - R_true")
+    plt.ylabel("Density")
+    plt.grid(True, alpha=0.25)
+    plt.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+
+    path = out_dir / f"topk_signed_error_hist_{split}_lag{lag}_top{topk}.png"
+    plt.savefig(path, dpi=180)
+    plt.close()
+    print("Saved:", path)
+
+
+def create_all_topk_error_plots(df: pd.DataFrame, out_dir: Path, split: str, lag: int, topk_values: List[int], methods: List[str]):
+    for topk in topk_values:
+        plot_abs_error_boxplot(df, out_dir, split, lag, topk, methods)
+        plot_abs_error_hist(df, out_dir, split, lag, topk, methods)
+        plot_signed_error_hist(df, out_dir, split, lag, topk, methods)
+
+
+def make_fixed_source_method_map(
+    edge_meta: Optional[pd.DataFrame],
+    true_mean: np.ndarray,
+    pred_means: Dict[str, np.ndarray],
+    out_path: Path,
+    methods: List[str],
+    n_sources: int = 5,
+    top_targets: int = 30,
+):
+    """One OSM map with fixed source node ids across methods."""
+    if folium is None:
+        print("[WARN] folium is not installed; skip OSM map.")
+        return
+    if edge_meta is None:
+        print("[WARN] no edge metadata; skip OSM map.")
+        return
+
+    required = {"position", "u_lat", "u_lon", "v_lat", "v_lon", "mid_lat", "mid_lon"}
+    if not required.issubset(edge_meta.columns):
+        print("[WARN] edge metadata lacks coordinate columns; skip OSM map.")
+        return
+
+    meta = edge_meta.sort_values("position").reset_index(drop=True)
+    center = [float(meta["mid_lat"].mean()), float(meta["mid_lon"].mean())]
+    fmap = folium.Map(location=center, zoom_start=13, tiles="OpenStreetMap")
+
+    abs_true = np.abs(true_mean.copy())
+    np.fill_diagonal(abs_true, 0.0)
+
+    # Fixed source ids selected once from R_true, then reused for every method.
+    source_score = abs_true.mean(axis=1)
+    source_idx = np.argsort(source_score)[::-1][:n_sources]
+
+    print("[MAP] Fixed source positions:", source_idx.tolist())
+    print("[MAP] Fixed source model_node_ids:", [int(meta.loc[s, "model_node_id"]) for s in source_idx])
+
+    for method in methods:
+        R_for_rank = true_mean if method == "true_rt" else pred_means.get(method)
+        if R_for_rank is None:
+            continue
+
+        for source_rank, src in enumerate(source_idx, start=1):
+            source_node_id = int(meta.loc[src, "model_node_id"]) if "model_node_id" in meta.columns else int(src)
+            fg = folium.FeatureGroup(
+                name=f"{METHOD_LABELS.get(method, method)} | SOURCE {source_rank} | node {source_node_id}",
+                show=(method == "true_rt" and source_rank == 1),
+            )
+
+            src_row = meta.loc[src]
+            scores = np.abs(R_for_rank[src]).copy()
+            scores[src] = -np.inf
+            top_idx = np.argsort(scores)[::-1][:top_targets]
+
+            # Draw correlated edges first.
+            for rank, tgt in enumerate(top_idx, start=1):
+                row = meta.loc[tgt]
+                true_corr = float(true_mean[src, tgt])
+                pred_corr = float(R_for_rank[src, tgt])
+                extra = (
+                    f"<b>method:</b> {METHOD_LABELS.get(method, method)}<br>"
+                    f"<b>fixed_source_node_id:</b> {source_node_id}<br>"
+                    f"<b>rank_in_method:</b> {rank}<br>"
+                    f"<b>R_true_mean:</b> {true_corr:.5f}<br>"
+                    f"<b>R_{method}_mean:</b> {pred_corr:.5f}<br>"
+                    f"<b>abs_error:</b> {abs(pred_corr - true_corr):.5f}<br>"
+                )
+
+                color = rank_color(rank)
+                add_edge_polyline(
+                    fg,
+                    row,
+                    color=color,
+                    weight=5 if rank <= 10 else 4,
+                    opacity=0.85,
+                    popup_html=edge_popup(row, extra=extra),
+                )
+
+                folium.PolyLine(
+                    [[float(src_row["mid_lat"]), float(src_row["mid_lon"])],
+                     [float(row["mid_lat"]), float(row["mid_lon"])]],
+                    color=color,
+                    weight=1,
+                    opacity=0.22,
+                ).add_to(fg)
+
+            # Draw source last so it remains visible.
+            source_extra = (
+                f"<b>THIS IS FIXED SOURCE EDGE</b><br>"
+                f"<b>source_rank:</b> {source_rank}<br>"
+                f"<b>fixed_source_node_id:</b> {source_node_id}<br>"
+                f"<b>source_mean_abs_true_corr:</b> {source_score[src]:.5f}<br>"
+                f"<b>method layer:</b> {METHOD_LABELS.get(method, method)}<br>"
+                f"<b>Color:</b> BLACK<br>"
+            )
+            add_edge_polyline(
+                fg,
+                src_row,
+                color="#000000",
+                weight=16,
+                opacity=1.0,
+                popup_html=edge_popup(src_row, extra=source_extra),
+            )
+
+            folium.CircleMarker(
+                location=[float(src_row["mid_lat"]), float(src_row["mid_lon"])],
+                radius=9,
+                color="#000000",
+                fill=True,
+                fill_color="#000000",
+                fill_opacity=1.0,
+                tooltip=f"SOURCE {source_rank} | node {source_node_id}",
+                popup=folium.Popup(edge_popup(src_row, extra=source_extra), max_width=500),
+            ).add_to(fg)
+
+            folium.Marker(
+                location=[float(src_row["mid_lat"]), float(src_row["mid_lon"])],
+                icon=folium.DivIcon(
+                    html=f"""
+                    <div style=\"
+                        font-size: 13px;
+                        color: white;
+                        background: black;
+                        padding: 2px 6px;
+                        border-radius: 4px;
+                        border: 1px solid white;
+                        white-space: nowrap;\">
+                        SOURCE {source_rank}<br>node {source_node_id}
+                    </div>
+                    """
+                ),
+            ).add_to(fg)
+
+            fg.add_to(fmap)
+
+    legend_html = """
+    <div style="position: fixed; bottom: 30px; left: 30px; width: 330px; z-index: 9999;
+                background-color: white; border: 2px solid grey; border-radius: 6px;
+                padding: 10px; font-size: 13px;">
+        <b>Branch A fixed-source correlation map</b><br>
+        <span style="color:black;font-weight:bold;">━━</span> Fixed source edge, same across methods<br>
+        <span style="color:red;font-weight:bold;">━━</span> Top 1-10 correlated edges<br>
+        <span style="color:orange;font-weight:bold;">━━</span> Top 11-20 correlated edges<br>
+        <span style="color:green;font-weight:bold;">━━</span> Top 21-30 correlated edges<br>
+        Toggle method/source layers on the right.
+    </div>
+    """
+    fmap.get_root().html.add_child(folium.Element(legend_html))
+    folium.LayerControl(collapsed=False).add_to(fmap)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fmap.save(str(out_path))
+    print("Saved map:", out_path)
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--common-dir", type=str, default=None)
     ap.add_argument("--output-dir", type=str, default=None)
-    ap.add_argument("--clean-output", action="store_true", default=True,
-                    help="Clean the 08 output folder before running, so old maps/unused plots are removed.")
-    ap.add_argument("--no-clean-output", dest="clean_output", action="store_false",
-                    help="Do not clean the output folder before running.")
+    ap.add_argument("--clean-output", action="store_true", default=True)
+    ap.add_argument("--no-clean-output", dest="clean_output", action="store_false")
+
     ap.add_argument("--methods", type=parse_str_list, default=DEFAULT_METHODS)
     ap.add_argument("--splits", type=parse_str_list, default=DEFAULT_SPLITS)
     ap.add_argument("--lags", type=parse_int_list, default=DEFAULT_LAGS)
-
-    ap.add_argument("--samples-per-split-lag", type=int, default=6)
-    ap.add_argument("--pair-samples", type=int, default=80000)
     ap.add_argument("--topk-values", type=parse_int_list, default=[5, 10, 50, 100, 500])
 
-    ap.add_argument("--max-nodes", type=int, default=0, help="0 = use all nodes. Use 1000/1500 for quick analysis.")
+    ap.add_argument("--samples-per-split-lag", type=int, default=6)
+    ap.add_argument("--max-nodes", type=int, default=0, help="0 = use all nodes. Use 1000/1500 for quick debug.")
     ap.add_argument("--seed", type=int, default=SEED)
 
     ap.add_argument("--dmfm-factors", type=int, default=DEFAULT_DMFM_FACTORS)
-    ap.add_argument("--dmfm-train-samples", type=int, default=80, help="0 = all train samples; default uses 80 for memory safety.")
+    ap.add_argument("--dmfm-train-samples", type=int, default=80, help="0 = all train samples; default 80 for memory safety.")
     ap.add_argument("--uut-rank", type=int, default=DEFAULT_UUT_RANK)
     ap.add_argument("--uut-ridge", type=float, default=DEFAULT_UUT_RIDGE)
     ap.add_argument("--ewma-alpha", type=float, default=DEFAULT_EWMA_ALPHA)
     ap.add_argument("--dcc-lambda", type=float, default=DEFAULT_DCC_LAMBDA)
     ap.add_argument("--dcc-decay", type=float, default=DEFAULT_DCC_DECAY)
 
-    ap.add_argument("--max-hop", type=int, default=4)
     ap.add_argument("--map-split", type=str, default="test")
     ap.add_argument("--map-lag", type=int, default=1)
     ap.add_argument("--map-snapshots", type=int, default=5)
@@ -1081,33 +1468,33 @@ def main():
     project_root = find_project_root()
     branchA_root = project_root / "ml_core" / "src" / "models" / "ML_BranchA"
     common_dir = Path(args.common_dir).resolve() if args.common_dir else branchA_root / "data" / "05_branchA_prepare_segment_segment_rt"
-    out_dir = Path(args.output_dir).resolve() if args.output_dir else branchA_root / "results" / "08_distribution_topology_map_analysis"
+    out_dir = Path(args.output_dir).resolve() if args.output_dir else branchA_root / "results" / "08_topk_error_distribution_map"
 
     if args.clean_output and out_dir.exists():
         print(f"[CLEAN] Removing old output folder: {out_dir}")
         shutil.rmtree(out_dir)
 
-    tables_dir = ensure_dir(out_dir / "tables")
     plots_dir = ensure_dir(out_dir / "plots")
-    # This reduced version intentionally does not create maps/.
+    maps_dir = ensure_dir(out_dir / "maps")
 
-    print_stage("BRANCH A — DISTRIBUTION / STRONG STRUCTURE / TOPOLOGY / OSM MAP ANALYSIS")
+    print_stage("BRANCH A — TOP-K ERROR DISTRIBUTION + FIXED-SOURCE OSM MAP")
     print("PROJECT_ROOT:", project_root)
     print("COMMON_DIR  :", common_dir)
     print("OUT_DIR     :", out_dir)
     print("methods     :", args.methods)
     print("splits      :", args.splits)
     print("lags        :", args.lags)
+    print("topk_values :", args.topk_values)
     print("max_nodes   :", args.max_nodes if args.max_nodes else "all")
 
-    print_stage("LOAD BRANCH A COMMON DATA")
+    print_stage("LOAD DATA")
     train = load_rt_split(common_dir, "train")
-    all_data = {"train": train}
-    for split in set(args.splits + [args.map_split]):
+    all_data: Dict[str, Dict[str, Any]] = {"train": train}
+    needed_splits = sorted(set(args.splits + [args.map_split]))
+    for split in needed_splits:
         if split != "train":
             all_data[split] = load_rt_split(common_dir, split)
 
-    # Optional node subset for faster analysis.
     node_idx = None
     n_full = len(train["segment_ids"])
     if args.max_nodes and args.max_nodes > 0 and args.max_nodes < n_full:
@@ -1115,233 +1502,110 @@ def main():
         node_idx = np.unique(node_idx)
         print(f"[NODE SUBSET] Using {len(node_idx)}/{n_full} nodes for analysis.")
 
-    train = subset_split(train, node_idx)
     for split in list(all_data.keys()):
         all_data[split] = subset_split(all_data[split], node_idx)
     train = all_data["train"]
-
     N = len(train["segment_ids"])
     print("N analysis nodes:", N)
 
     edge_meta = load_edge_metadata(project_root, train["segment_ids"], node_idx=node_idx)
 
-    # Shared pair samples for distribution/topology.
-    pair_i, pair_j = sample_offdiag_pairs(N, args.pair_samples, rng)
-    neighbors = build_edge_line_graph_neighbors(edge_meta, N)
-    hop_bins = compute_pair_hop_bins(neighbors, pair_i, pair_j, max_hop=args.max_hop)
-    geo_bins = compute_geo_bins(edge_meta, pair_i, pair_j)
-
     print_stage("FIT PREDICTOR MODELS")
     models = fit_predictor_models(args.methods, train, args, rng)
 
-    print_stage("DISTRIBUTION + STRONG STRUCTURE + TOPOLOGY EVALUATION")
-
-    dist_rows = []
-    topk_rows = []
-    topology_rows = []
-    sampled_value_blocks = []
-
+    print_stage("TOP-K ERROR DISTRIBUTION PLOTS")
     for split in args.splits:
         split_data = all_data[split]
         for lag in args.lags:
-            pairs = sample_eval_pairs(split_data["meta"], lag, args.samples_per_split_lag, rng)
-            print(f"\n[EVAL] split={split}, lag={lag}, n_snapshots={len(pairs)}")
+            sample_pairs = sample_eval_pairs(split_data["meta"], lag, args.samples_per_split_lag, rng)
+            print(f"\n[EVAL] split={split}, lag={lag}, n_snapshots={len(sample_pairs)}")
 
-            for sample_id, (origin_idx, target_idx) in enumerate(pairs):
-                R_true = get_R(split_data, target_idx)
-                true_vals = matrix_sample_values(R_true, pair_i, pair_j)
+            err_df, overlap_df = collect_topk_errors_for_split_lag(
+                train_data=train,
+                split_data=split_data,
+                methods=args.methods,
+                topk_values=args.topk_values,
+                lag=lag,
+                sample_pairs=sample_pairs,
+                models=models,
+                args=args,
+                split_name=split,
+            )
 
-                for method in args.methods:
-                    t0 = time.time()
-                    R_pred = predict_R(method, train, split_data, origin_idx, target_idx, lag, models, args)
-                    pred_vals = matrix_sample_values(R_pred, pair_i, pair_j)
+            create_all_topk_error_plots(
+                df=err_df,
+                out_dir=plots_dir,
+                split=split,
+                lag=lag,
+                topk_values=args.topk_values,
+                methods=args.methods,
+            )
 
-                    m = distribution_metrics(true_vals, pred_vals)
-                    m.update({
-                        "method": method,
-                        "split": split,
-                        "lag": int(lag),
-                        "sample_id": int(sample_id),
-                        "origin_idx": int(origin_idx),
-                        "target_idx": int(target_idx),
-                        "elapsed_sec": float(time.time() - t0),
-                    })
-                    dist_rows.append(m)
+            # Restore top-k overlap plots as image-only output.
+            for topk in args.topk_values:
+                plot_topk_overlap_summary(
+                    overlap_df=overlap_df,
+                    out_dir=plots_dir,
+                    split=split,
+                    topk=topk,
+                )
 
-                    # Store sampled values for a subset of snapshots to plot distributions.
-                    if sample_id < 2 and method in args.methods:
-                        sampled_value_blocks.append(pd.DataFrame({
-                            "method": method,
-                            "split": split,
-                            "lag": int(lag),
-                            "sample_id": int(sample_id),
-                            "true_value": true_vals.astype(np.float32),
-                            "pred_value": pred_vals.astype(np.float32),
-                            "hop_bin": hop_bins,
-                            "geo_bin": geo_bins,
-                        }))
+            del err_df, overlap_df
 
-                    # Top-k strong correlation overlap.
-                    for row in topk_overlap_metrics(R_true, R_pred, args.topk_values):
-                        row.update({
-                            "method": method,
-                            "split": split,
-                            "lag": int(lag),
-                            "sample_id": int(sample_id),
-                            "origin_idx": int(origin_idx),
-                            "target_idx": int(target_idx),
-                        })
-                        topk_rows.append(row)
-
-                    # Topology error on sampled pairs.
-                    abs_diff = np.abs(pred_vals - true_vals)
-                    sq_diff = (pred_vals - true_vals) ** 2
-                    topo_df = pd.DataFrame({
-                        "hop_bin": hop_bins,
-                        "geo_bin": geo_bins,
-                        "abs_diff": abs_diff,
-                        "sq_diff": sq_diff,
-                    })
-
-                    by_hop = topo_df.groupby("hop_bin", as_index=False).agg(
-                        n_pairs=("abs_diff", "size"),
-                        mae=("abs_diff", "mean"),
-                        rmse=("sq_diff", lambda x: float(np.sqrt(np.mean(x)))),
-                    )
-                    for _, r in by_hop.iterrows():
-                        topology_rows.append({
-                            "method": method,
-                            "split": split,
-                            "lag": int(lag),
-                            "sample_id": int(sample_id),
-                            "group_type": "hop_bin",
-                            "hop_bin": r["hop_bin"],
-                            "geo_bin": "",
-                            "n_pairs": int(r["n_pairs"]),
-                            "mae": float(r["mae"]),
-                            "rmse": float(r["rmse"]),
-                        })
-
-                    by_geo = topo_df.groupby("geo_bin", as_index=False).agg(
-                        n_pairs=("abs_diff", "size"),
-                        mae=("abs_diff", "mean"),
-                        rmse=("sq_diff", lambda x: float(np.sqrt(np.mean(x)))),
-                    )
-                    for _, r in by_geo.iterrows():
-                        topology_rows.append({
-                            "method": method,
-                            "split": split,
-                            "lag": int(lag),
-                            "sample_id": int(sample_id),
-                            "group_type": "geo_bin",
-                            "hop_bin": "",
-                            "geo_bin": r["geo_bin"],
-                            "n_pairs": int(r["n_pairs"]),
-                            "mae": float(r["mae"]),
-                            "rmse": float(r["rmse"]),
-                        })
-
-                    print(f"  method={method:15s} sample={sample_id+1}/{len(pairs)} mean_abs_diff={m.get('mean_abs_diff', np.nan):.5f}")
-
-    dist_df = pd.DataFrame(dist_rows)
-    topk_df = pd.DataFrame(topk_rows)
-    topology_df = pd.DataFrame(topology_rows)
-
-    dist_path = tables_dir / "branchA_distribution_metrics_by_snapshot.csv"
-    topk_path = tables_dir / "branchA_topk_strong_correlation_overlap.csv"
-    topology_path = tables_dir / "branchA_topology_error_by_snapshot.csv"
-
-    dist_df.to_csv(dist_path, index=False)
-    topk_df.to_csv(topk_path, index=False)
-    topology_df.to_csv(topology_path, index=False)
-
-    print("Saved:", dist_path)
-    print("Saved:", topk_path)
-    print("Saved:", topology_path)
-
-    dist_summary = (
-        dist_df
-        .groupby(["method", "split", "lag"], as_index=False)
-        .mean(numeric_only=True)
-        .sort_values(["split", "lag", "mean_abs_diff"])
-    )
-    dist_summary_path = tables_dir / "branchA_distribution_metrics_summary.csv"
-    dist_summary.to_csv(dist_summary_path, index=False)
-    print("Saved:", dist_summary_path)
-
-    topk_summary = (
-        topk_df
-        .groupby(["method", "split", "lag", "topk"], as_index=False)
-        .mean(numeric_only=True)
-        .sort_values(["split", "lag", "topk", "overlap_ratio"], ascending=[True, True, True, False])
-    )
-    topk_summary_path = tables_dir / "branchA_topk_overlap_summary.csv"
-    topk_summary.to_csv(topk_summary_path, index=False)
-    print("Saved:", topk_summary_path)
-
-    topology_summary = (
-        topology_df
-        .groupby(["method", "split", "lag", "group_type", "hop_bin", "geo_bin"], as_index=False)
-        .mean(numeric_only=True)
-        .sort_values(["split", "lag", "group_type", "method"])
-    )
-    topology_summary_path = tables_dir / "branchA_topology_error_summary.csv"
-    topology_summary.to_csv(topology_summary_path, index=False)
-    print("Saved:", topology_summary_path)
-
-    if sampled_value_blocks:
-        values_df = pd.concat(sampled_value_blocks, ignore_index=True)
-        values_path = tables_dir / "branchA_sampled_true_pred_values.csv.gz"
-        values_df.to_csv(values_path, index=False, compression="gzip")
-        print("Saved:", values_path)
-
-        # Distribution overlay plots for selected combinations.
-        for split in args.splits:
-            for lag in args.lags:
-                for method in args.methods:
-                    plot_distribution_overlay(values_df, plots_dir, split, lag, method)
+    print_stage("FIXED-SOURCE OSM MAP")
+    if args.map_split not in all_data:
+        print(f"[WARN] map_split={args.map_split} is not loaded; skip map.")
     else:
-        values_df = pd.DataFrame()
+        map_data = all_data[args.map_split]
+        map_pairs = sample_eval_pairs(map_data["meta"], args.map_lag, args.map_snapshots, rng)
 
-    # Summary plots.
-    for split in args.splits:
-        for metric in ["mean_abs_diff", "wasserstein", "ks_stat", "pearson"]:
-            plot_metric_by_lag(dist_summary, plots_dir, metric, split)
-        for topk in args.topk_values:
-            plot_topk_overlap(topk_summary, plots_dir, split, topk)
-        for lag in args.lags:
-            plot_topology_metric(topology_summary[topology_summary["group_type"] == "hop_bin"], plots_dir, split, lag, metric="mae")
-            plot_topology_metric(topology_summary[topology_summary["group_type"] == "hop_bin"], plots_dir, split, lag, metric="rmse")
+        if not map_pairs:
+            print("[WARN] no map pairs found; skip map.")
+        else:
+            R_true_acc = np.zeros((N, N), dtype=np.float64)
+            pred_acc: Dict[str, np.ndarray] = {
+                method: np.zeros((N, N), dtype=np.float64)
+                for method in args.methods
+            }
 
-    print_stage("SKIP OSM MAPS")
-    print("This reduced script only exports: dist_metric, dist_overlay, topk_overlap, topology_mae, topology_rmse.")
-    print("No HTML maps are generated in this version. Existing old outputs are removed when --clean-output is enabled.")
+            for pair_id, (origin_idx, target_idx) in enumerate(map_pairs, start=1):
+                print(f"[MAP] pair {pair_id}/{len(map_pairs)}: origin={origin_idx}, target={target_idx}")
+                R_true = get_R(map_data, target_idx)
+                R_true_acc += R_true
 
-    metadata = {
-        "project_root": str(project_root),
-        "common_dir": str(common_dir),
-        "out_dir": str(out_dir),
-        "methods": args.methods,
-        "splits": args.splits,
-        "lags": args.lags,
-        "N": int(N),
-        "max_nodes": args.max_nodes,
-        "samples_per_split_lag": args.samples_per_split_lag,
-        "pair_samples": args.pair_samples,
-        "topk_values": args.topk_values,
-        "dmfm_train_samples": args.dmfm_train_samples,
-        "outputs": {
-            "distribution_metrics": str(dist_summary_path),
-            "topk_overlap": str(topk_summary_path),
-            "topology_summary": str(topology_summary_path),
-            "plots_dir": str(plots_dir),
-        },
-    }
-    save_json(metadata, out_dir / "analysis_metadata.json")
+                for method in args.methods:
+                    R_pred = predict_R(
+                        method=method,
+                        train_data=train,
+                        split_data=map_data,
+                        origin_idx=origin_idx,
+                        target_idx=target_idx,
+                        lag=args.map_lag,
+                        models=models,
+                        args=args,
+                    )
+                    pred_acc[method] += R_pred
+
+            R_true_mean = (R_true_acc / len(map_pairs)).astype(np.float32)
+            pred_means = {
+                method: (mat / len(map_pairs)).astype(np.float32)
+                for method, mat in pred_acc.items()
+            }
+
+            map_path = maps_dir / f"branchA_fixed_sources_method_correlation_map_{args.map_split}_lag{args.map_lag}.html"
+            make_fixed_source_method_map(
+                edge_meta=edge_meta,
+                true_mean=R_true_mean,
+                pred_means=pred_means,
+                out_path=map_path,
+                methods=args.methods,
+                n_sources=args.map_sources,
+                top_targets=args.map_top_targets,
+            )
 
     print_stage("DONE")
-    print("Tables:", tables_dir)
-    print("Plots :", plots_dir)
+    print("Plots:", plots_dir)
+    print("Maps :", maps_dir)
 
 
 if __name__ == "__main__":
