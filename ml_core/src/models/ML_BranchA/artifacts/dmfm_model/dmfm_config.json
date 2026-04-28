@@ -1,0 +1,10 @@
+{
+  "common_dir": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\data\\05_branchA_prepare_segment_segment_rt",
+  "model_path": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\dmfm_model\\dmfm_model.npz",
+  "rank": 12,
+  "n": 3697,
+  "train_samples": 120,
+  "sample_mode": "uniform",
+  "seed": 42,
+  "matrix_contract": "R_pred[i,j] is predicted correlation between segment_ids[i] and segment_ids[j]."
+}

@@ -1,0 +1,18 @@
+{
+  "split": "test",
+  "horizon": 1,
+  "dtype": "float16",
+  "shape": [
+    64,
+    3697,
+    3697
+  ],
+  "N": 3697,
+  "n_predictions": 64,
+  "R_pred_series_path": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\dmfm_predictions_full\\test\\h1\\R_pred_series.npy",
+  "segment_ids_path": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\dmfm_predictions_full\\test\\h1\\segment_ids.npy",
+  "matrix_axis_path": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\dmfm_predictions_full\\test\\h1\\matrix_axis.csv",
+  "model_path": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\dmfm_model\\dmfm_model.npz",
+  "save_npz_bundles": true,
+  "matrix_contract": "R_pred_series[pred_idx,i,j] is predicted correlation between segment_ids[i] and segment_ids[j]."
+}
