@@ -1,5 +1,6 @@
 # Auto-converted from notebook for Branch B OSM-edge workflow.
 # Fixed syntax version.
+# Memory-safe update: fit_fulltrain_factor_bases() now streams G_train instead of loading full tensor.
 # Method: factorized_mar_gt
 # Reads prepared GT from:
 #   ml_core/src/data_processing/outputs/branchB/osm_edge_gt_like_branchA
@@ -213,27 +214,76 @@ def stabilize_mar_params(A: np.ndarray, B: np.ndarray, target: float = DEFAULT_S
 
 
 def fit_fulltrain_factor_bases(G_train: np.ndarray, rank: int = DEFAULT_RANK) -> Dict[str, np.ndarray]:
-    G = np.asarray(G_train, dtype=np.float32)
-    mean_G = np.mean(G, axis=0).astype(np.float32)
-    centered = G - mean_G[None, :, :]
-    T, N, M = centered.shape
+    """
+    Memory-safe streaming version.
+
+    Old version:
+        G = np.asarray(G_train, dtype=np.float32)
+        mean_G = np.mean(G, axis=0)
+        centered = G - mean_G[None, :, :]
+
+    That loads the whole [T, N, N] tensor and creates another centered copy,
+    which can easily explode RAM for full OSM-edge Branch B.
+
+    New version:
+        Pass 1: stream G_t from disk/memmap to compute mean_G.
+        Pass 2: stream G_t again to accumulate row_cov and col_cov.
+
+    This keeps the same mathematical objective as the old implementation,
+    but avoids materializing the full G_train and centered tensors in RAM.
+    """
+    T, N, M = G_train.shape
+    print(f"[FACTOR BASES STREAMING] T={T}, N={N}, M={M}, rank={rank}")
+    print("[FACTOR BASES STREAMING] Pass 1/2: computing mean_G without loading full G_train ...")
+
+    progress_every = max(1, T // 10)
+
+    # Pass 1: mean_G
+    mean_acc = np.zeros((N, M), dtype=np.float64)
+    for t in range(T):
+        Gt = np.asarray(G_train[t], dtype=np.float32)
+        mean_acc += Gt
+        if (t + 1) % progress_every == 0 or (t + 1) == T:
+            print(f"  mean_G progress: {t + 1}/{T}")
+
+    mean_G = (mean_acc / max(T, 1)).astype(np.float32)
+    del mean_acc
+
+    print("[FACTOR BASES STREAMING] Pass 2/2: accumulating row_cov and col_cov ...")
+
     row_cov = np.zeros((N, N), dtype=np.float64)
     col_cov = np.zeros((M, M), dtype=np.float64)
-    for Gt in centered:
-        row_cov += Gt @ Gt.T
-        col_cov += Gt.T @ Gt
+
+    for t in range(T):
+        Gt = np.asarray(G_train[t], dtype=np.float32)
+        centered_t = (Gt - mean_G).astype(np.float32, copy=False)
+
+        row_cov += centered_t @ centered_t.T
+        col_cov += centered_t.T @ centered_t
+
+        if (t + 1) % progress_every == 0 or (t + 1) == T:
+            print(f"  covariance progress: {t + 1}/{T}")
+
     row_cov /= max(T, 1)
     col_cov /= max(T, 1)
+
+    # Symmetrize to reduce numerical asymmetry.
     row_cov = 0.5 * (row_cov + row_cov.T)
     col_cov = 0.5 * (col_cov + col_cov.T)
+
+    print("[FACTOR BASES STREAMING] Eigen decomposition for U and V ...")
     evals_u, evecs_u = np.linalg.eigh(row_cov)
     evals_v, evecs_v = np.linalg.eigh(col_cov)
+
     ru = int(min(rank, evecs_u.shape[1]))
     rv = int(min(rank, evecs_v.shape[1]))
+
     U = evecs_u[:, np.argsort(evals_u)[::-1][:ru]].astype(np.float32)
     V = evecs_v[:, np.argsort(evals_v)[::-1][:rv]].astype(np.float32)
-    return {'U': U, 'V': V, 'mean_G': mean_G}
 
+    print(f"[FACTOR BASES STREAMING] Done. U={U.shape}, V={V.shape}, mean_G={mean_G.shape}")
+
+    return {'U': U, 'V': V, 'mean_G': mean_G}
 
 def compress_series(G_series: np.ndarray, U: np.ndarray, V: np.ndarray, mean_G: Optional[np.ndarray] = None) -> np.ndarray:
     T = len(G_series)
