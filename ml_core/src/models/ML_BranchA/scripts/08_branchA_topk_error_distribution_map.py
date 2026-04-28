@@ -34,10 +34,10 @@ import argparse
 import json
 import math
 import time
+import shutil
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-import shutil
 
 import numpy as np
 import pandas as pd
@@ -1064,9 +1064,17 @@ def collect_topk_errors_for_split_lag(
     sample_pairs: List[Tuple[int, int]],
     models: Dict[str, Any],
     args,
-) -> pd.DataFrame:
-    """Collect signed/absolute error on top-k pairs selected by |R_true|."""
-    rows = []
+    split_name: str = "",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Collect:
+    1) signed/absolute error on top-k pairs selected by |R_true|;
+    2) top-k overlap between TopK(|R_true|) and TopK(|R_pred|).
+
+    No CSV is saved. DataFrames are only used to create plots.
+    """
+    error_rows = []
+    overlap_rows = []
 
     for sample_id, (origin_idx, target_idx) in enumerate(sample_pairs):
         R_true = get_R(split_data, target_idx)
@@ -1084,17 +1092,19 @@ def collect_topk_errors_for_split_lag(
                 args=args,
             )
 
+        # A) Error distribution on true top-k pairs
         for topk in topk_values:
             ti, tj = topk_indices_abs_upper(R_true, topk)
             true_vals = R_true[ti, tj].astype(np.float32)
 
             for method in methods:
-                pred_vals = pred_cache[method][ti, tj].astype(np.float32)
+                R_pred = pred_cache[method]
+                pred_vals = R_pred[ti, tj].astype(np.float32)
                 signed_err = pred_vals - true_vals
                 abs_err = np.abs(signed_err)
 
                 for idx in range(len(ti)):
-                    rows.append({
+                    error_rows.append({
                         "sample_id": int(sample_id),
                         "origin_idx": int(origin_idx),
                         "target_idx": int(target_idx),
@@ -1108,9 +1118,69 @@ def collect_topk_errors_for_split_lag(
                         "abs_error": float(abs_err[idx]),
                     })
 
+        # B) Top-k overlap: TopK(|R_true|) vs TopK(|R_pred|)
+        for method in methods:
+            R_pred = pred_cache[method]
+            for row in topk_overlap_metrics(R_true, R_pred, topk_values):
+                row.update({
+                    "sample_id": int(sample_id),
+                    "origin_idx": int(origin_idx),
+                    "target_idx": int(target_idx),
+                    "split": split_name,
+                    "lag": int(lag),
+                    "method": method,
+                })
+                overlap_rows.append(row)
+
         print(f"  sample {sample_id + 1}/{len(sample_pairs)} done: origin={origin_idx}, target={target_idx}")
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(error_rows), pd.DataFrame(overlap_rows)
+
+
+def plot_topk_overlap_summary(overlap_df: pd.DataFrame, out_dir: Path, split: str, topk: int):
+    """
+    Plot average top-k overlap ratio by lag for each method.
+    This keeps only image output, no CSV/table.
+    """
+    if overlap_df.empty:
+        return
+
+    summary = (
+        overlap_df
+        .groupby(["method", "split", "lag", "topk"], as_index=False)
+        .agg(overlap_ratio=("overlap_ratio", "mean"))
+    )
+
+    sub = summary[(summary["split"] == split) & (summary["topk"] == topk)].copy()
+    if sub.empty:
+        return
+
+    plt.figure(figsize=(10, 5))
+    ordered = method_order(list(sub["method"].unique()), DEFAULT_METHODS)
+
+    for method in ordered:
+        g = sub[sub["method"] == method].sort_values("lag")
+        if g.empty:
+            continue
+        plt.plot(
+            g["lag"],
+            g["overlap_ratio"],
+            marker="o",
+            linewidth=2,
+            label=METHOD_LABELS.get(method, method),
+        )
+
+    plt.title(f"Top-{topk} strong-correlation overlap by lag | {split.upper()}")
+    plt.xlabel("Lag")
+    plt.ylabel("Overlap ratio")
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8, ncol=2)
+    plt.tight_layout()
+
+    path = out_dir / f"topk_overlap_top{topk}_{split}.png"
+    plt.savefig(path, dpi=180)
+    plt.close()
+    print("Saved:", path)
 
 
 def plot_abs_error_boxplot(df: pd.DataFrame, out_dir: Path, split: str, lag: int, topk: int, methods: List[str]):
@@ -1444,14 +1514,19 @@ def main():
     print_stage("FIT PREDICTOR MODELS")
     models = fit_predictor_models(args.methods, train, args, rng)
 
-    print_stage("TOP-K ERROR DISTRIBUTION PLOTS")
+    print_stage("TOP-K ERROR DISTRIBUTION PLOTS + TOP-K OVERLAP PLOTS")
     for split in args.splits:
         split_data = all_data[split]
+
+        # Accumulate overlap rows across ALL lags, then plot once.
+        # This avoids overwriting topk_overlap_top{k}_{split}.png inside each lag loop.
+        overlap_blocks = []
+
         for lag in args.lags:
             sample_pairs = sample_eval_pairs(split_data["meta"], lag, args.samples_per_split_lag, rng)
             print(f"\n[EVAL] split={split}, lag={lag}, n_snapshots={len(sample_pairs)}")
 
-            err_df = collect_topk_errors_for_split_lag(
+            err_df, overlap_df = collect_topk_errors_for_split_lag(
                 train_data=train,
                 split_data=split_data,
                 methods=args.methods,
@@ -1460,6 +1535,7 @@ def main():
                 sample_pairs=sample_pairs,
                 models=models,
                 args=args,
+                split_name=split,
             )
 
             create_all_topk_error_plots(
@@ -1470,7 +1546,25 @@ def main():
                 topk_values=args.topk_values,
                 methods=args.methods,
             )
-            del err_df
+
+            if not overlap_df.empty:
+                overlap_blocks.append(overlap_df)
+
+            del err_df, overlap_df
+
+        # Now plot top-k overlap with all requested lags on one image per top-k.
+        if overlap_blocks:
+            overlap_all_df = pd.concat(overlap_blocks, ignore_index=True)
+            for topk in args.topk_values:
+                plot_topk_overlap_summary(
+                    overlap_df=overlap_all_df,
+                    out_dir=plots_dir,
+                    split=split,
+                    topk=topk,
+                )
+            del overlap_all_df
+        else:
+            print(f"[WARN] No overlap rows collected for split={split}.")
 
     print_stage("FIXED-SOURCE OSM MAP")
     if args.map_split not in all_data:
@@ -1526,6 +1620,10 @@ def main():
     print_stage("DONE")
     print("Plots:", plots_dir)
     print("Maps :", maps_dir)
+    print("Expected top-k overlap images:")
+    for split in args.splits:
+        for topk in args.topk_values:
+            print(" -", plots_dir / f"topk_overlap_top{topk}_{split}.png")
 
 
 if __name__ == "__main__":
