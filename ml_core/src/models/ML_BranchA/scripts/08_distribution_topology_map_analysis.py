@@ -4,11 +4,14 @@ Branch A advanced analysis:
 1) So sánh phân phối giữa R_true và R_pred.
 2) Đánh giá khả năng giữ cấu trúc tương quan mạnh.
 3) Đánh giá lỗi theo topology OSM.
-4) Vẽ map OSM thật:
-   - Chọn 5 đoạn đường nguồn.
-   - Với mỗi source, vẽ top 30 đoạn tương quan mạnh nhất.
-   - Rank 1-10: đỏ, rank 11-20: vàng, rank 21-30: xanh.
-   - Vẽ map sai số DMFM theo từng đoạn đường.
+4) Chỉ xuất các biểu đồ cần dùng:
+   - dist_metric
+   - dist_overlay
+   - topk_overlap
+   - topology_mae
+   - topology_rmse
+
+Không xuất map HTML trong phiên bản rút gọn này.
 
 Input chính:
     ml_core/src/models/ML_BranchA/data/05_branchA_prepare_segment_segment_rt/
@@ -34,6 +37,7 @@ import argparse
 import json
 import math
 import time
+import shutil
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -1041,13 +1045,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--common-dir", type=str, default=None)
     ap.add_argument("--output-dir", type=str, default=None)
+    ap.add_argument("--clean-output", action="store_true", default=True,
+                    help="Clean the 08 output folder before running, so old maps/unused plots are removed.")
+    ap.add_argument("--no-clean-output", dest="clean_output", action="store_false",
+                    help="Do not clean the output folder before running.")
     ap.add_argument("--methods", type=parse_str_list, default=DEFAULT_METHODS)
     ap.add_argument("--splits", type=parse_str_list, default=DEFAULT_SPLITS)
     ap.add_argument("--lags", type=parse_int_list, default=DEFAULT_LAGS)
 
     ap.add_argument("--samples-per-split-lag", type=int, default=6)
     ap.add_argument("--pair-samples", type=int, default=80000)
-    ap.add_argument("--topk-values", type=parse_int_list, default=[100, 500, 1000])
+    ap.add_argument("--topk-values", type=parse_int_list, default=[5, 10, 50, 100, 500])
 
     ap.add_argument("--max-nodes", type=int, default=0, help="0 = use all nodes. Use 1000/1500 for quick analysis.")
     ap.add_argument("--seed", type=int, default=SEED)
@@ -1075,9 +1083,13 @@ def main():
     common_dir = Path(args.common_dir).resolve() if args.common_dir else branchA_root / "data" / "05_branchA_prepare_segment_segment_rt"
     out_dir = Path(args.output_dir).resolve() if args.output_dir else branchA_root / "results" / "08_distribution_topology_map_analysis"
 
+    if args.clean_output and out_dir.exists():
+        print(f"[CLEAN] Removing old output folder: {out_dir}")
+        shutil.rmtree(out_dir)
+
     tables_dir = ensure_dir(out_dir / "tables")
     plots_dir = ensure_dir(out_dir / "plots")
-    maps_dir = ensure_dir(out_dir / "maps")
+    # This reduced version intentionally does not create maps/.
 
     print_stage("BRANCH A — DISTRIBUTION / STRONG STRUCTURE / TOPOLOGY / OSM MAP ANALYSIS")
     print("PROJECT_ROOT:", project_root)
@@ -1301,66 +1313,9 @@ def main():
             plot_topology_metric(topology_summary[topology_summary["group_type"] == "hop_bin"], plots_dir, split, lag, metric="mae")
             plot_topology_metric(topology_summary[topology_summary["group_type"] == "hop_bin"], plots_dir, split, lag, metric="rmse")
 
-    print_stage("OSM MAPS")
-
-    # Build map mean matrices using map_split/map_lag.
-    if args.map_split not in all_data:
-        print(f"[WARN] map_split={args.map_split} not loaded; skip maps.")
-    else:
-        map_data = all_data[args.map_split]
-        map_pairs = sample_eval_pairs(map_data["meta"], args.map_lag, args.map_snapshots, rng)
-
-        if map_pairs:
-            R_true_acc = np.zeros((N, N), dtype=np.float64)
-            pred_acc: Dict[str, np.ndarray] = {
-                method: np.zeros((N, N), dtype=np.float64)
-                for method in args.methods
-            }
-            dmfm_edge_err_acc = np.zeros(N, dtype=np.float64)
-            dmfm_edge_count = 0
-
-            for origin_idx, target_idx in map_pairs:
-                R_true = get_R(map_data, target_idx)
-                R_true_acc += R_true
-
-                for method in args.methods:
-                    R_pred = predict_R(method, train, map_data, origin_idx, target_idx, args.map_lag, models, args)
-                    pred_acc[method] += R_pred
-                    if method == "dmfm":
-                        err_by_edge = np.mean(np.abs(R_pred - R_true), axis=1)
-                        dmfm_edge_err_acc += err_by_edge
-                        dmfm_edge_count += 1
-
-            R_true_mean = (R_true_acc / len(map_pairs)).astype(np.float32)
-            pred_means = {
-                method: (mat / len(map_pairs)).astype(np.float32)
-                for method, mat in pred_acc.items()
-            }
-
-            source_map_path = maps_dir / f"branchA_source_top{args.map_top_targets}_correlation_map_{args.map_split}_lag{args.map_lag}.html"
-            make_source_top30_map(
-                edge_meta=edge_meta,
-                true_mean=R_true_mean,
-                pred_means=pred_means,
-                out_path=source_map_path,
-                n_sources=args.map_sources,
-                top_targets=args.map_top_targets,
-            )
-
-            if dmfm_edge_count > 0:
-                edge_error = (dmfm_edge_err_acc / dmfm_edge_count).astype(np.float32)
-                error_map_path = maps_dir / f"branchA_dmfm_error_by_osm_edge_map_{args.map_split}_lag{args.map_lag}.html"
-                make_error_by_edge_map(edge_meta, edge_error, error_map_path)
-
-                err_df = pd.DataFrame({
-                    "position": np.arange(N, dtype=np.int64),
-                    "model_node_id": train["segment_ids"],
-                    "dmfm_edge_mean_abs_error": edge_error,
-                })
-                if edge_meta is not None:
-                    cols = [c for c in ["position", "osm_edge_id", "street_names", "mid_lat", "mid_lon"] if c in edge_meta.columns]
-                    err_df = err_df.merge(edge_meta[cols], on="position", how="left")
-                err_df.to_csv(tables_dir / "branchA_dmfm_error_by_edge_for_map.csv", index=False)
+    print_stage("SKIP OSM MAPS")
+    print("This reduced script only exports: dist_metric, dist_overlay, topk_overlap, topology_mae, topology_rmse.")
+    print("No HTML maps are generated in this version. Existing old outputs are removed when --clean-output is enabled.")
 
     metadata = {
         "project_root": str(project_root),
@@ -1373,13 +1328,13 @@ def main():
         "max_nodes": args.max_nodes,
         "samples_per_split_lag": args.samples_per_split_lag,
         "pair_samples": args.pair_samples,
+        "topk_values": args.topk_values,
         "dmfm_train_samples": args.dmfm_train_samples,
         "outputs": {
             "distribution_metrics": str(dist_summary_path),
             "topk_overlap": str(topk_summary_path),
             "topology_summary": str(topology_summary_path),
             "plots_dir": str(plots_dir),
-            "maps_dir": str(maps_dir),
         },
     }
     save_json(metadata, out_dir / "analysis_metadata.json")
@@ -1387,7 +1342,6 @@ def main():
     print_stage("DONE")
     print("Tables:", tables_dir)
     print("Plots :", plots_dir)
-    print("Maps  :", maps_dir)
 
 
 if __name__ == "__main__":
