@@ -1,6 +1,6 @@
 # ml_core/src/models/ML_BranchA/scripts/00_prepare_branchA_common_from_osm.py
 """
-Create Branch A common input format from OSM-edge tensor.
+Create Branch A common input format from OSM-edge tensor with whole-date train/val/test split.
 
 This script converts:
     ml_core/src/data_processing/outputs/branchA/osm_edge_forecasting_dataset/osm_edge_tensor.npz
@@ -21,6 +21,12 @@ Each split train/val/test contains:
 Run:
     cd C:/AI/Thesis/UTraffic-ML
     python ml_core/src/models/ML_BranchA/scripts/00_prepare_branchA_common_from_osm.py --overwrite
+
+Split rule:
+    - train/val/test are split by whole dates.
+    - No date is allowed to appear in more than one split.
+    - If input npz already has train_idx/val_idx/test_idx, this script validates them.
+    - If input npz does not have split indices, it creates by-date split fallback.
 
 Debug:
     python ml_core/src/models/ML_BranchA/scripts/00_prepare_branchA_common_from_osm.py --max-nodes 512 --overwrite
@@ -167,6 +173,122 @@ def build_meta(timestamps):
     return meta
 
 
+def split_indices_by_date_from_timestamps(
+    timestamps: np.ndarray,
+    train_ratio: float = 0.70,
+    val_ratio: float = 0.15,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Any], pd.DataFrame]:
+    """
+    Fallback split by whole dates if input npz has no train_idx/val_idx/test_idx.
+    """
+    meta = build_meta(timestamps)
+    date_table = (
+        meta[["date"]]
+        .drop_duplicates()
+        .assign(date_parsed=lambda df: pd.to_datetime(df["date"], errors="coerce"))
+        .sort_values(["date_parsed", "date"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+    n_days = int(len(date_table))
+    if n_days < 3:
+        raise ValueError(f"Need at least 3 dates for train/val/test split, got {n_days}.")
+
+    test_ratio = 1.0 - float(train_ratio) - float(val_ratio)
+    if train_ratio <= 0 or val_ratio <= 0 or test_ratio <= 0:
+        raise ValueError(f"Invalid ratios: train={train_ratio}, val={val_ratio}, test={test_ratio}")
+
+    n_train = int(round(n_days * float(train_ratio)))
+    n_val = int(round(n_days * float(val_ratio)))
+    n_train = max(1, min(n_train, n_days - 2))
+    n_val = max(1, min(n_val, n_days - n_train - 1))
+    n_test = n_days - n_train - n_val
+
+    train_dates = date_table.iloc[:n_train]["date"].astype(str).tolist()
+    val_dates = date_table.iloc[n_train:n_train + n_val]["date"].astype(str).tolist()
+    test_dates = date_table.iloc[n_train + n_val:]["date"].astype(str).tolist()
+
+    split_dates = {
+        "train": train_dates,
+        "val": val_dates,
+        "test": test_dates,
+    }
+
+    splits = {}
+    for split, dates in split_dates.items():
+        splits[split] = meta.index[meta["date"].astype(str).isin(dates)].to_numpy(dtype=np.int64)
+
+    day_rows = []
+    for split, dates in split_dates.items():
+        for d in dates:
+            day_rows.append({
+                "date": d,
+                "split": split,
+                "n_timestamps": int((meta["date"].astype(str) == d).sum()),
+            })
+    split_day_table = pd.DataFrame(day_rows)
+    split_day_table["date_parsed"] = pd.to_datetime(split_day_table["date"], errors="coerce")
+    split_day_table = split_day_table.sort_values(["date_parsed", "split"], kind="stable").reset_index(drop=True)
+
+    split_info = {
+        "split_mode": "by_whole_date_fallback_in_00_prepare",
+        "n_days": int(n_days),
+        "n_train_days": int(n_train),
+        "n_val_days": int(n_val),
+        "n_test_days": int(n_test),
+        "train_dates": train_dates,
+        "val_dates": val_dates,
+        "test_dates": test_dates,
+        "train_date_start": train_dates[0],
+        "train_date_end": train_dates[-1],
+        "val_date_start": val_dates[0],
+        "val_date_end": val_dates[-1],
+        "test_date_start": test_dates[0],
+        "test_date_end": test_dates[-1],
+    }
+
+    return splits, split_info, split_day_table
+
+
+def validate_splits_are_whole_dates(
+    timestamps: np.ndarray,
+    splits: Dict[str, np.ndarray],
+) -> Dict[str, Any]:
+    """
+    Validate that no date appears in multiple splits.
+    """
+    full_meta = build_meta(timestamps)
+    date_sets: Dict[str, set] = {}
+    split_info: Dict[str, Any] = {"split_mode": "from_input_indices_validated_by_whole_date"}
+
+    for split in ["train", "val", "test"]:
+        idx = np.asarray(splits[split], dtype=np.int64)
+        sub = full_meta.iloc[idx].copy()
+        dates = sorted(sub["date"].astype(str).unique().tolist())
+        date_sets[split] = set(dates)
+        split_info[f"{split}_dates"] = dates
+        split_info[f"n_{split}_days"] = int(len(dates))
+        split_info[f"{split}_size"] = int(len(idx))
+        split_info[f"{split}_date_start"] = dates[0] if dates else None
+        split_info[f"{split}_date_end"] = dates[-1] if dates else None
+
+    overlaps = {
+        "train_val": sorted(date_sets["train"] & date_sets["val"]),
+        "train_test": sorted(date_sets["train"] & date_sets["test"]),
+        "val_test": sorted(date_sets["val"] & date_sets["test"]),
+    }
+    bad = {k: v for k, v in overlaps.items() if v}
+    if bad:
+        raise ValueError(
+            "Invalid split: at least one date appears in multiple splits. "
+            f"Overlaps={bad}. Re-run prepare_osm_edge_forecasting_dataset.py with by-date split."
+        )
+
+    split_info["n_days"] = int(sum(len(date_sets[x]) for x in ["train", "val", "test"]))
+    split_info["overlap_check"] = "passed_no_date_overlap"
+    return split_info
+
+
 def session_groups(meta):
     groups = []
     if "session_id" not in meta.columns:
@@ -240,14 +362,22 @@ def load_input(input_npz, prefer, feature):
     test_idx = data["test_idx"].astype(np.int64) if "test_idx" in data.files else None
 
     if train_idx is None or val_idx is None or test_idx is None:
-        T = X2.shape[0]
-        a = int(0.70 * T)
-        b = a + int(0.15 * T)
-        train_idx = np.arange(0, a, dtype=np.int64)
-        val_idx = np.arange(a, b, dtype=np.int64)
-        test_idx = np.arange(b, T, dtype=np.int64)
+        print("[SPLIT] Input npz has no train_idx/val_idx/test_idx. Creating fallback split by whole dates.")
+        splits, split_info, split_day_table = split_indices_by_date_from_timestamps(timestamps)
+    else:
+        splits = {"train": train_idx, "val": val_idx, "test": test_idx}
+        split_info = validate_splits_are_whole_dates(timestamps, splits)
+        split_day_table = pd.concat(
+            [
+                pd.DataFrame({"date": split_info[f"{split}_dates"], "split": split})
+                for split in ["train", "val", "test"]
+            ],
+            ignore_index=True,
+        )
+        split_day_table["date_parsed"] = pd.to_datetime(split_day_table["date"], errors="coerce")
+        split_day_table = split_day_table.sort_values(["date_parsed", "split"], kind="stable").reset_index(drop=True)
 
-    return X2, timestamps, model_node_ids, {"train": train_idx, "val": val_idx, "test": test_idx}, x_key, feature_idx, feature_used
+    return X2, timestamps, model_node_ids, splits, x_key, feature_idx, feature_used, split_info, split_day_table
 
 
 def build_split(out_dir, split, X2, timestamps, model_node_ids, idx, window, dtype, overwrite):
@@ -362,7 +492,13 @@ def main():
     print("INPUT       :", input_npz)
     print("OUTPUT      :", out_dir)
 
-    X2, timestamps, node_ids, splits, x_key, feature_idx, feature_used = load_input(input_npz, args.prefer, args.feature)
+    X2, timestamps, node_ids, splits, x_key, feature_idx, feature_used, split_info, split_day_table = load_input(input_npz, args.prefer, args.feature)
+
+    print("[SPLIT] mode:", split_info.get("split_mode"))
+    print("[SPLIT] train:", split_info.get("train_date_start"), "->", split_info.get("train_date_end"), f"({split_info.get('n_train_days')} days)")
+    print("[SPLIT] val  :", split_info.get("val_date_start"), "->", split_info.get("val_date_end"), f"({split_info.get('n_val_days')} days)")
+    print("[SPLIT] test :", split_info.get("test_date_start"), "->", split_info.get("test_date_end"), f"({split_info.get('n_test_days')} days)")
+    split_day_table.to_csv(out_dir / "split_by_date.csv", index=False)
 
     if args.max_nodes is not None and args.max_nodes > 0 and X2.shape[1] > args.max_nodes:
         print(f"[DEBUG] keep first {args.max_nodes} nodes")
@@ -391,6 +527,7 @@ def main():
         "window": int(args.window),
         "dtype": args.dtype,
         "shape_X2": list(map(int, X2.shape)),
+        "split_info": split_info,
         "splits": summaries,
     }
     with open(out_dir / "branchA_common_prepare_summary.json", "w", encoding="utf-8") as f:

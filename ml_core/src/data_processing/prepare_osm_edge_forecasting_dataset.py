@@ -568,7 +568,7 @@ def fill_missing_values(X_raw: np.ndarray, feature_names: List[str], output_dir:
 
 def normalize_using_train(
     X_filled: np.ndarray,
-    train_end: int,
+    train_idx_or_end: Any,
     eps: float = 1e-6,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -579,7 +579,14 @@ def normalize_using_train(
     log_section("STAGE 3 — NORMALIZE USING TRAIN STATISTICS")
     t = Timer("normalize_using_train")
 
-    train = X_filled[:train_end]
+    if np.isscalar(train_idx_or_end):
+        train = X_filled[:int(train_idx_or_end)]
+    else:
+        train_idx = np.asarray(train_idx_or_end, dtype=np.int64)
+        if train_idx.size == 0:
+            raise ValueError("train_idx is empty; cannot fit scaler.")
+        train = X_filled[train_idx]
+
     mean = train.mean(axis=(0, 1), keepdims=True).astype(np.float32)  # [1,1,F]
     std = train.std(axis=(0, 1), keepdims=True).astype(np.float32)
     std = np.where(std < eps, 1.0, std).astype(np.float32)
@@ -680,7 +687,113 @@ def compute_network_time_summary(
     return out
 
 
+def split_timestamp_indices_by_date(
+    timestamp_table: pd.DataFrame,
+    train_ratio: float,
+    val_ratio: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any], pd.DataFrame]:
+    """
+    Split timestamp indices by whole calendar dates.
+
+    Contract:
+    - A date belongs to exactly one split: train, val, or test.
+    - No day is cut in the middle.
+    - Timestamp order is preserved inside each split.
+    """
+    if "date_key" not in timestamp_table.columns:
+        raise ValueError("timestamp_table must contain date_key column to split by whole dates.")
+
+    test_ratio = 1.0 - float(train_ratio) - float(val_ratio)
+    if train_ratio <= 0 or val_ratio <= 0 or test_ratio <= 0:
+        raise ValueError(
+            f"Invalid split ratios. Expected train>0, val>0, test>0; "
+            f"got train={train_ratio}, val={val_ratio}, test={test_ratio}"
+        )
+
+    tt = timestamp_table.copy()
+    tt["date_key"] = tt["date_key"].astype(str)
+    tt["date_parsed"] = pd.to_datetime(tt["date_key"], errors="coerce")
+
+    sort_cols = ["date_parsed", "date_key"]
+    if "time_minutes" in tt.columns:
+        sort_cols.append("time_minutes")
+    if "time_set" in tt.columns:
+        sort_cols.append("time_set")
+    tt = tt.sort_values(sort_cols, kind="stable").reset_index(drop=True)
+
+    unique_dates = (
+        tt[["date_key", "date_parsed"]]
+        .drop_duplicates(subset=["date_key"])
+        .sort_values(["date_parsed", "date_key"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+    n_days = int(len(unique_dates))
+    if n_days < 3:
+        raise ValueError(f"Need at least 3 unique dates for train/val/test split, got {n_days}.")
+
+    n_train = int(round(n_days * float(train_ratio)))
+    n_val = int(round(n_days * float(val_ratio)))
+
+    # Keep every split non-empty. Test receives the remaining tail days.
+    n_train = max(1, min(n_train, n_days - 2))
+    n_val = max(1, min(n_val, n_days - n_train - 1))
+    n_test = n_days - n_train - n_val
+
+    train_dates = unique_dates.iloc[:n_train]["date_key"].astype(str).tolist()
+    val_dates = unique_dates.iloc[n_train:n_train + n_val]["date_key"].astype(str).tolist()
+    test_dates = unique_dates.iloc[n_train + n_val:]["date_key"].astype(str).tolist()
+
+    date_to_split = {d: "train" for d in train_dates}
+    date_to_split.update({d: "val" for d in val_dates})
+    date_to_split.update({d: "test" for d in test_dates})
+
+    split_day_table = unique_dates.copy()
+    split_day_table["split"] = split_day_table["date_key"].map(date_to_split)
+    split_day_table["n_timestamps"] = split_day_table["date_key"].map(tt.groupby("date_key").size()).astype(int)
+
+    train_idx = tt.loc[tt["date_key"].isin(train_dates), "timestamp_idx"].to_numpy(dtype=np.int64)
+    val_idx = tt.loc[tt["date_key"].isin(val_dates), "timestamp_idx"].to_numpy(dtype=np.int64)
+    test_idx = tt.loc[tt["date_key"].isin(test_dates), "timestamp_idx"].to_numpy(dtype=np.int64)
+
+    train_idx = np.sort(train_idx)
+    val_idx = np.sort(val_idx)
+    test_idx = np.sort(test_idx)
+
+    # Guardrail: no overlapping timestamp and no overlapping date.
+    if len(set(train_idx.tolist()) & set(val_idx.tolist())) or len(set(train_idx.tolist()) & set(test_idx.tolist())) or len(set(val_idx.tolist()) & set(test_idx.tolist())):
+        raise RuntimeError("Timestamp index overlap detected between splits.")
+    if set(train_dates) & set(val_dates) or set(train_dates) & set(test_dates) or set(val_dates) & set(test_dates):
+        raise RuntimeError("Date overlap detected between train/val/test splits.")
+
+    split_info = {
+        "split_mode": "by_whole_date",
+        "train_ratio_requested": float(train_ratio),
+        "val_ratio_requested": float(val_ratio),
+        "test_ratio_requested": float(test_ratio),
+        "n_days": int(n_days),
+        "n_train_days": int(n_train),
+        "n_val_days": int(n_val),
+        "n_test_days": int(n_test),
+        "train_dates": train_dates,
+        "val_dates": val_dates,
+        "test_dates": test_dates,
+        "train_date_start": train_dates[0],
+        "train_date_end": train_dates[-1],
+        "val_date_start": val_dates[0],
+        "val_date_end": val_dates[-1],
+        "test_date_start": test_dates[0],
+        "test_date_end": test_dates[-1],
+        "train_size": int(len(train_idx)),
+        "val_size": int(len(val_idx)),
+        "test_size": int(len(test_idx)),
+    }
+
+    return train_idx, val_idx, test_idx, split_info, split_day_table
+
+
 def make_splits(T: int, train_ratio: float, val_ratio: float) -> Tuple[int, int, np.ndarray, np.ndarray, np.ndarray]:
+    """Deprecated fallback kept for compatibility. Prefer split_timestamp_indices_by_date."""
     train_end = max(1, int(T * train_ratio))
     val_end = min(T, train_end + max(1, int(T * val_ratio)))
 
@@ -805,13 +918,13 @@ def parse_args() -> argparse.Namespace:
         "--train-ratio",
         type=float,
         default=TRAIN_RATIO,
-        help="Temporal train ratio",
+        help="Train ratio by whole dates (not by individual timestamps)",
     )
     parser.add_argument(
         "--val-ratio",
         type=float,
         default=VAL_RATIO,
-        help="Temporal validation ratio",
+        help="Validation ratio by whole dates (not by individual timestamps)",
     )
     parser.add_argument(
         "--no-plots",
@@ -847,7 +960,7 @@ def main() -> None:
     log(f"Features         : {features}")
     log(f"Primary feature  : {primary_feature}")
     log(f"Min valid ratio  : {args.min_valid_ratio}")
-    log(f"Train/Val/Test   : {args.train_ratio}/{args.val_ratio}/{1 - args.train_ratio - args.val_ratio:.2f}")
+    log(f"Train/Val/Test   : {args.train_ratio}/{args.val_ratio}/{1 - args.train_ratio - args.val_ratio:.2f} (split by whole dates)")
 
     if not input_base.exists():
         raise FileNotFoundError(f"Input base does not exist: {input_base}")
@@ -917,12 +1030,17 @@ def main() -> None:
     X_filled = fill_missing_values(X_raw, feature_names, output_dir)
 
     T = X_filled.shape[0]
-    train_end, val_end, train_idx, val_idx, test_idx = make_splits(
-        T,
-        args.train_ratio,
-        args.val_ratio,
+    train_idx, val_idx, test_idx, split_info, split_day_table = split_timestamp_indices_by_date(
+        timestamp_table=timestamp_table,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
     )
-    X_norm, scaler_mean, scaler_std = normalize_using_train(X_filled, train_end)
+    split_day_table.to_csv(tables_dir / "split_by_date.csv", index=False, encoding="utf-8-sig")
+    log("Split mode       : by whole date")
+    log(f"Train dates      : {split_info['train_date_start']} -> {split_info['train_date_end']} ({split_info['n_train_days']} days)")
+    log(f"Val dates        : {split_info['val_date_start']} -> {split_info['val_date_end']} ({split_info['n_val_days']} days)")
+    log(f"Test dates       : {split_info['test_date_start']} -> {split_info['test_date_end']} ({split_info['n_test_days']} days)")
+    X_norm, scaler_mean, scaler_std = normalize_using_train(X_filled, train_idx)
 
     # -------------------------------------------------------------------------
     # Quality and summaries
@@ -1063,20 +1181,7 @@ def main() -> None:
             "total_nodes": int(len(node_quality)),
             "min_valid_ratio_recommended": float(args.min_valid_ratio),
         },
-        "split": {
-            "train_ratio": float(args.train_ratio),
-            "val_ratio": float(args.val_ratio),
-            "test_ratio": float(1.0 - args.train_ratio - args.val_ratio),
-            "train_start": 0,
-            "train_end_exclusive": int(train_end),
-            "val_start": int(train_end),
-            "val_end_exclusive": int(val_end),
-            "test_start": int(val_end),
-            "test_end_exclusive": int(T),
-            "train_size": int(len(train_idx)),
-            "val_size": int(len(val_idx)),
-            "test_size": int(len(test_idx)),
-        },
+        "split": split_info,
         "outputs": {
             "tensor_npz": str(tensor_npz_path),
             "split_npz": str(split_npz_path),
@@ -1099,6 +1204,10 @@ def main() -> None:
         f.write(f"Features: {feature_names}\n")
         f.write(f"Primary feature: {primary_feature}\n")
         f.write(f"Train/Val/Test: {len(train_idx)}/{len(val_idx)}/{len(test_idx)}\n")
+        f.write("Split mode: by whole date; no date is shared across train/val/test.\n")
+        f.write(f"Train dates: {split_info['train_date_start']} -> {split_info['train_date_end']}\n")
+        f.write(f"Val dates: {split_info['val_date_start']} -> {split_info['val_date_end']}\n")
+        f.write(f"Test dates: {split_info['test_date_start']} -> {split_info['test_date_end']}\n")
         f.write(f"Recommended keep nodes: {metadata['coverage']['recommended_keep_nodes']}/{metadata['coverage']['total_nodes']}\n\n")
         f.write("Important files:\n")
         f.write(f"- {tensor_npz_path.name}: full tensor arrays\n")
