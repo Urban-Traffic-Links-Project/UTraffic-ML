@@ -1,0 +1,4 @@
+﻿status,date,origin_time,step,target_timestamp,split,sample_id,output_path
+saved,2024-08-27,08:15,1,2024-08-27 08:30:00,test,15,C:\AI\Thesis\UTraffic-ML\ml_core\src\models\ML_BranchA\artifacts\backend_predictions\sliding_d27_d27_from_0815_h1_h3\dmfm_backend_pred_test_20240827_0815_h1.npz
+saved,2024-08-27,08:15,2,2024-08-27 08:45:00,test,15,C:\AI\Thesis\UTraffic-ML\ml_core\src\models\ML_BranchA\artifacts\backend_predictions\sliding_d27_d27_from_0815_h1_h3\dmfm_backend_pred_test_20240827_0815_h2.npz
+saved,2024-08-27,08:30,1,2024-08-27 08:45:00,test,16,C:\AI\Thesis\UTraffic-ML\ml_core\src\models\ML_BranchA\artifacts\backend_predictions\sliding_d27_d27_from_0815_h1_h3\dmfm_backend_pred_test_20240827_0830_h1.npz

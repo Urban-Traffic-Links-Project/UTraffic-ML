@@ -1,0 +1,30 @@
+{
+  "split": "test",
+  "source_sample_id": 16,
+  "step": 1,
+  "request_timestamp": "2024-08-27 08:30:00",
+  "timestamp_local": "2024-08-27 08:30:00",
+  "target_timestamp": "2024-08-27 08:45:00",
+  "time_interval_min": 15,
+  "matrix_contract": "R_pred[i,j] is predicted correlation between segment_ids[i] and segment_ids[j].",
+  "model_path": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\dmfm_model\\dmfm_model.npz",
+  "common_dir": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\data\\05_branchA_prepare_segment_segment_rt",
+  "meta_row": {
+    "sample_id": 16,
+    "raw_row_idx": 34,
+    "window_end_idx": 34,
+    "session_step": 10,
+    "timestamp_local": "2024-08-27 08:30:00",
+    "session_id": "2024-08-27",
+    "date": "2024-08-27",
+    "time_set_id": "Slot_0830",
+    "slot_index": 10,
+    "tod_minutes": 510,
+    "raw_global_timestamp_idx": 634,
+    "split_local_idx": 34,
+    "_date": "2024-08-27",
+    "_time_hhmm": "08:30",
+    "_real_date": "2024-08-27",
+    "_minutes": 510
+  }
+}

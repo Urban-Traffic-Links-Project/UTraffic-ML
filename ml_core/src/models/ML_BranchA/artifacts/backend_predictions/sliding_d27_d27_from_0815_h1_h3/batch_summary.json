@@ -1,0 +1,22 @@
+{
+  "service_path": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\scripts\\10_function_helper.py",
+  "common_dir": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\data\\05_branchA_prepare_segment_segment_rt",
+  "model_path": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\dmfm_model\\dmfm_model.npz",
+  "output_dir": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\backend_predictions\\sliding_d27_d27_from_0815_h1_h3",
+  "year": 2024,
+  "month": 8,
+  "start_day": 27,
+  "end_day": 27,
+  "start_time": "08:15",
+  "end_time": "08:45",
+  "max_step": 3,
+  "time_interval_min": 15,
+  "dtype": "float16",
+  "include_current": false,
+  "n_success_or_skipped_exists_or_dry": 3,
+  "n_stopped_or_skipped": 3,
+  "n_errors": 0,
+  "manifest_csv": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\backend_predictions\\sliding_d27_d27_from_0815_h1_h3\\batch_manifest.csv",
+  "skipped_csv": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\backend_predictions\\sliding_d27_d27_from_0815_h1_h3\\batch_skipped.csv",
+  "errors_csv": "C:\\AI\\Thesis\\UTraffic-ML\\ml_core\\src\\models\\ML_BranchA\\artifacts\\backend_predictions\\sliding_d27_d27_from_0815_h1_h3\\batch_errors.csv"
+}

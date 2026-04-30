@@ -1,0 +1,4 @@
+﻿date,origin_time,step,target_timestamp,reason
+2024-08-27,08:15,3,2024-08-27 09:00:00,target outside available R_t window
+2024-08-27,08:30,2,2024-08-27 09:00:00,target outside available R_t window
+2024-08-27,08:45,1,2024-08-27 09:00:00,target outside available R_t window
