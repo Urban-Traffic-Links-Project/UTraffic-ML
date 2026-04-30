@@ -1,6 +1,4 @@
-%cd /kaggle/working/UTraffic-ML
 
-%%writefile ml_core/src/models/ML_BranchB/scripts/08B_branchB_demo_map_and_overlap.py
 from __future__ import annotations
 
 import argparse
