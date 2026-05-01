@@ -38,6 +38,7 @@ def find_project_root() -> Path:
 BASE_METHOD_LABELS: Dict[str, str] = {
     "no_gt": "No-Rt",
     "true_gt": "True-Rt",
+    "granger_gt": "Granger-GT",
     "persistence_gt": "Persistence-Rt",
     "ewma_gt": "EWMA-Rt",
     "sparse_tvpvar_gt": "Sparse TVP-VAR-Rt",
@@ -50,6 +51,7 @@ BASE_METHOD_LABELS: Dict[str, str] = {
 BASE_ORDER = [
     "no_gt",
     "true_gt",
+    "granger_gt",
     "persistence_gt",
     "ewma_gt",
     "sparse_tvpvar_gt",

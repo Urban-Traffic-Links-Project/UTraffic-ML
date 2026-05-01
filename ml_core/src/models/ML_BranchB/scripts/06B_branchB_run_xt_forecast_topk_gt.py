@@ -56,6 +56,7 @@ EPS = 1e-8
 METHOD_TO_SCRIPT = {
     "no_gt": "06_branchB_run_xt_forecast_no_gt.py",
     "true_gt": "06_branchB_run_xt_forecast_true_gt.py",
+    "granger_gt": "06_branchB_run_xt_forecast_granger_gt.py",
     "persistence_gt": "06_branchB_run_xt_forecast_persistence_gt.py",
     "ewma_gt": "06_branchB_run_xt_forecast_ewma_gt.py",
     "sparse_tvpvar_gt": "06_branchB_run_xt_forecast_sparse_tvpvar_gt.py",
@@ -81,6 +82,7 @@ ALL_WITH_DENSE_METHODS = PRACTICAL_ALL_METHODS + ["dense_tvpvar_gt"]
 BASE_LABELS = {
     "no_gt": "No-Rt",
     "true_gt": "True-Rt",
+    "granger_gt": "Granger-GT",
     "persistence_gt": "Persistence-Rt",
     "ewma_gt": "EWMA-Rt",
     "sparse_tvpvar_gt": "Sparse TVP-VAR-Rt",
