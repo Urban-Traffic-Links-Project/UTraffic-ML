@@ -57,6 +57,7 @@ METHOD_TO_SCRIPT = {
     "no_gt": "06_branchB_run_xt_forecast_no_gt.py",
     "true_gt": "06_branchB_run_xt_forecast_true_gt.py",
     "granger_gt": "06_branchB_run_xt_forecast_granger_gt.py",
+    "granger_dynamic_gt": "06_branchB_run_xt_forecast_granger_dynamic_gt.py",
     "persistence_gt": "06_branchB_run_xt_forecast_persistence_gt.py",
     "ewma_gt": "06_branchB_run_xt_forecast_ewma_gt.py",
     "sparse_tvpvar_gt": "06_branchB_run_xt_forecast_sparse_tvpvar_gt.py",
@@ -83,6 +84,7 @@ BASE_LABELS = {
     "no_gt": "No-Rt",
     "true_gt": "True-Rt",
     "granger_gt": "Granger-GT",
+    "granger_dynamic_gt": "Granger-Dynamic-GT",
     "persistence_gt": "Persistence-Rt",
     "ewma_gt": "EWMA-Rt",
     "sparse_tvpvar_gt": "Sparse TVP-VAR-Rt",
@@ -269,12 +271,15 @@ def subset_split_data(data: Dict[str, Any], node_idx: Optional[np.ndarray]) -> D
 
     idx = np.asarray(node_idx, dtype=np.int64)
     out = dict(data)
+    out["_node_idx"] = idx
     out["segment_ids"] = np.asarray(data["segment_ids"])[idx].astype(np.int64)
     out["z"] = np.asarray(data["z"], dtype=np.float32)[:, idx]
 
-    # G_weight_series and G_best_lag_series are T x N x N. For node subset, copy
-    # the selected submatrix into RAM. This is intended for quick testing.
-    out["G_weight_series"] = np.asarray(data["G_weight_series"][:, idx, :][:, :, idx], dtype=np.float32)
+    # Standard Rt/Gt methods store G as T x N x N or H x N x N in split_data.
+    # Dynamic methods may store graph banks outside split_data; for those, keep
+    # only _node_idx so the method module can subset the graph lazily.
+    if "G_weight_series" in data:
+        out["G_weight_series"] = np.asarray(data["G_weight_series"][:, idx, :][:, :, idx], dtype=np.float32)
 
     if "G_best_lag_series" in data:
         out["G_best_lag_series"] = np.asarray(data["G_best_lag_series"][:, idx, :][:, :, idx])
@@ -688,6 +693,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--topk", type=int, default=20, help="Top-K sources per target row for Rt/Gt methods.")
     parser.add_argument("--lags", type=str, default="1-9", help="Horizons, e.g. 1-9 or 1,2,3.")
     parser.add_argument("--data-dir", type=str, default=None, help="Prepared Branch-B data dir.")
+    parser.add_argument("--results-dir", type=str, default=None, help="Output results directory for this run. Default: BranchB/results/06_branchB_run_xt_forecast")
     parser.add_argument("--no-normalize", action="store_true", help="Disable row L1 normalization after Top-K.")
     parser.add_argument("--keep-self-loop", action="store_true", help="Keep diagonal/self-loop edges. Default removes self-loop.")
     parser.add_argument(
@@ -745,11 +751,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-
     project_root = find_project_root()
     scripts_dir = project_root / "ml_core" / "src" / "models" / "ML_BranchB" / "scripts"
     branchb_root = project_root / "ml_core" / "src" / "models" / "ML_BranchB"
-    base_results_dir = branchb_root / "results" / "06_branchB_run_xt_forecast"
+    if args.results_dir is None:
+        base_results_dir = branchb_root / "results" / "06_branchB_run_xt_forecast"
+    else:
+        base_results_dir = Path(args.results_dir)
+        if not base_results_dir.is_absolute():
+            base_results_dir = project_root / base_results_dir
+    base_results_dir.mkdir(parents=True, exist_ok=True)
     base_results_dir.mkdir(parents=True, exist_ok=True)
 
     if args.data_dir is None:
