@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -451,6 +452,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--node-sample", type=str, default="first", choices=["first", "random"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--parallel-level", type=str, default="none", choices=["none", "horizon"], help="Parallelize independent horizons without changing the formula.")
+    parser.add_argument("--n-jobs", type=int, default=1, help="Number of parallel workers when --parallel-level horizon.")
     return parser
 
 
@@ -521,23 +524,41 @@ def main() -> None:
     if not np.array_equal(train["segment_ids"], test["segment_ids"]):
         raise ValueError("train and test segment_ids differ.")
 
-    rows: List[Dict[str, Any]] = []
-    for h in horizons:
-        rows.extend(
-            run_horizon(
-                train=train,
-                val=val,
-                test=test,
-                horizon=int(h),
-                method_name=method_name,
-                topk=int(args.topk),
-                normalize=normalize,
-                remove_self_loop=remove_self_loop,
-                lag_mode=str(args.lag_mode),
-                model_type=str(args.model_type),
-                fit_intercept=bool(args.fit_intercept),
-            )
+    def _run_one_horizon(h: int) -> List[Dict[str, Any]]:
+        return run_horizon(
+            train=train,
+            val=val,
+            test=test,
+            horizon=int(h),
+            method_name=method_name,
+            topk=int(args.topk),
+            normalize=normalize,
+            remove_self_loop=remove_self_loop,
+            lag_mode=str(args.lag_mode),
+            model_type=str(args.model_type),
+            fit_intercept=bool(args.fit_intercept),
         )
+
+    rows: List[Dict[str, Any]] = []
+    n_jobs = max(1, int(args.n_jobs))
+    if args.parallel_level == "horizon" and n_jobs > 1 and len(horizons) > 1:
+        log(f"Parallel mode: horizon | n_jobs={n_jobs}. Each horizon is independent; formulas and samples are unchanged.")
+        future_to_h = {}
+        with ThreadPoolExecutor(max_workers=n_jobs) as ex:
+            for h in horizons:
+                future_to_h[ex.submit(_run_one_horizon, int(h))] = int(h)
+            for fut in as_completed(future_to_h):
+                h = future_to_h[fut]
+                try:
+                    rows.extend(fut.result())
+                    log(f"[h={h}] finished")
+                except Exception as e:
+                    log(f"[h={h}] failed: {e}")
+                    raise
+    else:
+        log("Parallel mode: none/sequential")
+        for h in horizons:
+            rows.extend(_run_one_horizon(int(h)))
 
     df = pd.DataFrame(rows)
     df.to_csv(metrics_path, index=False)
@@ -557,6 +578,8 @@ def main() -> None:
             "horizons": horizons,
             "common_dir": str(common_dir),
             "metrics_path": str(metrics_path),
+            "parallel_level": str(args.parallel_level),
+            "n_jobs": int(args.n_jobs),
         },
         out_dir / "run_config.json",
     )
