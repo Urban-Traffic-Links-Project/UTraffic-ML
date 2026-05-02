@@ -1,6 +1,7 @@
 """
-Branch B method module: Sparse VAR-Gt.
-Runs on Granger-Gt series. Includes safe split alignment to avoid index mismatch.
+Branch B method module: Sparse TVP-VAR-Gt.
+Practical TVP-like sparse VAR on PCA scores of Granger-Gt with recency-weighted fitting.
+Includes safe split alignment to avoid index mismatch.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -114,7 +115,7 @@ except Exception:
     MultiTaskElasticNet = None
 
 SPARSE_VAR_RANK = 8
-SPARSE_VAR_ALPHA = 0.001
+SPARSE_VAR_ALPHA = 0.002
 SPARSE_VAR_L1_RATIO = 0.5
 SPARSE_VAR_MAX_ITER = 3000
 MAX_TRAIN_MATS = 0  # 0 = all
