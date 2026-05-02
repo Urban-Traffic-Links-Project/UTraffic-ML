@@ -1,6 +1,6 @@
 # ml_core/src/models/ML_BranchB/scripts/07_branchB_plot_xt_forecast_results.py
 """
-Plot Branch B XT forecast metrics.
+Plot Branch B XT forecast metrics for Granger-Gt runs.
 
 Updated version:
 - Can filter to Top-K runs, e.g. --topk 20.
@@ -36,17 +36,18 @@ def find_project_root() -> Path:
 
 
 BASE_METHOD_LABELS: Dict[str, str] = {
-    "no_gt": "No-Rt",
-    "true_gt": "True-Rt",
+    "no_gt": "No-Graph",
+    "true_gt": "True-Gt",
     "granger_gt": "Granger-GT",
     "granger_dynamic_gt": "Granger-Dynamic-GT",
-    "persistence_gt": "Persistence-Rt",
-    "ewma_gt": "EWMA-Rt",
-    "sparse_tvpvar_gt": "Sparse TVP-VAR-Rt",
-    "factorized_var_gt": "Factorized VAR-Rt",
-    "factorized_mar_gt": "Factorized MAR-Rt",
-    "factorized_tvpvar_gt": "Factorized TVP-VAR-Rt",
-    "dense_tvpvar_gt": "Dense TVP-VAR-Rt",
+    "persistence_gt": "Persistence-Gt",
+    "ewma_gt": "EWMA-Gt",
+    "sparse_tvpvar_gt": "Sparse TVP-VAR-Gt",
+    "sparse_var_gt": "Sparse VAR-Gt",
+    "factorized_var_gt": "Factorized VAR-Gt",
+    "factorized_mar_gt": "Factorized MAR-Gt",
+    "factorized_tvpvar_gt": "Factorized TVP-VAR-Gt",
+    "dense_tvpvar_gt": "Dense TVP-VAR-Gt",
 }
 
 BASE_ORDER = [
@@ -57,6 +58,7 @@ BASE_ORDER = [
     "persistence_gt",
     "ewma_gt",
     "sparse_tvpvar_gt",
+    "sparse_var_gt",
     "factorized_var_gt",
     "factorized_mar_gt",
     "factorized_tvpvar_gt",

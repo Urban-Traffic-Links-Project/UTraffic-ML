@@ -1,6 +1,6 @@
 # ml_core/src/models/ML_BranchB/scripts/06B_branchB_run_xt_forecast_topk_gt.py
 """
-Branch B — XT forecast with Top-K Rt/Gt graph signal for all methods.
+Branch B — XT forecast with Top-K Gt graph signal for selected methods.
 
 Main changes:
 - Apply Top-K graph signal consistently to every Rt/Gt-based method.
@@ -61,6 +61,7 @@ METHOD_TO_SCRIPT = {
     "persistence_gt": "06_branchB_run_xt_forecast_persistence_gt.py",
     "ewma_gt": "06_branchB_run_xt_forecast_ewma_gt.py",
     "sparse_tvpvar_gt": "06_branchB_run_xt_forecast_sparse_tvpvar_gt.py",
+    "sparse_var_gt": "06_branchB_run_xt_forecast_sparse_var_gt.py",
     "factorized_var_gt": "06_branchB_run_xt_forecast_factorized_var_gt.py",
     "factorized_mar_gt": "06_branchB_run_xt_forecast_factorized_mar_gt.py",
     "factorized_tvpvar_gt": "06_branchB_run_xt_forecast_factorized_tvpvar_gt.py",
@@ -68,30 +69,28 @@ METHOD_TO_SCRIPT = {
 }
 
 PRACTICAL_ALL_METHODS = [
-    "no_gt",
     "true_gt",
     "persistence_gt",
     "ewma_gt",
     "sparse_tvpvar_gt",
-    "factorized_var_gt",
-    "factorized_mar_gt",
-    "factorized_tvpvar_gt",
+    "sparse_var_gt",
 ]
 
 ALL_WITH_DENSE_METHODS = PRACTICAL_ALL_METHODS + ["dense_tvpvar_gt"]
 
 BASE_LABELS = {
-    "no_gt": "No-Rt",
-    "true_gt": "True-Rt",
+    "no_gt": "No-Graph",
+    "true_gt": "True-Gt",
     "granger_gt": "Granger-GT",
     "granger_dynamic_gt": "Granger-Dynamic-GT",
-    "persistence_gt": "Persistence-Rt",
-    "ewma_gt": "EWMA-Rt",
-    "sparse_tvpvar_gt": "Sparse TVP-VAR-Rt",
-    "factorized_var_gt": "Factorized VAR-Rt",
-    "factorized_mar_gt": "Factorized MAR-Rt",
-    "factorized_tvpvar_gt": "Factorized TVP-VAR-Rt",
-    "dense_tvpvar_gt": "Dense TVP-VAR-Rt",
+    "persistence_gt": "Persistence-Gt",
+    "ewma_gt": "EWMA-Gt",
+    "sparse_tvpvar_gt": "Sparse TVP-VAR-Gt",
+    "sparse_var_gt": "Sparse VAR-Gt",
+    "factorized_var_gt": "Factorized VAR-Gt",
+    "factorized_mar_gt": "Factorized MAR-Gt",
+    "factorized_tvpvar_gt": "Factorized TVP-VAR-Gt",
+    "dense_tvpvar_gt": "Dense TVP-VAR-Gt",
 }
 
 
@@ -682,7 +681,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="all",
         help=(
             "Comma-separated methods. Use all, all_with_dense, baselines, or explicit names. "
-            "Default all excludes dense_tvpvar_gt for full-run safety."
+            "Default all now runs only: true_gt, persistence_gt, ewma_gt, sparse_tvpvar_gt, sparse_var_gt. Use explicit methods for others."
         ),
     )
     parser.add_argument(

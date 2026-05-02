@@ -1,19 +1,37 @@
 """
-Prepare Branch B OSM-edge STATIC Granger-based directed predictive graph.
+Prepare Branch B OSM-edge Granger-based directed predictive graph.
 
-This file also provides helper functions used by:
-    prepare_branchB_osm_edge_granger_dynamic_like_branchA.py
+This script replaces the old lagged-correlation GT with a practical Granger-style
+predictive influence graph, while keeping the downstream Branch-B file format.
 
-Input:
-    outputs/branchB/osm_edge_gt_like_branchA/
+Main idea
+---------
+For each forecast horizon h and directed pair source j -> target i, estimate:
 
-Output:
-    outputs/branchB/osm_edge_granger_like_branchA/
+    Restricted: x_i[t+h] <- past/current of x_i
+    Full      : x_i[t+h] <- past/current of x_i + past/current of x_j
 
-Graph semantics:
-    G[target, source] = sign(source coefficient) * max(0, log((MSE_R+eps)/(MSE_F+eps)))
+Then define the edge weight:
 
-This is NOT a correlation matrix. It is a directed predictive influence graph.
+    G[i, j, h] = sign(source coefficient) * max(0, log((MSE_R + eps)/(MSE_F + eps)))
+
+where G uses the existing convention:
+
+    G[target, source]
+
+Important:
+- This is NOT a correlation matrix.
+- It is a directed predictive influence / Granger-style adjacency matrix.
+- Default mode is static train-only Granger: graph is estimated from train split
+  and reused for train/val/test to avoid leakage.
+
+Recommended quick test:
+    python -u ml_core/src/data_processing/prepare_branchB_osm_edge_granger_like_branchA.py \
+      --max-nodes 512 --horizons 1-9 --granger-p 3 --max-candidates 50 --overwrite
+
+Recommended full run, safer first:
+    python -u ml_core/src/data_processing/prepare_branchB_osm_edge_granger_like_branchA.py \
+      --horizons 1-9 --granger-p 3 --max-candidates 50 --candidate-block-size 256 --overwrite
 """
 
 from __future__ import annotations
@@ -25,8 +43,10 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+# Keep BLAS threads controlled. The heavy parts are matrix multiplications and
+# small least-squares solves; avoid accidental oversubscription in notebooks.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -40,15 +60,21 @@ try:
 except Exception:
     tqdm = None
 
-
 EPS = 1e-8
+
 THIS_FILE = Path(__file__).resolve()
 DATA_PROCESSING_DIR = THIS_FILE.parent
-PROJECT_ROOT = DATA_PROCESSING_DIR.parents[2]
+SRC_ROOT = DATA_PROCESSING_DIR.parent
+ML_CORE_ROOT = SRC_ROOT.parent
+PROJECT_ROOT = ML_CORE_ROOT.parent
+
 DEFAULT_SOURCE_DIR = DATA_PROCESSING_DIR / "outputs" / "branchB" / "osm_edge_gt_like_branchA"
 DEFAULT_OUTPUT_DIR = DATA_PROCESSING_DIR / "outputs" / "branchB" / "osm_edge_granger_like_branchA"
 
 
+# =============================================================================
+# Utilities
+# =============================================================================
 class NumpyJsonEncoder(json.JSONEncoder):
     def default(self, obj: Any):
         if isinstance(obj, np.integer):
@@ -57,6 +83,8 @@ class NumpyJsonEncoder(json.JSONEncoder):
             return float(obj)
         if isinstance(obj, np.ndarray):
             return obj.tolist()
+        if isinstance(obj, pd.Timestamp):
+            return str(obj)
         if isinstance(obj, Path):
             return str(obj)
         return super().default(obj)
@@ -71,9 +99,9 @@ def log(msg: str) -> None:
 
 
 def print_stage(title: str) -> None:
-    print("\n" + "=" * 88, flush=True)
-    print(title, flush=True)
-    print("=" * 88, flush=True)
+    print("\n" + "=" * 96, flush=True)
+    print(f"{now_str()} | {title}", flush=True)
+    print("=" * 96, flush=True)
 
 
 def ensure_dir(path: Path) -> Path:
@@ -109,36 +137,64 @@ def maybe_iter(iterable, total: Optional[int] = None, desc: str = ""):
     return iterable
 
 
-def fmt_gb(nbytes: int) -> str:
-    return f"{nbytes / (1024 ** 3):.2f} GB"
+def memory_mb(arr: np.ndarray) -> float:
+    return arr.nbytes / 1024 / 1024
 
 
+def bytes_to_gb(n_bytes: int) -> float:
+    return n_bytes / (1024 ** 3)
+
+
+def fmt_gb(n_bytes: int) -> str:
+    return f"{bytes_to_gb(n_bytes):,.2f} GB"
+
+
+def decode_np_datetime(arr: np.ndarray) -> np.ndarray:
+    try:
+        return arr.astype("datetime64[ns]")
+    except Exception:
+        return np.asarray(pd.to_datetime(arr), dtype="datetime64[ns]")
+
+
+# =============================================================================
+# Loading existing Branch-B prepared data
+# =============================================================================
 def load_existing_split(source_dir: Path, split: str, mmap: bool = True) -> Dict[str, Any]:
-    d = Path(source_dir) / split
-    required = ["z.npy", "segment_ids.npy", "timestamps.npy", "G_series_meta.csv"]
-    missing = [d / name for name in required if not (d / name).exists()]
+    d = source_dir / split
+    required = [
+        d / "z.npy",
+        d / "segment_ids.npy",
+        d / "timestamps.npy",
+        d / "G_series_meta.csv",
+    ]
+    missing = [p for p in required if not p.exists()]
     if missing:
-        raise FileNotFoundError("Missing Branch-B split files:\n" + "\n".join(map(str, missing)))
+        raise FileNotFoundError("Missing source Branch-B files:\n" + "\n".join(map(str, missing)))
 
     mmap_mode = "r" if mmap else None
     z = np.load(d / "z.npy", mmap_mode=mmap_mode)
     segment_ids = np.asarray(np.load(d / "segment_ids.npy"), dtype=np.int64)
-    timestamps = np.asarray(np.load(d / "timestamps.npy")).astype(str)
+    timestamps = decode_np_datetime(np.load(d / "timestamps.npy"))
     meta = pd.read_csv(d / "G_series_meta.csv")
     if "timestamp_local" in meta.columns:
-        meta["timestamp_local"] = pd.to_datetime(meta["timestamp_local"], errors="coerce")
+        meta["timestamp_local"] = pd.to_datetime(meta["timestamp_local"])
 
-    out = {
+    return {
+        "split_dir": d,
         "z": z,
         "segment_ids": segment_ids,
         "timestamps": timestamps,
         "meta": meta,
     }
-    # Keep standard Rt if available.
-    if (d / "G_weight_series.npy").exists():
-        out["G_weight_series"] = np.load(d / "G_weight_series.npy", mmap_mode=mmap_mode)
-    if (d / "G_best_lag_series.npy").exists():
-        out["G_best_lag_series"] = np.load(d / "G_best_lag_series.npy", mmap_mode=mmap_mode)
+
+
+def subset_nodes(data: Dict[str, Any], node_idx: Optional[np.ndarray]) -> Dict[str, Any]:
+    if node_idx is None:
+        return data
+    idx = np.asarray(node_idx, dtype=np.int64)
+    out = dict(data)
+    out["z"] = np.asarray(data["z"], dtype=np.float32)[:, idx]
+    out["segment_ids"] = np.asarray(data["segment_ids"], dtype=np.int64)[idx]
     return out
 
 
@@ -150,60 +206,53 @@ def resolve_node_indices(
     node_sample: str = "first",
     seed: int = 42,
 ) -> Optional[np.ndarray]:
-    seg = np.asarray(train_segment_ids, dtype=np.int64)
-    N = int(len(seg))
+    N = int(len(train_segment_ids))
+    if not node_indices_arg and not node_ids_arg and int(max_nodes) <= 0:
+        return None
+
     selected: Optional[np.ndarray] = None
 
     if node_indices_arg:
         idx = np.asarray(parse_int_list(node_indices_arg), dtype=np.int64)
-        if idx.size == 0:
-            raise ValueError("--node-indices was provided but no valid index was parsed.")
+        if len(idx) == 0:
+            raise ValueError("--node-indices provided but parsed no indices")
         if idx.min() < 0 or idx.max() >= N:
             raise ValueError(f"node index out of range. N={N}, min={idx.min()}, max={idx.max()}")
         selected = idx
 
     if node_ids_arg:
         requested = np.asarray(parse_int_list(node_ids_arg), dtype=np.int64)
-        pos = {int(v): i for i, v in enumerate(seg)}
-        missing = [int(x) for x in requested if int(x) not in pos]
+        id_to_pos = {int(v): i for i, v in enumerate(train_segment_ids)}
+        missing = [int(x) for x in requested if int(x) not in id_to_pos]
         if missing:
-            raise ValueError(f"Some node ids are missing from segment_ids: {missing[:20]}")
-        idx = np.asarray([pos[int(x)] for x in requested], dtype=np.int64)
+            raise ValueError(f"Some node ids are not in train segment_ids: {missing[:20]}")
+        idx = np.asarray([id_to_pos[int(x)] for x in requested], dtype=np.int64)
         selected = idx if selected is None else np.intersect1d(selected, idx)
 
-    if selected is None and int(max_nodes) > 0:
-        max_nodes = min(int(max_nodes), N)
-        if max_nodes < N:
-            if node_sample == "first":
-                selected = np.arange(max_nodes, dtype=np.int64)
-            elif node_sample == "random":
-                rng = np.random.default_rng(int(seed))
-                selected = np.sort(rng.choice(N, size=max_nodes, replace=False).astype(np.int64))
-            else:
-                raise ValueError("--node-sample must be first or random")
-
     if selected is None:
-        return None
-    selected = np.asarray(sorted(set(map(int, selected.tolist()))), dtype=np.int64)
-    if selected.size == 0:
-        raise ValueError("Node selection is empty.")
+        max_nodes = int(max_nodes)
+        if max_nodes <= 0 or max_nodes >= N:
+            return None
+        if node_sample == "first":
+            selected = np.arange(max_nodes, dtype=np.int64)
+        elif node_sample == "random":
+            rng = np.random.default_rng(int(seed))
+            selected = np.sort(rng.choice(N, size=max_nodes, replace=False).astype(np.int64))
+        else:
+            raise ValueError("--node-sample must be first or random")
+    else:
+        selected = np.asarray(sorted(set(map(int, selected.tolist()))), dtype=np.int64)
+        if int(max_nodes) > 0 and len(selected) > int(max_nodes):
+            selected = selected[: int(max_nodes)]
+
+    if len(selected) == 0:
+        raise ValueError("Node selection is empty")
     return selected
 
 
-def subset_nodes(data: Dict[str, Any], node_idx: Optional[np.ndarray]) -> Dict[str, Any]:
-    if node_idx is None:
-        return dict(data)
-    idx = np.asarray(node_idx, dtype=np.int64)
-    out = dict(data)
-    out["segment_ids"] = np.asarray(data["segment_ids"], dtype=np.int64)[idx]
-    out["z"] = np.asarray(data["z"], dtype=np.float32)[:, idx]
-    if "G_weight_series" in data:
-        out["G_weight_series"] = np.asarray(data["G_weight_series"][:, idx, :][:, :, idx], dtype=np.float32)
-    if "G_best_lag_series" in data:
-        out["G_best_lag_series"] = np.asarray(data["G_best_lag_series"][:, idx, :][:, :, idx])
-    return out
-
-
+# =============================================================================
+# Session-aware supervised samples
+# =============================================================================
 def session_groups(meta: pd.DataFrame) -> List[np.ndarray]:
     if "session_id" in meta.columns:
         groups = []
@@ -215,141 +264,141 @@ def session_groups(meta: pd.DataFrame) -> List[np.ndarray]:
     return [np.arange(len(meta), dtype=np.int64)]
 
 
-def build_supervised_tensors(
-    z: np.ndarray,
-    meta: pd.DataFrame,
-    horizon: int,
-    p: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Build:
-        X_lags[m, r, n] = z[origin-r, n], r=0..p-1
-        Y[m, n]         = z[origin+horizon, n]
-    Session boundaries are respected.
-    """
-    z = np.asarray(z, dtype=np.float32)
+def iter_eval_pairs_with_history(meta: pd.DataFrame, horizon: int, p: int) -> List[Tuple[int, int]]:
+    pairs: List[Tuple[int, int]] = []
     h = int(horizon)
     p = int(p)
-    X_rows = []
-    Y_rows = []
-    origins = []
-    targets = []
-
     for idx in session_groups(meta):
-        if len(idx) <= h + p:
+        if len(idx) <= h:
             continue
-        # pos is position of origin inside session.
         for pos in range(p - 1, len(idx) - h):
             origin = int(idx[pos])
             target = int(idx[pos + h])
-            lag_indices = [int(idx[pos - r]) for r in range(p)]
-            X_rows.append(z[lag_indices, :])
-            Y_rows.append(z[target, :])
-            origins.append(origin)
-            targets.append(target)
-
-    if not X_rows:
-        N = int(z.shape[1])
-        return (
-            np.empty((0, p, N), dtype=np.float32),
-            np.empty((0, N), dtype=np.float32),
-            np.empty((0,), dtype=np.int64),
-            np.empty((0,), dtype=np.int64),
-        )
-
-    return (
-        np.stack(X_rows, axis=0).astype(np.float32),
-        np.stack(Y_rows, axis=0).astype(np.float32),
-        np.asarray(origins, dtype=np.int64),
-        np.asarray(targets, dtype=np.int64),
-    )
+            # Ensure lags origin-r stay inside the same session by construction.
+            pairs.append((origin, target))
+    return pairs
 
 
-def ridge_beta(X: np.ndarray, y: np.ndarray, ridge: float = 1e-4) -> np.ndarray:
+def build_supervised_tensors(z: np.ndarray, meta: pd.DataFrame, horizon: int, p: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    pairs = iter_eval_pairs_with_history(meta, horizon=horizon, p=p)
+    if not pairs:
+        raise RuntimeError(f"No valid samples for horizon={horizon}, p={p}")
+
+    origins = np.asarray([a for a, _ in pairs], dtype=np.int64)
+    targets = np.asarray([b for _, b in pairs], dtype=np.int64)
+    z_arr = np.asarray(z, dtype=np.float32)
+
+    lagged = []
+    for r in range(int(p)):
+        lagged.append(z_arr[origins - r])
+    X_lags = np.stack(lagged, axis=1).astype(np.float32)  # [M, p, N]
+    Y = z_arr[targets].astype(np.float32)                 # [M, N]
+    return X_lags, Y, origins, targets
+
+
+# =============================================================================
+# Linear algebra helpers
+# =============================================================================
+def standardize_columns(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float32)
+    mu = X.mean(axis=0, keepdims=True)
+    Xc = X - mu
+    std = Xc.std(axis=0, ddof=1, keepdims=True) if X.shape[0] > 1 else np.ones_like(mu)
+    std = np.where(np.isfinite(std) & (std > 1e-8), std, 1.0).astype(np.float32)
+    return np.nan_to_num(Xc / std, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+
+def ridge_beta(X: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
     p = X.shape[1]
-    A = X.T @ X + float(ridge) * np.eye(p, dtype=np.float64)
+    A = X.T @ X
+    if ridge > 0:
+        A = A + float(ridge) * np.eye(p, dtype=np.float64)
     b = X.T @ y
     try:
         return np.linalg.solve(A, b)
     except np.linalg.LinAlgError:
-        return np.linalg.pinv(A) @ b
+        return np.linalg.lstsq(A, b, rcond=None)[0]
 
 
 def fit_restricted_residuals(
     X_lags: np.ndarray,
     Y: np.ndarray,
-    ridge: float = 1e-4,
-    fit_intercept: bool = False,
+    ridge: float,
+    fit_intercept: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Per target i:
-        restricted: y_i <- own past x_i(t), x_i(t-1), ...
-    Returns residuals[M,N], mse_r[N], betas[N,p(+1)].
-    """
-    X_lags = np.asarray(X_lags, dtype=np.float32)
-    Y = np.asarray(Y, dtype=np.float32)
+    """Fit y_i <- own lags of i for every target i."""
     M, p, N = X_lags.shape
-    residuals = np.zeros((M, N), dtype=np.float32)
-    mse = np.zeros(N, dtype=np.float32)
-    betas = np.zeros((N, p + (1 if fit_intercept else 0)), dtype=np.float32)
+    residuals = np.empty((M, N), dtype=np.float32)
+    mse_r = np.empty(N, dtype=np.float32)
+    coefs = np.empty((N, p + (1 if fit_intercept else 0)), dtype=np.float32)
 
-    for i in range(N):
-        X = X_lags[:, :, i]
+    for i in maybe_iter(range(N), total=N, desc="restricted models"):
+        Xi = X_lags[:, :, i]
         if fit_intercept:
-            X = np.concatenate([np.ones((M, 1), dtype=np.float32), X], axis=1)
-        beta = ridge_beta(X, Y[:, i], ridge=ridge)
-        pred = X @ beta
-        res = Y[:, i] - pred
+            Xi = np.concatenate([np.ones((M, 1), dtype=np.float32), Xi], axis=1)
+        y = Y[:, i]
+        beta = ridge_beta(Xi, y, ridge=ridge)
+        pred = Xi @ beta
+        res = y - pred
         residuals[:, i] = res.astype(np.float32)
-        mse[i] = float(np.mean(res ** 2))
-        betas[i, :len(beta)] = beta.astype(np.float32)
+        mse_r[i] = float(np.mean(res ** 2))
+        coefs[i] = beta.astype(np.float32)
 
-    return residuals, mse, betas
+    return residuals, mse_r, coefs
 
 
 def choose_candidates_by_partial_corr(
     X_lags: np.ndarray,
     residuals: np.ndarray,
-    max_candidates: int = 50,
-    block_size: int = 256,
-) -> np.ndarray:
+    max_candidates: int,
+    block_size: int,
+) -> List[np.ndarray]:
     """
-    Candidate sources per target using correlation between source lag features and restricted residual.
+    Candidate pruning for Granger tests.
 
-    Score(source,target) = max_r |corr(X_lags[:,r,source], residual[:,target])|
+    We use correlation between source lag variables and the restricted residual
+    of each target. This is only a fast candidate filter; final weights are
+    Granger predictive-improvement scores.
     """
-    X_lags = np.asarray(X_lags, dtype=np.float32)
-    residuals = np.asarray(residuals, dtype=np.float32)
     M, p, N = X_lags.shape
-    K = min(int(max_candidates), max(1, N - 1))
-    scores = np.zeros((N, N), dtype=np.float32)  # target x source
+    K = max(1, min(int(max_candidates), max(N - 1, 1)))
+    B = max(1, int(block_size))
 
-    R = residuals - residuals.mean(axis=0, keepdims=True)
-    R = R / (R.std(axis=0, keepdims=True) + EPS)
+    log(f"Standardizing source lag matrices for candidate search: p={p}, N={N}")
+    X_std_by_lag = [standardize_columns(X_lags[:, r, :]) for r in range(p)]
+    R_std = standardize_columns(residuals)
 
-    for r in range(p):
-        X = X_lags[:, r, :]
-        X = X - X.mean(axis=0, keepdims=True)
-        X = X / (X.std(axis=0, keepdims=True) + EPS)
+    candidates: List[Optional[np.ndarray]] = [None] * N
+    denom = float(max(M - 1, 1))
 
-        # Process targets by block to limit transient memory.
-        for start in range(0, N, int(block_size)):
-            end = min(N, start + int(block_size))
-            # source x target_block -> transpose target_block x source
-            C = (X.T @ R[:, start:end]) / max(1, M - 1)
-            scores[start:end, :] = np.maximum(scores[start:end, :], np.abs(C.T).astype(np.float32))
+    for start in maybe_iter(range(0, N, B), total=math.ceil(N / B), desc="candidate blocks"):
+        end = min(start + B, N)
+        rb = R_std[:, start:end]
+        score = np.zeros((N, end - start), dtype=np.float32)
+        for Xs in X_std_by_lag:
+            corr = (Xs.T @ rb).astype(np.float32) / denom
+            np.maximum(score, np.abs(corr), out=score)
+        # remove self candidates
+        for local, target in enumerate(range(start, end)):
+            score[target, local] = -np.inf
 
-    diag = np.arange(N)
-    scores[diag, diag] = -np.inf
-    idx = np.argpartition(scores, -K, axis=1)[:, -K:]
-    return idx.astype(np.int64)
+        k_eff = min(K, N - 1)
+        idx = np.argpartition(score, -k_eff, axis=0)[-k_eff:, :]  # [K, B]
+        # Sort each target's candidates by descending candidate score for reproducibility.
+        for local, target in enumerate(range(start, end)):
+            cand = idx[:, local]
+            vals = score[cand, local]
+            order = np.argsort(-vals)
+            candidates[target] = cand[order].astype(np.int64)
+
+    return [np.asarray(c, dtype=np.int64) for c in candidates]  # type: ignore[arg-type]
 
 
-def compute_granger_from_supervised_tensors(
-    X_lags: np.ndarray,
-    Y: np.ndarray,
+def compute_granger_for_horizon(
+    z: np.ndarray,
+    meta: pd.DataFrame,
     horizon: int,
     p: int,
     max_candidates: int,
@@ -360,16 +409,15 @@ def compute_granger_from_supervised_tensors(
     dtype: str,
     lag_dtype: str,
     min_improvement: float,
-    label: str,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Return G[target, source] and best source-lag matrix for one horizon."""
     t0 = time.time()
-    X_lags = np.asarray(X_lags, dtype=np.float32)
-    Y = np.asarray(Y, dtype=np.float32)
+    X_lags, Y, origins, targets = build_supervised_tensors(z, meta, horizon=horizon, p=p)
     M, p_used, N = X_lags.shape
-    if M <= (2 * p_used + 2):
-        raise RuntimeError(f"Too few samples for Granger {label}: M={M}, p={p_used}")
+    log(f"h={horizon}: supervised tensors X_lags={X_lags.shape}, Y={Y.shape}")
 
-    log(f"{label}: X_lags={X_lags.shape}, Y={Y.shape}")
+    if M <= (2 * p_used + 2):
+        raise RuntimeError(f"Too few samples for Granger h={horizon}: M={M}, p={p_used}")
 
     residuals, mse_r, _ = fit_restricted_residuals(
         X_lags=X_lags,
@@ -380,14 +428,19 @@ def compute_granger_from_supervised_tensors(
     candidates = choose_candidates_by_partial_corr(
         X_lags=X_lags,
         residuals=residuals,
-        max_candidates=int(max_candidates),
-        block_size=int(candidate_block_size),
+        max_candidates=max_candidates,
+        block_size=candidate_block_size,
     )
 
     G = np.zeros((N, N), dtype=np.float32)
     L = np.zeros((N, N), dtype=np.int16)
 
-    for target in maybe_iter(range(N), total=N, desc=f"granger {label}"):
+    n_edges_positive = 0
+    source_coef_abs_sum = 0.0
+    feature_count = 2 * p_used + (1 if fit_intercept else 0)
+
+    log(f"h={horizon}: running pairwise candidate Granger tests | N={N}, candidates/target={max_candidates}")
+    for target in maybe_iter(range(N), total=N, desc=f"granger h={horizon}"):
         own = X_lags[:, :, target]
         y = Y[:, target]
         mse_base = float(mse_r[target])
@@ -398,13 +451,11 @@ def compute_granger_from_supervised_tensors(
             source = int(source)
             if source == target:
                 continue
-
             src = X_lags[:, :, source]
             Xf = np.concatenate([own, src], axis=1)
             if fit_intercept:
                 Xf = np.concatenate([np.ones((M, 1), dtype=np.float32), Xf], axis=1)
-
-            beta = ridge_beta(Xf, y, ridge=float(ridge))
+            beta = ridge_beta(Xf, y, ridge=ridge)
             pred = Xf @ beta
             mse_f = float(np.mean((y - pred) ** 2))
             if not np.isfinite(mse_f) or mse_f <= 0:
@@ -414,26 +465,32 @@ def compute_granger_from_supervised_tensors(
             if score <= float(min_improvement):
                 continue
 
+            # Source coefficients are the last p entries unless intercept shifts offset.
             src_offset = (1 if fit_intercept else 0) + p_used
             src_coefs = np.asarray(beta[src_offset: src_offset + p_used], dtype=np.float64)
             if src_coefs.size == 0:
                 continue
-            best_lag_idx = int(np.argmax(np.abs(src_coefs)))
+            best_lag_idx = int(np.argmax(np.abs(src_coefs)))  # 0 means x_t, 1 means x_{t-1}
             coef = float(src_coefs[best_lag_idx])
-            w = math.copysign(score, coef if coef != 0.0 else 1.0) if signed else score
+            if signed:
+                w = math.copysign(score, coef if coef != 0.0 else 1.0)
+            else:
+                w = score
 
             G[target, source] = float(w)
             L[target, source] = int(best_lag_idx)
+            n_edges_positive += 1
+            source_coef_abs_sum += abs(coef)
 
     np.fill_diagonal(G, 0.0)
     np.fill_diagonal(L, 0)
+
     elapsed = time.time() - t0
     summary = {
-        "label": str(label),
         "horizon": int(horizon),
         "n_samples": int(M),
         "n_segments": int(N),
-        "granger_p": int(p),
+        "granger_p": int(p_used),
         "max_candidates": int(max_candidates),
         "candidate_block_size": int(candidate_block_size),
         "ridge": float(ridge),
@@ -441,44 +498,48 @@ def compute_granger_from_supervised_tensors(
         "signed": bool(signed),
         "min_improvement": float(min_improvement),
         "n_nonzero_edges": int(np.count_nonzero(G)),
+        "candidate_edges_tested_approx": int(N * min(max_candidates, max(N - 1, 1))),
         "mean_restricted_mse": float(np.mean(mse_r)),
         "median_restricted_mse": float(np.median(mse_r)),
         "elapsed_seconds": float(elapsed),
     }
-    log(f"{label} DONE | nonzero={summary['n_nonzero_edges']:,} | elapsed={elapsed/60:.2f} min")
+    log(f"h={horizon} DONE | nonzero={summary['n_nonzero_edges']:,} | elapsed={elapsed/60:.2f} min")
+
     return G.astype(dtype), L.astype(lag_dtype), summary
 
 
-def copy_basic_split_files(source_split_dir: Path, split_out: Path, data: Dict[str, Any], node_idx: Optional[np.ndarray]) -> None:
-    ensure_dir(split_out)
-    np.save(split_out / "z.npy", np.asarray(data["z"], dtype=np.float32))
-    np.save(split_out / "segment_ids.npy", np.asarray(data["segment_ids"], dtype=np.int64))
-    np.save(split_out / "timestamps.npy", np.asarray(data["timestamps"]).astype(str))
-    data["meta"].to_csv(split_out / "G_series_meta.csv", index=False)
+# =============================================================================
+# Saving output in downstream-compatible structure
+# =============================================================================
+def copy_basic_split_files(
+    source_split_dir: Path,
+    out_split_dir: Path,
+    data: Dict[str, Any],
+    node_idx: Optional[np.ndarray],
+) -> None:
+    ensure_dir(out_split_dir)
+
+    # Save z/segment_ids/timestamps after optional node subset.
+    np.save(out_split_dir / "z.npy", np.asarray(data["z"], dtype=np.float32))
+    np.save(out_split_dir / "segment_ids.npy", np.asarray(data["segment_ids"], dtype=np.int64))
+    np.save(out_split_dir / "timestamps.npy", np.asarray(data["timestamps"]).astype("datetime64[ns]"))
+
+    # Meta files are unchanged by node subset.
+    meta_path = source_split_dir / "G_series_meta.csv"
+    raw_meta_path = source_split_dir / "raw_meta.csv"
+    if meta_path.exists():
+        shutil.copy2(meta_path, out_split_dir / "G_series_meta.csv")
+    else:
+        pd.DataFrame(data["meta"]).to_csv(out_split_dir / "G_series_meta.csv", index=False)
+
+    if raw_meta_path.exists():
+        shutil.copy2(raw_meta_path, out_split_dir / "raw_meta.csv")
+
+    if node_idx is not None:
+        np.save(out_split_dir / "selected_node_indices.npy", np.asarray(node_idx, dtype=np.int64))
 
 
-def write_readme(out_dir: Path, args: argparse.Namespace) -> None:
-    text = f"""# Branch B Static Granger-style directed predictive graph
-
-Created by `prepare_branchB_osm_edge_granger_like_branchA.py`.
-
-This folder stores a train-only static Granger graph per horizon.
-
-Graph format:
-- `graphs/G_hXXX.npy[target, source]`
-- `graphs/L_hXXX.npy[target, source]`
-
-It is not a correlation matrix.
-
-Args:
-```json
-{json.dumps(vars(args), ensure_ascii=False, indent=2)}
-```
-"""
-    (out_dir / "README_GRANGER_STATIC.md").write_text(text, encoding="utf-8")
-
-
-def save_static_outputs(
+def save_static_granger_to_splits(
     out_dir: Path,
     source_dir: Path,
     splits: Dict[str, Dict[str, Any]],
@@ -490,58 +551,92 @@ def save_static_outputs(
     node_idx: Optional[np.ndarray],
     run_summary: Dict[str, Any],
 ) -> None:
-    graphs_dir = ensure_dir(out_dir / "graphs")
-    for h in horizons:
-        np.save(graphs_dir / f"G_h{int(h):03d}.npy", G_by_h[int(h)].astype(dtype))
-        np.save(graphs_dir / f"L_h{int(h):03d}.npy", L_by_h[int(h)].astype(lag_dtype))
-    np.save(graphs_dir / "available_horizons.npy", np.asarray(list(map(int, horizons)), dtype=np.int16))
+    h_max = int(max(horizons))
+    N = int(next(iter(G_by_h.values())).shape[0])
 
     for split_name, data in splits.items():
         split_out = out_dir / split_name
+        source_split_dir = source_dir / split_name
         if split_out.exists():
             shutil.rmtree(split_out)
         ensure_dir(split_out)
-        copy_basic_split_files(source_dir / split_name, split_out, data, node_idx=node_idx)
+        copy_basic_split_files(source_split_dir, split_out, data, node_idx=node_idx)
 
-        # For compatibility with standard checkers/methods, also store one graph per timestamp.
-        # The actual granger_gt method can use graphs/G_hXXX.npy; these series are a fallback.
-        T = np.asarray(data["z"]).shape[0]
-        G_series = np.zeros((T, len(data["segment_ids"]), len(data["segment_ids"])), dtype=np.dtype(dtype))
-        L_series = np.zeros((T, len(data["segment_ids"]), len(data["segment_ids"])), dtype=np.dtype(lag_dtype))
-        # Fill with h=1 graph as a generic fallback.
-        h0 = int(list(horizons)[0])
-        G_series[:] = G_by_h[h0].astype(dtype)
-        L_series[:] = L_by_h[h0].astype(lag_dtype)
-        np.save(split_out / "G_weight_series.npy", G_series)
-        np.save(split_out / "G_best_lag_series.npy", L_series)
+        G_path = split_out / "G_weight_series.npy"
+        L_path = split_out / "G_best_lag_series.npy"
+        G_mem = np.lib.format.open_memmap(G_path, mode="w+", dtype=dtype, shape=(h_max + 1, N, N))
+        L_mem = np.lib.format.open_memmap(L_path, mode="w+", dtype=lag_dtype, shape=(h_max + 1, N, N))
+        G_mem[:] = 0
+        L_mem[:] = 0
+        for h in horizons:
+            G_mem[int(h)] = G_by_h[int(h)].astype(dtype)
+            L_mem[int(h)] = L_by_h[int(h)].astype(lag_dtype)
+        G_mem.flush(); L_mem.flush()
+        del G_mem, L_mem
 
         split_summary = dict(run_summary)
         split_summary.update({
             "split": split_name,
+            "G_shape": [int(h_max + 1), int(N), int(N)],
+            "G_semantics": "static train-only Granger/predictive influence graph indexed by horizon; G[h,target,source]",
             "z_shape": list(map(int, np.asarray(data["z"]).shape)),
-            "static_graph_format": "graphs/G_hXXX.npy[target,source]",
+            "segment_ids_shape": list(map(int, np.asarray(data["segment_ids"]).shape)),
         })
-        save_json(split_summary, split_out / "branchB_granger_static_split_summary.json")
+        save_json(split_summary, split_out / "branchB_granger_split_summary.json")
+        # Also save with old name for compatibility with checks.
         save_json(split_summary, split_out / "branchB_gt_split_summary.json")
 
-    save_json(run_summary, out_dir / "branchB_granger_static_run_summary.json")
+    # Save global horizon summaries.
+    save_json(run_summary, out_dir / "branchB_granger_run_summary.json")
 
 
+def write_readme(out_dir: Path, args: argparse.Namespace) -> None:
+    text = f"""# Branch B Granger-style directed predictive graph
+
+This directory was created by `prepare_branchB_osm_edge_granger_like_branchA.py`.
+
+It keeps the downstream Branch-B file names but changes graph semantics:
+
+- OLD: `G_weight_series.npy` from lagged correlation.
+- NEW: `G_weight_series.npy[h, target, source]` is a static train-only Granger-style predictive influence graph for horizon `h`.
+
+Weight definition:
+
+`G[target, source, h] = sign(source coefficient) * max(0, log((MSE_R + eps)/(MSE_F + eps)))`
+
+where:
+
+- Restricted model predicts target from its own lags.
+- Full model adds source lags.
+- Candidate pruning is used before pairwise Granger tests.
+
+Args:
+
+```json
+{json.dumps(vars(args), ensure_ascii=False, indent=2)}
+```
+"""
+    (out_dir / "README_GRANGER.md").write_text(text, encoding="utf-8")
+
+
+# =============================================================================
+# CLI
+# =============================================================================
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--source-dir", type=str, default=None)
-    parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--horizons", type=str, default="1-9")
-    parser.add_argument("--granger-p", type=int, default=3)
-    parser.add_argument("--max-candidates", type=int, default=50)
-    parser.add_argument("--candidate-block-size", type=int, default=256)
-    parser.add_argument("--ridge", type=float, default=1e-4)
-    parser.add_argument("--min-improvement", type=float, default=0.0)
-    parser.add_argument("--unsigned", action="store_true")
-    parser.add_argument("--fit-intercept", action="store_true")
+    parser.add_argument("--source-dir", type=str, default=None, help="Existing lagged-correlation Branch-B prepared dir used only for z/meta/splits.")
+    parser.add_argument("--output-dir", type=str, default=None, help="Output Granger Branch-B prepared dir.")
+    parser.add_argument("--horizons", type=str, default="1-9", help="Forecast horizons, e.g. 1-9 or 1,2,3.")
+    parser.add_argument("--granger-p", type=int, default=3, help="Number of own/source lags: x_t, x_{t-1}, ..., x_{t-p+1}.")
+    parser.add_argument("--max-candidates", type=int, default=50, help="Candidate sources per target before Granger testing.")
+    parser.add_argument("--candidate-block-size", type=int, default=256, help="Target block size for candidate search.")
+    parser.add_argument("--ridge", type=float, default=1e-4, help="Small ridge regularization for OLS solves.")
+    parser.add_argument("--min-improvement", type=float, default=0.0, help="Minimum log(MSE_R/MSE_F) to keep an edge.")
+    parser.add_argument("--unsigned", action="store_true", help="Use nonnegative Granger strengths instead of signed source coefficients.")
+    parser.add_argument("--fit-intercept", action="store_true", help="Include intercept in restricted/full Granger regressions.")
     parser.add_argument("--g-dtype", type=str, default="float16")
     parser.add_argument("--lag-dtype", type=str, default="int8")
-    parser.add_argument("--max-nodes", type=int, default=0)
+    parser.add_argument("--max-nodes", type=int, default=0, help="Use first/random N nodes for quick test. 0 means full.")
     parser.add_argument("--node-indices", type=str, default=None)
     parser.add_argument("--node-ids", type=str, default=None)
     parser.add_argument("--node-sample", type=str, default="first", choices=["first", "random"])
@@ -553,6 +648,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+
     source_dir = Path(args.source_dir) if args.source_dir else DEFAULT_SOURCE_DIR
     output_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_DIR
     if not source_dir.is_absolute():
@@ -563,11 +659,14 @@ def main() -> None:
     horizons = parse_int_list(args.horizons)
     if not horizons:
         raise ValueError("No horizons parsed from --horizons")
+    if min(horizons) < 1:
+        raise ValueError("Horizons must be >= 1")
 
-    print_stage("LOAD EXISTING BRANCH-B TRUE-RT DATA")
+    print_stage("LOAD EXISTING BRANCH-B DATA")
     log(f"PROJECT_ROOT: {PROJECT_ROOT}")
     log(f"SOURCE_DIR  : {source_dir}")
     log(f"OUTPUT_DIR  : {output_dir}")
+    log(f"HORIZONS    : {horizons}")
 
     train0 = load_existing_split(source_dir, "train", mmap=False)
     node_idx = resolve_node_indices(
@@ -578,16 +677,22 @@ def main() -> None:
         node_sample=args.node_sample,
         seed=int(args.seed),
     )
+
     splits = {
         "train": subset_nodes(train0, node_idx),
         "val": subset_nodes(load_existing_split(source_dir, "val", mmap=False), node_idx),
         "test": subset_nodes(load_existing_split(source_dir, "test", mmap=False), node_idx),
     }
 
-    N = int(np.asarray(splits["train"]["z"]).shape[1])
-    est_bytes = len(horizons) * N * N * (np.dtype(args.g_dtype).itemsize + np.dtype(args.lag_dtype).itemsize)
+    train = splits["train"]
+    z_train = np.asarray(train["z"], dtype=np.float32)
+    N = int(z_train.shape[1])
+    log(f"train z shape: {z_train.shape}")
     log(f"node mode: {'full' if node_idx is None else f'subset n={len(node_idx)}'}")
-    log(f"N={N}, estimated graph storage={fmt_gb(est_bytes)}")
+
+    h_max = max(horizons)
+    one_graph_bytes = (h_max + 1) * N * N * np.dtype(args.g_dtype).itemsize
+    log(f"Estimated one split G file: {fmt_gb(one_graph_bytes)}; all 3 splits: {fmt_gb(one_graph_bytes * 3)}")
 
     if args.dry_run:
         log("DRY RUN: stop before computation.")
@@ -599,20 +704,14 @@ def main() -> None:
     ensure_dir(output_dir)
 
     print_stage("COMPUTE STATIC TRAIN-ONLY GRANGER GRAPHS")
-    train = splits["train"]
-    z_train = np.asarray(train["z"], dtype=np.float32)
-    train_meta = train["meta"]
-
     G_by_h: Dict[int, np.ndarray] = {}
     L_by_h: Dict[int, np.ndarray] = {}
-    summaries: List[Dict[str, Any]] = []
+    horizon_summaries: List[Dict[str, Any]] = []
 
     for h in horizons:
-        print_stage(f"HORIZON h={h}")
-        X_lags, Y, origins, targets = build_supervised_tensors(z_train, train_meta, horizon=int(h), p=int(args.granger_p))
-        G, L, summary = compute_granger_from_supervised_tensors(
-            X_lags=X_lags,
-            Y=Y,
+        G, L, summary = compute_granger_for_horizon(
+            z=z_train,
+            meta=train["meta"],
             horizon=int(h),
             p=int(args.granger_p),
             max_candidates=int(args.max_candidates),
@@ -623,18 +722,18 @@ def main() -> None:
             dtype=str(args.g_dtype),
             lag_dtype=str(args.lag_dtype),
             min_improvement=float(args.min_improvement),
-            label=f"h={h} static",
         )
         G_by_h[int(h)] = G
         L_by_h[int(h)] = L
-        summaries.append(summary)
+        horizon_summaries.append(summary)
 
     run_summary = {
         "created_at": now_str(),
-        "mode": "static_train_only_granger",
         "source_dir": str(source_dir),
         "output_dir": str(output_dir),
+        "mode": "static_train_only_granger",
         "horizons": [int(x) for x in horizons],
+        "max_horizon": int(h_max),
         "n_segments": int(N),
         "node_mode": "full" if node_idx is None else f"subset n={len(node_idx)}",
         "granger_p": int(args.granger_p),
@@ -646,11 +745,11 @@ def main() -> None:
         "min_improvement": float(args.min_improvement),
         "G_dtype": str(args.g_dtype),
         "lag_dtype": str(args.lag_dtype),
-        "summaries": summaries,
+        "horizon_summaries": horizon_summaries,
     }
 
-    print_stage("SAVE STATIC GRANGER OUTPUTS")
-    save_static_outputs(
+    print_stage("SAVE DOWNSTREAM-COMPATIBLE OUTPUTS")
+    save_static_granger_to_splits(
         out_dir=output_dir,
         source_dir=source_dir,
         splits=splits,
@@ -663,7 +762,7 @@ def main() -> None:
         run_summary=run_summary,
     )
     write_readme(output_dir, args)
-    log("DONE.")
+    log("DONE. Next run 06B with --data-dir pointing to this output and --methods no_gt,granger_gt")
 
 
 if __name__ == "__main__":
