@@ -65,7 +65,7 @@ except Exception:
 # ============================================================
 
 WINDOW = 10
-DEFAULT_METHODS = ["true_rt", "persistence", "ewma", "dcc", "dmfm", "factorized_uut"]
+DEFAULT_METHODS = ["true_rt", "persistence", "ewma", "dcc", "dmfm"]
 DEFAULT_LAGS = [1, 3, 6, 9]
 DEFAULT_SPLITS = ["val", "test"]
 
@@ -73,9 +73,6 @@ DEFAULT_EWMA_ALPHA = 0.30
 DEFAULT_DCC_LAMBDA = 0.94
 DEFAULT_DCC_DECAY = 0.97
 DEFAULT_DMFM_FACTORS = 12
-DEFAULT_UUT_RANK = 12
-DEFAULT_UUT_RIDGE = 1e-2
-DEFAULT_STABILITY_TARGET = 0.98
 
 SEED = 42
 
@@ -454,88 +451,6 @@ def predict_dmfm(model: Dict[str, Any], R_origin: np.ndarray, lag: int) -> np.nd
     return sym_clip_diag(R)
 
 
-def spectral_radius(M: np.ndarray) -> float:
-    vals = np.linalg.eigvals(np.asarray(M, dtype=np.float64))
-    return float(np.max(np.abs(vals))) if vals.size else 0.0
-
-
-def stabilize_transition(Phi: np.ndarray, target: float = DEFAULT_STABILITY_TARGET) -> np.ndarray:
-    Phi = np.asarray(Phi, dtype=np.float32)
-    rho = spectral_radius(Phi)
-    if not np.isfinite(rho) or rho <= 0 or rho < target:
-        return Phi
-    return (Phi * (target / max(rho, 1e-8))).astype(np.float32)
-
-
-def compute_mean_R_stream(train_data: Dict[str, Any]) -> np.ndarray:
-    T = int(train_data["R_series"].shape[0])
-    N = len(train_data["segment_ids"])
-    acc = np.zeros((N, N), dtype=np.float64)
-    for t in range(T):
-        acc += get_R(train_data, t)
-        if (t + 1) % 20 == 0 or t + 1 == T:
-            print(f"  [UUT] mean_R processed {t+1}/{T}")
-    R = (acc / max(T, 1)).astype(np.float32)
-    return sym_clip_diag(R)
-
-
-def fit_factorized_uut_model(train_data: Dict[str, Any], rank: int, ridge: float) -> Dict[str, Any]:
-    print("[UUT] fitting mean_R ...")
-    mean_R = compute_mean_R_stream(train_data)
-
-    print("[UUT] eigendecomposition of mean_R ...")
-    vals, vecs = np.linalg.eigh(0.5 * (mean_R.astype(np.float64) + mean_R.T.astype(np.float64)))
-    idx = np.argsort(vals)[::-1]
-    r = int(min(rank, mean_R.shape[0]))
-    U = vecs[:, idx[:r]].astype(np.float32)
-
-    T = int(train_data["R_series"].shape[0])
-    Z = np.empty((T, r * r), dtype=np.float32)
-
-    for t in range(T):
-        R = get_R(train_data, t)
-        X = U.T @ (R - mean_R) @ U
-        Z[t] = X.reshape(-1, order="F")
-        if (t + 1) % 30 == 0 or t + 1 == T:
-            print(f"  [UUT] compressed train R {t+1}/{T}")
-
-    mu, std = fit_standardizer(Z)
-    Zs = standardize(Z, mu, std)
-
-    if len(Zs) < 2:
-        c = np.zeros(r * r, dtype=np.float32)
-        Phi = np.eye(r * r, dtype=np.float32)
-    else:
-        X_prev, X_next = Zs[:-1], Zs[1:]
-        X_design = np.concatenate([np.ones((len(X_prev), 1), dtype=np.float32), X_prev], axis=1)
-        reg = ridge * np.eye(X_design.shape[1], dtype=np.float32)
-        reg[0, 0] = 0.0
-        B = np.linalg.solve(X_design.T @ X_design + reg, X_design.T @ X_next)
-        c = B[0].astype(np.float32)
-        Phi = B[1:].T.astype(np.float32)
-        Phi = stabilize_transition(Phi)
-
-    return {"mean_R": mean_R, "U": U, "mu": mu, "std": std, "c": c, "Phi": Phi, "rank": r}
-
-
-def predict_factorized_uut(model: Dict[str, Any], R_origin: np.ndarray, lag: int) -> np.ndarray:
-    mean_R = model["mean_R"]
-    U = model["U"]
-    r = model["rank"]
-
-    X0 = U.T @ (np.asarray(R_origin, dtype=np.float32) - mean_R) @ U
-    z = X0.reshape(-1, order="F")[None, :]
-    zs = standardize(z, model["mu"], model["std"]).reshape(-1)
-
-    for _ in range(int(lag)):
-        zs = model["c"] + model["Phi"] @ zs
-
-    zh = (zs[None, :] * model["std"] + model["mu"]).reshape(-1)
-    Xh = zh.reshape(r, r, order="F").astype(np.float32)
-
-    R = mean_R + U @ Xh @ U.T
-    return sym_clip_diag(R)
-
 
 def fit_predictor_models(methods: List[str], train_data: Dict[str, Any], args, rng) -> Dict[str, Any]:
     models = {}
@@ -545,13 +460,6 @@ def fit_predictor_models(methods: List[str], train_data: Dict[str, Any], args, r
             max_factors=args.dmfm_factors,
             train_samples=args.dmfm_train_samples,
             rng=rng,
-        )
-
-    if "factorized_uut" in methods:
-        models["factorized_uut"] = fit_factorized_uut_model(
-            train_data,
-            rank=args.uut_rank,
-            ridge=args.uut_ridge,
         )
 
     if "dcc" in methods:
@@ -594,9 +502,6 @@ def predict_R(method: str, train_data: Dict[str, Any], split_data: Dict[str, Any
 
     if method == "dmfm":
         return predict_dmfm(models["dmfm"], get_R(split_data, origin_idx), lag)
-
-    if method == "factorized_uut":
-        return predict_factorized_uut(models["factorized_uut"], get_R(split_data, origin_idx), lag)
 
     raise ValueError(f"Unsupported method: {method}")
 
@@ -1044,7 +949,6 @@ METHOD_LABELS = {
     "ewma": "EWMA",
     "dcc": "DCC",
     "dmfm": "DMFM",
-    "factorized_uut": "Factorized UUT",
 }
 
 
@@ -1450,8 +1354,6 @@ def main():
 
     ap.add_argument("--dmfm-factors", type=int, default=DEFAULT_DMFM_FACTORS)
     ap.add_argument("--dmfm-train-samples", type=int, default=80, help="0 = all train samples; default 80 for memory safety.")
-    ap.add_argument("--uut-rank", type=int, default=DEFAULT_UUT_RANK)
-    ap.add_argument("--uut-ridge", type=float, default=DEFAULT_UUT_RIDGE)
     ap.add_argument("--ewma-alpha", type=float, default=DEFAULT_EWMA_ALPHA)
     ap.add_argument("--dcc-lambda", type=float, default=DEFAULT_DCC_LAMBDA)
     ap.add_argument("--dcc-decay", type=float, default=DEFAULT_DCC_DECAY)
@@ -1463,6 +1365,15 @@ def main():
     ap.add_argument("--map-top-targets", type=int, default=30)
 
     args = ap.parse_args()
+
+    # Removed from thesis/reporting pipeline.
+    # This prevents Factorized UUT from being fitted, evaluated, plotted, or drawn on maps,
+    # even if someone accidentally passes --methods ... factorized_uut.
+    removed_methods = {"factorized_uut"}
+    args.methods = [m for m in args.methods if m not in removed_methods]
+    if not args.methods:
+        raise ValueError("No methods left to evaluate after removing factorized_uut.")
+
     rng = np.random.default_rng(args.seed)
 
     project_root = find_project_root()

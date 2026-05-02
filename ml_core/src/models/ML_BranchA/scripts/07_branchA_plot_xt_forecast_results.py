@@ -51,7 +51,6 @@ METHOD_ORDER = [
     "dcc",
     "prodcc",
     "dmfm",
-    "factorized_uut",
 ]
 
 METHOD_LABELS = {
@@ -62,7 +61,6 @@ METHOD_LABELS = {
     "dcc": "DCC",
     "prodcc": "Pro-DCC",
     "dmfm": "DMFM",
-    "factorized_uut": "Factorized UUT",
 }
 
 
@@ -88,6 +86,12 @@ for p in metric_files:
     dfs.append(df)
 
 all_df = pd.concat(dfs, ignore_index=True)
+
+# Removed from thesis/reporting pipeline: do not plot Factorized UUT even if old result files exist.
+EXCLUDED_METHODS = {"factorized_uut"}
+all_df = all_df[~all_df["method"].astype(str).isin(EXCLUDED_METHODS)].copy()
+if all_df.empty:
+    raise RuntimeError("No metrics left after excluding methods: factorized_uut")
 
 required_cols = {"method", "split", "lag", "mae", "rmse"}
 missing = required_cols - set(all_df.columns)
