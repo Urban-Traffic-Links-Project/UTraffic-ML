@@ -256,3 +256,35 @@ def predict_G_method(method_name: str, g_model: Dict[str, Any], split_name: str,
         intercept = np.asarray(model_h.get("intercept", np.zeros(len(f), dtype=np.float32)), dtype=np.float32)
     f_hat = f @ coef + intercept
     return _reconstruct_one(f_hat, mean, comps, N=N)
+
+# ---------------------------------------------------------------------------
+# OVERRIDE: fair session-aware evaluation pairs for Granger-Gt timeline.
+# A prediction origin is allowed only if prepare step marked can_predict_granger=True,
+# meaning it has enough previous p history in the same day. Target must stay in same day.
+# ---------------------------------------------------------------------------
+def _session_groups(meta: pd.DataFrame) -> List[np.ndarray]:
+    if "session_id" in meta.columns:
+        groups = []
+        for _, sub in meta.groupby("session_id", sort=False):
+            idx = sub.index.to_numpy(dtype=np.int64)
+            if len(idx):
+                groups.append(idx)
+        return groups
+    return [np.arange(len(meta), dtype=np.int64)]
+
+
+def iter_eval_pairs(meta: pd.DataFrame, horizon: int):
+    h = int(horizon)
+    for idx in _session_groups(meta):
+        if len(idx) <= h:
+            continue
+        for pos in range(0, len(idx) - h):
+            origin = int(idx[pos])
+            target = int(idx[pos + h])
+            if "can_predict_granger" in meta.columns:
+                if not bool(meta.loc[origin, "can_predict_granger"]):
+                    continue
+            elif "can_predict" in meta.columns:
+                if not bool(meta.loc[origin, "can_predict"]):
+                    continue
+            yield origin, target
